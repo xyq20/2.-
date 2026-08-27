@@ -46,20 +46,23 @@ DOUYIN_FIXTURE = r"""
   <div id="slot"></div>
 </div>
 <script>
+let selectSequence = 0;
+
 function selectBox(label, values, multi=false) {
+  const dropdownId = `attribute-popper-${++selectSequence}`;
   const options = values.map(value =>
     `<li class="el-select-dropdown__item" onclick="pickOption(this, '${value}', ${multi})">${value}</li>`
   ).join('');
   const tags = multi
-    ? '<div class="el-select__tags"><input class="el-select__input" onclick="openSelect(this)"></div>'
+    ? `<div class="el-select__tags"><input class="el-select__input" aria-controls="${dropdownId}" onclick="openSelect(this)"></div>`
     : '';
   return `<div class="attr-item"><div class="el-form-item">
     <label class="el-form-item__label">${label}</label>
     <div class="el-form-item__content"><div class="el-select">
-      ${tags}<input class="el-input__inner" readonly placeholder="请选择" onclick="openSelect(this)">
-      <div class="el-select-dropdown" style="display:none"><ul>${options}</ul></div>
+      ${tags}<input class="el-input__inner" readonly placeholder="请选择" aria-controls="${dropdownId}" onclick="openSelect(this)">
     </div></div>
-  </div></div>`;
+  </div></div>
+  <div id="${dropdownId}" class="el-select-dropdown el-popper" style="display:none;z-index:${1000 + selectSequence}"><ul>${options}</ul></div>`;
 }
 
 function materialRow() {
@@ -77,11 +80,23 @@ function materialRow() {
 }
 
 function openSelect(element) {
+  document.querySelectorAll('.el-select-dropdown').forEach(dropdown => {
+    dropdown.style.display = 'none';
+  });
+  const linkedId = element.getAttribute('aria-controls');
+  if (linkedId) {
+    document.getElementById(linkedId).style.display = 'block';
+    return;
+  }
   element.closest('.el-select').querySelector('.el-select-dropdown').style.display = 'block';
 }
 
 function pickOption(option, value, multi) {
-  const select = option.closest('.el-select');
+  const dropdown = option.closest('.el-select-dropdown');
+  let select = option.closest('.el-select');
+  if (!select && dropdown.id) {
+    select = document.querySelector(`.el-select [aria-controls="${dropdown.id}"]`).closest('.el-select');
+  }
   if (multi) {
     const tags = select.querySelector('.el-select__tags');
     if (![...tags.querySelectorAll('.el-tag')].some(tag => tag.dataset.value === value)) {
@@ -97,7 +112,7 @@ function pickOption(option, value, multi) {
     }
   } else {
     select.querySelector('input.el-input__inner').value = value;
-    select.querySelector('.el-select-dropdown').style.display = 'none';
+    dropdown.style.display = 'none';
   }
 }
 
@@ -175,6 +190,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             await self.listing.apply_first_recommended_category(),
             "服装 > 男装 > 休闲裤",
         )
+        self.assertEqual(await self.page.locator("#attributes > .el-select-dropdown").count(), 2)
         self.assertEqual(await self.listing.fill_short_title("重磅水洗工装裤"), "重磅水洗工装裤")
 
         self.assertEqual(await self.listing.fill_attribute("厚度", "常 规-款"), ("常规款",))
@@ -205,18 +221,18 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
 
-    async def test_apply_category_and_fields_uses_unique_alias_and_skips_absent_excel_field(self):
+    async def test_apply_category_and_fields_rejects_unmatched_supplied_attribute(self):
         await self.listing.open()
         fields = SimpleNamespace(
             short_title="复古工装裤",
-            attributes={"厚度/厚薄": "常规款", "当前类目不存在": "应跳过"},
+            attributes={"厚度/厚薄": "常规款", "当前类目不存在/未知属性": "不能静默跳过"},
         )
 
-        result = await self.listing.apply_category_and_fields(fields)
-
-        self.assertEqual(result["category"], "服装 > 男装 > 休闲裤")
-        self.assertEqual(result["short_title"], "复古工装裤")
-        self.assertEqual(result["attributes"], {"厚度": ("常规款",)})
+        with self.assertRaisesRegex(
+            DouyinListingError,
+            r"未按规范化别名精确匹配.*当前类目不存在/未知属性",
+        ):
+            await self.listing.apply_category_and_fields(fields)
 
     async def test_material_total_must_be_exactly_100_before_page_changes(self):
         with self.assertRaisesRegex(DouyinListingError, "合计必须为 100"):

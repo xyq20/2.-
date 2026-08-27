@@ -342,11 +342,81 @@ class DouyinListing:
             raise DouyinListingError("属性下拉框中找不到可点击输入框")
         await input_box.click()
 
-    async def _visible_dom_options(self, select: Any) -> List[Mapping[str, str]]:
+    async def _active_select_dropdown(self, select: Any) -> Optional[Any]:
+        linked_ids: List[str] = []
+        controllers = select.locator("input[aria-controls], input[aria-owns]")
+        for index in range(await controllers.count()):
+            controller = controllers.nth(index)
+            for attribute in ("aria-controls", "aria-owns"):
+                value = await controller.get_attribute(attribute) or ""
+                for identifier in value.split():
+                    if identifier and identifier not in linked_ids:
+                        linked_ids.append(identifier)
+
+        linked = []
+        valid_linked_count = 0
+        for identifier in linked_ids:
+            candidate = self.page.locator(f"[id={json.dumps(identifier)}]")
+            if await candidate.count() != 1:
+                continue
+            if "el-select-dropdown" not in (await candidate.get_attribute("class") or ""):
+                continue
+            valid_linked_count += 1
+            if await candidate.is_visible():
+                linked.append(candidate)
+        if len(linked) == 1:
+            return linked[0]
+        if len(linked) > 1:
+            raise DouyinListingError("当前属性关联了多个可见下拉框，无法安全选择")
+        if valid_linked_count:
+            # 已有确定关联时等它完成展开，不误用其他残留 popper。
+            return None
+
+        local = select.locator(".el-select-dropdown:visible")
+        if await local.count() == 1:
+            return local.first
+        if await local.count() > 1:
+            raise DouyinListingError("当前属性内部出现多个可见下拉框，无法安全选择")
+
+        # Element UI 默认会把 popper portal 到 body。若没有 aria 关联，只接受
+        # 唯一可见 popper，或 z-index 唯一最高的活动 popper。
+        global_dropdowns = self.page.locator(".el-select-dropdown:visible")
+        count = await global_dropdowns.count()
+        if count == 0:
+            return None
+        if count == 1:
+            return global_dropdowns.first
+
+        ranked = []
+        for index in range(count):
+            dropdown = global_dropdowns.nth(index)
+            z_index = await dropdown.evaluate(
+                """element => {
+                    const value = Number.parseInt(getComputedStyle(element).zIndex, 10);
+                    return Number.isFinite(value) ? value : 0;
+                }"""
+            )
+            ranked.append((int(z_index), index, dropdown))
+        highest = max(item[0] for item in ranked)
+        top = [item for item in ranked if item[0] == highest]
+        if len(top) != 1:
+            raise DouyinListingError(
+                f"页面同时存在 {count} 个可见属性下拉框，且活动层级不唯一"
+            )
+        return top[0][2]
+
+    async def _visible_dom_options(
+        self,
+        select: Any,
+    ) -> Tuple[Any, List[Mapping[str, str]]]:
         deadline = asyncio.get_running_loop().time() + 5
         while asyncio.get_running_loop().time() < deadline:
+            dropdown = await self._active_select_dropdown(select)
+            if dropdown is None:
+                await asyncio.sleep(0.05)
+                continue
             result: List[Mapping[str, str]] = []
-            options = select.locator(".el-select-dropdown__item")
+            options = dropdown.locator(".el-select-dropdown__item")
             for index in range(await options.count()):
                 option = options.nth(index)
                 classes = await option.get_attribute("class") or ""
@@ -361,7 +431,7 @@ class DouyinListing:
                 if name:
                     result.append({"name": name, "id": "", "index": str(index)})
             if result:
-                return result
+                return dropdown, result
             await asyncio.sleep(0.05)
         raise DouyinListingError("打开属性下拉框后未找到可见选项")
 
@@ -407,9 +477,9 @@ class DouyinListing:
                 # API 给出稳定 ID/name 时先用其检查缺失或重名。
                 choose_unique_option(expected, api_options)
             await self._open_select(select, multi=multi)
-            dom_options = await self._visible_dom_options(select)
+            dropdown, dom_options = await self._visible_dom_options(select)
             chosen = choose_unique_option(expected, dom_options)
-            option = select.locator(".el-select-dropdown__item").nth(int(chosen["index"]))
+            option = dropdown.locator(".el-select-dropdown__item").nth(int(chosen["index"]))
             await option.click()
 
         actual = await self._read_select_values(select, multi=multi)
@@ -468,29 +538,46 @@ class DouyinListing:
         return (actual,)
 
     async def apply_category_and_fields(self, fields: Any) -> Mapping[str, Any]:
-        """应用类目、短标题及当前页面可唯一映射的 Excel 属性。"""
+        """应用类目、短标题和所有 Excel 属性；未匹配的属性立即报错。"""
         category = await self.apply_first_recommended_category()
         short_title = await self.fill_short_title(fields.short_title)
         page_items = await self._attribute_items()
 
         excel_attributes = list(fields.attributes.items())
-        applied: Dict[str, Tuple[str, ...]] = {}
+        assignments: List[Tuple[str, object]] = []
+        matched_indexes: set[int] = set()
         for normalized_label, (page_label, _item) in page_items.items():
             matches = [
-                (key, value)
-                for key, value in excel_attributes
+                (index, key, value)
+                for index, (key, value) in enumerate(excel_attributes)
                 if normalized_label in _excel_aliases(key)
             ]
             if not matches:
                 continue
             if len(matches) != 1:
-                keys = "、".join(str(key) for key, _value in matches)
+                keys = "、".join(str(key) for _index, key, _value in matches)
                 raise DouyinListingError(
                     f"抖音属性“{page_label}”匹配到多个 Excel 字段：{keys}"
                 )
-            _key, value = matches[0]
-            # 已唯一映射的页面字段不能静默跳过；选项缺失/重名由
-            # fill_attribute 立即终止。Excel 中未出现在当前类目的字段自然跳过。
+            index, _key, value = matches[0]
+            matched_indexes.add(index)
+            assignments.append((page_label, value))
+
+        unmatched = [
+            str(key)
+            for index, (key, _value) in enumerate(excel_attributes)
+            if index not in matched_indexes
+        ]
+        if unmatched:
+            names = "、".join(unmatched)
+            raise DouyinListingError(
+                "以下 Excel 抖音属性未按规范化别名精确匹配当前页面字段："
+                f"{names}"
+            )
+
+        applied: Dict[str, Tuple[str, ...]] = {}
+        for page_label, value in assignments:
+            # 已唯一映射的页面字段不能静默跳过；选项缺失/重名立即终止。
             applied[page_label] = await self.fill_attribute(page_label, str(value))
         return {"category": category, "short_title": short_title, "attributes": applied}
 
