@@ -12,6 +12,45 @@ from typing import Any, Dict, Optional, Tuple
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
+# 不应作为抖音商品属性匹配的业务输入字段。每项均为 Excel 键中可能出现的别名。
+RESERVED_FIELD_ALIAS_NAMES = frozenset(
+    {
+        "商品分类",
+        "商品标题",
+        "商品名称",
+        "导购短标题",
+        "品牌",
+        "货号",
+        "商家外部编码",
+        "款式编码",
+        "吊牌价",
+        "价格",
+        "京东价",
+        "市场价",
+        "售卖价",
+        "售价",
+        "基本售价",
+        "拼单价",
+        "单买价",
+        "满件折扣",
+        "尺码",
+        "SKU分类",
+        "现货库存",
+        "预售库存",
+        "运费设置",
+        "运费模板",
+        "面料材质",
+        "水洗标",
+        "吊牌图",
+        "面料",
+        "面料俗称",
+        "店铺中分类",
+        "拍下减库存",
+        "商品状态",
+        "发布类型",
+    }
+)
+
 
 class DouyinDataError(ValueError):
     """可直接向用户展示的抖音资料输入错误。"""
@@ -45,7 +84,10 @@ class DouyinAssets:
 def normalize_key(value: Any) -> str:
     """按页面字段匹配需要规范化 Excel 键名。"""
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
-    return re.sub(r"\s+", "", text).strip(":：").casefold()
+    return re.sub(r"[\s:：]+", "", text).casefold()
+
+
+RESERVED_FIELD_ALIASES = frozenset(normalize_key(alias) for alias in RESERVED_FIELD_ALIAS_NAMES)
 
 
 def key_aliases(key: Any) -> Tuple[str, ...]:
@@ -126,11 +168,23 @@ def _split_nonempty(value: Any, separator: str, label: str) -> Tuple[str, ...]:
     return values
 
 
+def _douyin_attributes(fields: Dict[str, Any]) -> Dict[str, str]:
+    """保留可用于后续抖音页面属性匹配的非空 Excel 键值。"""
+    attributes: Dict[str, str] = {}
+    for key, value in fields.items():
+        if set(key_aliases(key)).intersection(RESERVED_FIELD_ALIASES):
+            continue
+        text = _cell_text(value)
+        if text:
+            attributes[key] = text
+    return attributes
+
+
 def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:
     """从 Excel 键值映射提取并校验抖音表单所需的业务字段。"""
     short_title = _cell_text(_required_value(fields, "导购短标题", "导购短标题"))
     materials = parse_materials(
-        _required_value(fields, "面料材质", "面料材质", "水洗标", "吊牌图", "面料")
+        _required_value(fields, "面料材质", "面料材质", "水洗标", "吊牌图", "面料", "面料俗称")
     )
     sizes = _split_nonempty(_required_value(fields, "尺码", "尺码"), "/", "尺码")
     price = _normalize_price(
@@ -143,7 +197,7 @@ def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:
     )
     return DouyinFields(
         short_title=short_title,
-        attributes=dict(fields),
+        attributes=_douyin_attributes(fields),
         materials=materials,
         sizes=sizes,
         price=price,
