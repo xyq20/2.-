@@ -23,6 +23,11 @@ from urllib.parse import parse_qs, urlsplit
 CATEGORY_PROPERTIES_ENDPOINT = "/fxg/getCategoryProperties.json"
 CATEGORY_PROPERTIES_QUIET_SECONDS = 0.2
 CATEGORY_PROPERTIES_TIMEOUT_SECONDS = 2.0
+SIZE_NAME_PATTERN = re.compile(
+    r"^(?:XS|S|M|L|X{1,6}L|\d{1,2}XL)$",
+    re.IGNORECASE,
+)
+SIZE_FIELD_LABELS = ("身高(cm)", "体重(斤)", "腰围(cm)", "臀围(cm)", "裤长(cm)")
 
 
 class DouyinListingError(RuntimeError):
@@ -58,6 +63,24 @@ def _normalize_label(value: object) -> str:
 def _excel_aliases(value: object) -> Tuple[str, ...]:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     return tuple(_normalize_label(part) for part in text.split("/") if _normalize_label(part))
+
+
+def _normalize_size_name(value: object) -> Optional[str]:
+    normalized = re.sub(
+        r"\s+",
+        "",
+        unicodedata.normalize("NFKC", "" if value is None else str(value)),
+    ).upper()
+    return normalized if SIZE_NAME_PATTERN.fullmatch(normalized) else None
+
+
+def _form_number(value: object) -> str:
+    """将 OCR 数值转为页面需要的紧凑文本。"""
+    if isinstance(value, bool):
+        raise DouyinListingError("尺码推荐数值不能是布尔值")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
 
 
 class DouyinListing:
@@ -847,3 +870,257 @@ class DouyinListing:
         if sum(percentage for _name, percentage in actual) != 100:
             raise DouyinListingError("面料百分比页面回读合计不是 100")
         return tuple(actual)
+
+    async def _size_table(self) -> Any:
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+
+        expected_headers = {_normalize_label(label) for label in SIZE_FIELD_LABELS}
+
+        async def matching_tables(selector: str) -> List[Any]:
+            matches: List[Any] = []
+            candidates = self.panel.locator(selector)
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    headers = candidate.locator(
+                        ":scope > .el-table__header-wrapper thead th"
+                    )
+                    header_texts = {
+                        _normalize_label(await header.inner_text())
+                        for header in [
+                            headers.nth(header_index)
+                            for header_index in range(await headers.count())
+                        ]
+                    }
+                except Exception:
+                    continue
+                if expected_headers.issubset(header_texts):
+                    matches.append(candidate)
+            return matches
+
+        # 真实页面是 Element UI 表格；普通 table 回退仅用于等价测试页。
+        matches = await matching_tables(".el-table")
+        if not matches:
+            matches = await matching_tables("table")
+        if len(matches) != 1:
+            raise DouyinListingError(
+                f"尺码推荐表匹配数为 {len(matches)}，无法安全填写"
+            )
+        return matches[0]
+
+    async def _size_rows(self, table: Any) -> Any:
+        rows = table.locator(":scope > .el-table__body-wrapper tbody > tr")
+        if not await rows.count():
+            rows = table.locator("tbody > tr")
+        if not await rows.count():
+            raise DouyinListingError("尺码推荐表中没有可填写行")
+        return rows
+
+    async def _row_size_name(self, row: Any, row_number: int) -> str:
+        values = set()
+        raw_values: List[str] = []
+
+        row_attribute = await row.get_attribute("data-size")
+        if row_attribute:
+            raw_values.append(row_attribute)
+
+        preferred = row.locator(".size-name, [data-size]")
+        for index in range(await preferred.count()):
+            candidate = preferred.nth(index)
+            attribute = await candidate.get_attribute("data-size")
+            text = attribute or (await candidate.inner_text())
+            if text:
+                raw_values.append(text)
+
+        # 真实 Element UI 表格的尺码通常是某个 .cell 的独立文本。
+        if not raw_values:
+            cells = row.locator(":scope > td")
+            for index in range(await cells.count()):
+                text = (await cells.nth(index).inner_text()).strip()
+                if text:
+                    raw_values.extend(part for part in text.splitlines() if part.strip())
+
+        for raw_value in raw_values:
+            size = _normalize_size_name(raw_value)
+            if size is not None:
+                values.add(size)
+        if len(values) != 1:
+            visible = "、".join(value.strip() for value in raw_values if value.strip()) or "<空>"
+            raise DouyinListingError(
+                f"尺码推荐第 {row_number} 行无法唯一识别尺码：{visible}"
+            )
+        return next(iter(values))
+
+    async def _size_header_indexes(self, table: Any) -> Dict[str, int]:
+        # Element UI 会在 .el-table__fixed-right 中复制一整套表头；
+        # 只使用主表头，否则每列都会被误判为重复。
+        headers = table.locator(":scope > .el-table__header-wrapper thead th")
+        by_label: Dict[str, List[int]] = {}
+        for index in range(await headers.count()):
+            label = _normalize_label(await headers.nth(index).inner_text())
+            by_label.setdefault(label, []).append(index)
+
+        result: Dict[str, int] = {}
+        for label in SIZE_FIELD_LABELS:
+            matches = by_label.get(_normalize_label(label), [])
+            if len(matches) != 1:
+                raise DouyinListingError(
+                    f"尺码推荐列“{label}”匹配数为 {len(matches)}"
+                )
+            result[label] = matches[0]
+        return result
+
+    async def _size_field_inputs(
+        self,
+        row: Any,
+        header_indexes: Mapping[str, int],
+        size: str,
+    ) -> Tuple[Any, ...]:
+        cells = row.locator(":scope > td")
+        controls = []
+        for label in SIZE_FIELD_LABELS:
+            column_index = header_indexes[label]
+            if await cells.count() <= column_index:
+                raise DouyinListingError(f"尺码 {size} 缺少“{label}”单元格")
+            inputs = cells.nth(column_index).locator("input:not([readonly])")
+            if await inputs.count() != 1:
+                raise DouyinListingError(
+                    f"尺码 {size} 的“{label}”输入框匹配数为 {await inputs.count()}"
+                )
+            controls.append(inputs.first)
+        return tuple(controls)
+
+    async def fill_size_recommendations(
+        self,
+        recommendations: Sequence[Any],
+    ) -> Mapping[str, Tuple[str, ...]]:
+        """按尺码文本填写身高、体重、腰围、臀围和裤长。
+
+        所有尺码行与五列输入框先完成预检，只有页面与识别结果的
+        尺码集合完全一致才开始写入，避免半张表被修改。
+        """
+        by_size: Dict[str, Any] = {}
+        for item in recommendations:
+            size = _normalize_size_name(getattr(item, "size", None))
+            if size is None:
+                raise DouyinListingError(
+                    f"识别结果包含无效尺码：{getattr(item, 'size', None)!r}"
+                )
+            if size in by_size:
+                raise DouyinListingError(f"识别结果包含重复尺码：{size}")
+            by_size[size] = item
+        if not by_size:
+            raise DouyinListingError("尺码推荐识别结果为空")
+
+        table = await self._size_table()
+        await table.scroll_into_view_if_needed()
+        rows = await self._size_rows(table)
+        header_indexes = await self._size_header_indexes(table)
+
+        page_rows: Dict[str, Any] = {}
+        duplicate_sizes = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            size = await self._row_size_name(row, index + 1)
+            if size in page_rows:
+                duplicate_sizes.append(size)
+            else:
+                page_rows[size] = row
+
+        expected_sizes = set(by_size)
+        page_sizes = set(page_rows)
+        missing_sizes = sorted(expected_sizes - page_sizes)
+        unexpected_sizes = sorted(page_sizes - expected_sizes)
+        problems = []
+        if duplicate_sizes:
+            problems.append("重复：" + "、".join(sorted(set(duplicate_sizes))))
+        if missing_sizes:
+            problems.append("缺少：" + "、".join(missing_sizes))
+        if unexpected_sizes:
+            problems.append("意外：" + "、".join(unexpected_sizes))
+        if problems:
+            raise DouyinListingError("尺码推荐行无法唯一匹配（" + "；".join(problems) + "）")
+
+        # 先确认每行五个控件都唯一存在，再做任何 fill。
+        controls_by_size: Dict[str, Tuple[Any, ...]] = {}
+        expected_values: Dict[str, Tuple[str, ...]] = {}
+        for size, row in page_rows.items():
+            item = by_size[size]
+            controls_by_size[size] = await self._size_field_inputs(
+                row, header_indexes, size
+            )
+            expected_values[size] = (
+                f"{_form_number(item.height_min)}-{_form_number(item.height_max)}",
+                f"{_form_number(item.weight_min)}-{_form_number(item.weight_max)}",
+                _form_number(item.waist),
+                _form_number(item.hip),
+                _form_number(item.length),
+            )
+
+        actual: Dict[str, Tuple[str, ...]] = {}
+        for size, controls in controls_by_size.items():
+            for control, value in zip(controls, expected_values[size]):
+                await control.fill(value)
+                await control.press("Tab")
+            row_values_list = []
+            for control in controls:
+                row_values_list.append((await control.input_value()).strip())
+            row_values = tuple(row_values_list)
+            if row_values != expected_values[size]:
+                raise DouyinListingError(
+                    f"尺码 {size} 回读校验失败：期望 {expected_values[size]}，"
+                    f"页面为 {row_values}"
+                )
+            actual[size] = row_values
+        return actual
+
+    async def sync_douyin_images(
+        self,
+        main_images: Sequence[Path],
+        main_images_34: Sequence[Path],
+        detail_images: Sequence[Path],
+        timeout_seconds: int = 300,
+    ) -> Mapping[str, str]:
+        """分别同步抖音 1:1 主图、3:4 主图和详情图。
+
+        共享的 ``sync_image_group`` 按用户确认的数量规则决定跳过或
+        整组重传；这里只保留调用方已按文件名自然排序的顺序。
+        """
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+        from kuaimai_erp import sync_image_group
+
+        groups = (
+            (
+                "main",
+                "主图",
+                tuple(Path(path) for path in main_images),
+                "抖音 1:1 主图",
+            ),
+            (
+                "main_34",
+                "主图3:4",
+                tuple(Path(path) for path in main_images_34),
+                "抖音 3:4 主图",
+            ),
+            (
+                "details",
+                "商品详情图",
+                tuple(Path(path) for path in detail_images),
+                "抖音商品详情图",
+            ),
+        )
+        results: Dict[str, str] = {}
+        for key, field_label, paths, log_label in groups:
+            item = await self._wait_for_field(field_label)
+            results[key] = await sync_image_group(
+                self.page,
+                item,
+                paths,
+                log_label,
+                timeout_seconds,
+            )
+        return results

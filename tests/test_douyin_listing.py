@@ -13,6 +13,7 @@ from douyin_listing import (
     choose_unique_option,
     normalize_option,
 )
+from size_image_recognition import SkuRecommendation
 
 
 LOGGER = logging.getLogger("douyin-listing-tests")
@@ -159,6 +160,7 @@ DOUYIN_FIXTURE = r"""
 </div>
 <script>
 let selectSequence = 0;
+window.sizeWriteCount = 0;
 
 function selectBox(label, values, multi=false) {
   const dropdownId = `attribute-popper-${++selectSequence}`;
@@ -190,6 +192,40 @@ function materialRow() {
     <i class="el-icon-delete" onclick="this.closest('.measure-item').remove()"></i>
   </div>`;
 }
+
+function sizeRow(size) {
+  const input = () => `<input oninput="window.sizeWriteCount += 1">`;
+  return `<tr data-size="${size}">
+    <td><div class="cell"><span class="size-name">${size}</span></div></td>
+    <td><div class="cell">${input()}</div></td>
+    <td><div class="cell">${input()}</div></td>
+    <td><div class="cell">${input()}</div></td>
+    <td><div class="cell">${input()}</div></td>
+    <td><div class="cell">${input()}</div></td>
+  </tr>`;
+}
+
+function sizeTable() {
+  const headerRow = `<tr>
+      <th><div class="cell">尺码</div></th>
+      <th><div class="cell">身高(cm)</div></th>
+      <th><div class="cell">体重(斤)</div></th>
+      <th><div class="cell">腰围(cm)</div></th>
+      <th><div class="cell">臀围(cm)</div></th>
+      <th><div class="cell">裤长(cm)</div></th>
+    </tr>`;
+  return `<div class="el-table size-recommend-table">
+    <div class="el-table__header-wrapper"><table><thead>${headerRow}</thead></table></div>
+    <div class="el-table__body-wrapper"><table><tbody id="size-rows"></tbody></table></div>
+    <div class="el-table__fixed-right">
+      <div class="el-table__fixed-header-wrapper"><table><thead>${headerRow}</thead></table></div>
+    </div>
+  </div>`;
+}
+
+window.renderSizeRows = sizes => {
+  document.querySelector('#size-rows').innerHTML = sizes.map(sizeRow).join('');
+};
 
 function openSelect(element) {
   document.querySelectorAll('.el-select-dropdown').forEach(dropdown => {
@@ -266,8 +302,22 @@ function openDouyin() {
         <label class="el-form-item__label">导购短标题</label>
         <div class="el-form-item__content"><input placeholder="建议填写简明准确的标题内容，避免重复表达"></div>
       </div>
+      ${sizeTable()}
+      <div class="el-form-item">
+        <label class="el-form-item__label">主图</label>
+        <div class="el-form-item__content" data-image-group="main" data-existing-count="2"></div>
+      </div>
+      <div class="el-form-item">
+        <label class="el-form-item__label">主图3:4</label>
+        <div class="el-form-item__content" data-image-group="main-34" data-existing-count="0"></div>
+      </div>
+      <div class="el-form-item">
+        <label class="el-form-item__label">商品详情图</label>
+        <div class="el-form-item__content" data-image-group="details" data-existing-count="2"></div>
+      </div>
       <div id="attributes"></div>
     </section>`;
+    renderSizeRows(['XL', 'S', '2XL', 'M', 'L']);
   }, 60);
 }
 </script>
@@ -332,6 +382,92 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator("#material-rows .measure-item").count(), 2)
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
+
+    @staticmethod
+    def recommendations():
+        return (
+            SkuRecommendation("S", 155, 160, 50, 60, 80, 106, 104),
+            SkuRecommendation("M", 155, 170, 50, 70, 84, 110, 106),
+            SkuRecommendation("L", 155, 180, 50, 80, 88, 114, 108),
+            SkuRecommendation("XL", 155, 190, 50, 90, 92, 118, 110),
+            SkuRecommendation("2XL", 155, 200, 50, 100, 96, 122, 112),
+        )
+
+    async def test_size_recommendations_map_by_size_text_not_row_order(self):
+        await self.listing.open()
+
+        actual = await self.listing.fill_size_recommendations(self.recommendations())
+
+        self.assertEqual(
+            actual["S"],
+            ("155-160", "50-60", "80", "106", "104"),
+        )
+        self.assertEqual(
+            actual["2XL"],
+            ("155-200", "50-100", "96", "122", "112"),
+        )
+        self.assertEqual(
+            await self.page.locator("tr[data-size='M'] input").evaluate_all(
+                "inputs => inputs.map(input => input.value)"
+            ),
+            ["155-170", "50-70", "84", "110", "106"],
+        )
+        self.assertGreater(await self.page.evaluate("window.sizeWriteCount"), 0)
+
+    async def test_size_preflight_rejects_duplicate_and_missing_unexpected_before_writes(self):
+        await self.listing.open()
+
+        await self.page.evaluate(
+            "sizes => renderSizeRows(sizes)",
+            ["S", "M", "L", "XL", "XL"],
+        )
+        await self.page.evaluate("window.sizeWriteCount = 0")
+        with self.assertRaisesRegex(DouyinListingError, r"重复：XL.*缺少：2XL"):
+            await self.listing.fill_size_recommendations(self.recommendations())
+        self.assertEqual(await self.page.evaluate("window.sizeWriteCount"), 0)
+
+        await self.page.evaluate(
+            "sizes => renderSizeRows(sizes)",
+            ["S", "M", "L", "XL", "3XL"],
+        )
+        await self.page.evaluate("window.sizeWriteCount = 0")
+        with self.assertRaisesRegex(DouyinListingError, r"缺少：2XL.*意外：3XL"):
+            await self.listing.fill_size_recommendations(self.recommendations())
+        self.assertEqual(await self.page.evaluate("window.sizeWriteCount"), 0)
+
+    async def test_douyin_image_groups_delegate_independently_and_preserve_order(self):
+        await self.listing.open()
+        calls = []
+
+        async def fake_sync(page, item, paths, label, timeout_seconds):
+            image_group = item.locator("[data-image-group]")
+            group = await image_group.get_attribute("data-image-group")
+            existing_count = int(
+                await image_group.get_attribute("data-existing-count") or 0
+            )
+            calls.append((group, paths, label, timeout_seconds))
+            return "skipped" if existing_count == len(paths) else "replaced"
+
+        main = (Path("main-2.jpg"), Path("main-10.jpg"))
+        main_34 = (Path("main-34-1.jpg"),)
+        details = (Path("detail-1.jpg"), Path("detail-2.jpg"))
+        with patch("kuaimai_erp.sync_image_group", new=fake_sync):
+            actual = await self.listing.sync_douyin_images(
+                main,
+                main_34,
+                details,
+                timeout_seconds=45,
+            )
+
+        self.assertEqual(
+            actual,
+            {"main": "skipped", "main_34": "replaced", "details": "skipped"},
+        )
+        self.assertEqual([call[0] for call in calls], ["main", "main-34", "details"])
+        self.assertEqual(calls[0][1], main)
+        self.assertEqual(calls[1][1], main_34)
+        self.assertEqual(calls[2][1], details)
+        self.assertTrue(all(call[3] == 45 for call in calls))
 
     async def test_apply_category_and_fields_rejects_unmatched_supplied_attribute(self):
         await self.listing.open()
