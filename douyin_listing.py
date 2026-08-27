@@ -83,6 +83,20 @@ def _form_number(value: object) -> str:
     return str(value).strip()
 
 
+async def _size_header_label(header: Any) -> str:
+    """读取 Element UI 表头的第一行字段名，忽略后续规则提示。"""
+    label_lines = header.locator(":scope > .cell > p")
+    for index in range(await label_lines.count()):
+        text = (await label_lines.nth(index).inner_text()).strip()
+        if text:
+            return text
+    for line in (await header.inner_text()).splitlines():
+        text = line.strip()
+        if text:
+            return text
+    return ""
+
+
 class DouyinListing:
     """抖音资料页的类目、属性和面料填写适配器。"""
 
@@ -889,7 +903,7 @@ class DouyinListing:
                         ":scope > .el-table__header-wrapper thead th"
                     )
                     header_texts = {
-                        _normalize_label(await header.inner_text())
+                        _normalize_label(await _size_header_label(header))
                         for header in [
                             headers.nth(header_index)
                             for header_index in range(await headers.count())
@@ -901,10 +915,7 @@ class DouyinListing:
                     matches.append(candidate)
             return matches
 
-        # 真实页面是 Element UI 表格；普通 table 回退仅用于等价测试页。
         matches = await matching_tables(".el-table")
-        if not matches:
-            matches = await matching_tables("table")
         if len(matches) != 1:
             raise DouyinListingError(
                 f"尺码推荐表匹配数为 {len(matches)}，无法安全填写"
@@ -960,7 +971,7 @@ class DouyinListing:
         headers = table.locator(":scope > .el-table__header-wrapper thead th")
         by_label: Dict[str, List[int]] = {}
         for index in range(await headers.count()):
-            label = _normalize_label(await headers.nth(index).inner_text())
+            label = _normalize_label(await _size_header_label(headers.nth(index)))
             by_label.setdefault(label, []).append(index)
 
         result: Dict[str, int] = {}

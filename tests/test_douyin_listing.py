@@ -206,13 +206,16 @@ function sizeRow(size) {
 }
 
 function sizeTable() {
+  const header = (label, help='') => `<th><div class="cell">
+    <p>${label}</p><p class="header-ruleTip">${help}</p>
+  </div></th>`;
   const headerRow = `<tr>
-      <th><div class="cell">尺码</div></th>
-      <th><div class="cell">身高(cm)</div></th>
-      <th><div class="cell">体重(斤)</div></th>
-      <th><div class="cell">腰围(cm)</div></th>
-      <th><div class="cell">臀围(cm)</div></th>
-      <th><div class="cell">裤长(cm)</div></th>
+      ${header('尺码')}
+      ${header('身高(cm)', '请填写40-220之间的数值')}
+      ${header('体重(斤)', '请填写4-320之间的数值')}
+      ${header('腰围(cm)', '请填写20-200之间的数值')}
+      ${header('臀围(cm)', '请填写50-200之间的数值')}
+      ${header('裤长(cm)', '请填写15-150之间的数值')}
     </tr>`;
   return `<div class="el-table size-recommend-table">
     <div class="el-table__header-wrapper"><table><thead>${headerRow}</thead></table></div>
