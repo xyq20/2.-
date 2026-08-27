@@ -42,8 +42,8 @@ func writeError(_ message: String) {
 func imageOrientation(from source: CGImageSource) -> CGImagePropertyOrientation {
     guard
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-        let rawOrientation = properties[kCGImagePropertyOrientation] as? UInt32,
-        let orientation = CGImagePropertyOrientation(rawValue: rawOrientation)
+        let rawOrientation = properties[kCGImagePropertyOrientation] as? NSNumber,
+        let orientation = CGImagePropertyOrientation(rawValue: rawOrientation.uint32Value)
     else {
         return .up
     }
