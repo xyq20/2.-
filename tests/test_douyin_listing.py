@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import tempfile
 import unittest
@@ -84,7 +85,7 @@ class CategoryPropertyCacheTests(unittest.IsolatedAsyncioTestCase):
         page = _EventPage()
         listing = DouyinListing(page, None, LOGGER, Path("ignored-artifacts"))
 
-        stale_generation = await listing._begin_category_property_capture()
+        await listing._begin_category_property_capture()
         first_request = _PropertyRequest("old-leaf")
         late_request = _PropertyRequest("old-leaf")
         page.emit("request", first_request)
@@ -94,9 +95,6 @@ class CategoryPropertyCacheTests(unittest.IsolatedAsyncioTestCase):
             _PropertyResponse(first_request, "old-property", "旧选项"),
         )
         await listing._drain_property_response_tasks()
-        self.assertTrue(
-            await listing._wait_for_fresh_category_properties(stale_generation)
-        )
         self.assertEqual((await listing._api_property("厚度"))["id"], "old-property")
 
         fresh_generation = await listing._begin_category_property_capture()
@@ -122,6 +120,32 @@ class CategoryPropertyCacheTests(unittest.IsolatedAsyncioTestCase):
         fresh_property = await listing._api_property("厚度")
         self.assertEqual(fresh_property["id"], "fresh-property")
         self.assertEqual(fresh_property["options"][0]["name"], "新选项")
+
+    async def test_second_leaf_response_in_same_generation_forces_dom_fallback(self):
+        page = _EventPage()
+        listing = DouyinListing(page, None, LOGGER, Path("ignored-artifacts"))
+        generation = await listing._begin_category_property_capture()
+        first_request = _PropertyRequest("first-leaf")
+        second_request = _PropertyRequest("second-leaf")
+        page.emit("request", first_request)
+        page.emit("request", second_request)
+        page.emit(
+            "response",
+            _PropertyResponse(first_request, "first-property", "第一选项"),
+        )
+
+        wait_task = asyncio.create_task(
+            listing._wait_for_fresh_category_properties(generation)
+        )
+        await asyncio.sleep(0.05)
+        self.assertFalse(wait_task.done(), "第二个已观测请求未完成时不应定稿")
+
+        page.emit(
+            "response",
+            _PropertyResponse(second_request, "second-property", "第二选项"),
+        )
+        self.assertFalse(await wait_task)
+        self.assertIsNone(await listing._api_property("厚度"))
 
 
 DOUYIN_FIXTURE = r"""

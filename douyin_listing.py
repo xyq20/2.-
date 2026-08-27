@@ -21,6 +21,8 @@ from urllib.parse import parse_qs, urlsplit
 # 2026-08-27 在真实抖音资料页选择预测类目后观测到的精确路径。
 # 请勿放宽为 list/query 等通用子串，避免误解析其他业务接口。
 CATEGORY_PROPERTIES_ENDPOINT = "/fxg/getCategoryProperties.json"
+CATEGORY_PROPERTIES_QUIET_SECONDS = 0.2
+CATEGORY_PROPERTIES_TIMEOUT_SECONDS = 2.0
 
 
 class DouyinListingError(RuntimeError):
@@ -70,6 +72,9 @@ class DouyinListing:
         self._category_properties: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
         self._property_response_tasks: set[asyncio.Task[Any]] = set()
         self._property_request_generations: Dict[int, Tuple[int, str]] = {}
+        self._property_pending_requests: Dict[int, set[int]] = {}
+        self._property_leaf_ids: Dict[int, set[str]] = {}
+        self._property_last_activity = 0.0
         self._property_generation = 0
         self._property_capture_generation: Optional[int] = None
         self._category_properties_generation: Optional[int] = None
@@ -88,7 +93,11 @@ class DouyinListing:
             leaf_id = self._request_leaf_category_id(request)
             if generation is None or leaf_id is None:
                 return
-            self._property_request_generations[id(request)] = (generation, leaf_id)
+            request_id = id(request)
+            self._property_request_generations[request_id] = (generation, leaf_id)
+            self._property_pending_requests.setdefault(generation, set()).add(request_id)
+            self._property_leaf_ids.setdefault(generation, set()).add(leaf_id)
+            self._mark_property_activity(generation)
 
         def on_response(response: Any) -> None:
             if not self._is_category_properties_response(response):
@@ -100,6 +109,7 @@ class DouyinListing:
                 # the previous category and must not populate the active cache.
                 return
             generation, leaf_id = request_context
+            self._complete_property_request(generation, id(request))
             task = asyncio.create_task(
                 self._consume_category_properties(response, generation, leaf_id)
             )
@@ -107,12 +117,27 @@ class DouyinListing:
             task.add_done_callback(self._property_response_tasks.discard)
 
         def on_request_failed(request: Any) -> None:
-            self._property_request_generations.pop(id(request), None)
+            request_id = id(request)
+            request_context = self._property_request_generations.pop(request_id, None)
+            if request_context is not None:
+                generation, _leaf_id = request_context
+                self._complete_property_request(generation, request_id)
 
         self.page.on("request", on_request)
         self.page.on("response", on_response)
         self.page.on("requestfailed", on_request_failed)
         self._response_listener_installed = True
+
+    def _mark_property_activity(self, generation: int) -> None:
+        if self._property_capture_generation != generation:
+            return
+        self._property_last_activity = asyncio.get_running_loop().time()
+
+    def _complete_property_request(self, generation: int, request_id: int) -> None:
+        pending = self._property_pending_requests.get(generation)
+        if pending is not None:
+            pending.discard(request_id)
+        self._mark_property_activity(generation)
 
     def _is_category_properties_url(self, raw_url: object) -> bool:
         try:
@@ -221,6 +246,9 @@ class DouyinListing:
     async def _begin_category_property_capture(self) -> int:
         self._install_property_response_listener()
         await self._drain_property_response_tasks()
+        previous_generation = self._property_capture_generation
+        if previous_generation is not None:
+            self._invalidate_property_capture(previous_generation)
         self._property_generation += 1
         generation = self._property_generation
         self._property_capture_generation = generation
@@ -228,6 +256,9 @@ class DouyinListing:
         self._category_properties_generation = None
         self._category_properties_leaf_id = None
         self._category_properties_seen = asyncio.Event()
+        self._property_pending_requests[generation] = set()
+        self._property_leaf_ids[generation] = set()
+        self._property_last_activity = asyncio.get_running_loop().time()
         return generation
 
     def _invalidate_property_capture(self, generation: int) -> None:
@@ -238,6 +269,8 @@ class DouyinListing:
         self._category_properties_generation = None
         self._category_properties_leaf_id = None
         self._category_properties_seen.set()
+        self._property_pending_requests.pop(generation, None)
+        self._property_leaf_ids.pop(generation, None)
 
     async def _wait_for_fresh_category_properties(self, generation: int) -> bool:
         if urlsplit(self.page.url).scheme not in {"http", "https"}:
@@ -245,23 +278,38 @@ class DouyinListing:
             return False
         if self._property_capture_generation != generation:
             return False
-        if self._category_properties_generation != generation:
-            try:
-                await asyncio.wait_for(self._category_properties_seen.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                self._invalidate_property_capture(generation)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CATEGORY_PROPERTIES_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            await self._drain_property_response_tasks()
+            if self._property_capture_generation != generation:
                 return False
-        await self._drain_property_response_tasks()
-        fresh = (
-            self._property_capture_generation == generation
-            and self._category_properties_generation == generation
-            and bool(self._category_properties)
-            and self._category_properties_leaf_id is not None
-        )
-        if fresh:
-            # Keep the verified cache, but stop tagging later unrelated requests.
-            self._property_capture_generation = None
-            return True
+
+            pending = self._property_pending_requests.get(generation, set())
+            if not pending:
+                leaf_ids = self._property_leaf_ids.get(generation, set())
+                if len(leaf_ids) > 1:
+                    self._invalidate_property_capture(generation)
+                    return False
+                fresh = (
+                    self._category_properties_generation == generation
+                    and bool(self._category_properties)
+                    and self._category_properties_leaf_id is not None
+                    and leaf_ids == {self._category_properties_leaf_id}
+                )
+                quiet_for = loop.time() - self._property_last_activity
+                if fresh and quiet_for >= CATEGORY_PROPERTIES_QUIET_SECONDS:
+                    # Keep the verified cache, but stop tagging later unrelated requests.
+                    self._property_capture_generation = None
+                    self._property_pending_requests.pop(generation, None)
+                    self._property_leaf_ids.pop(generation, None)
+                    return True
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.02, remaining))
+
         self._invalidate_property_capture(generation)
         return False
 
