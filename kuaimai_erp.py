@@ -67,6 +67,10 @@ class ProductData:
     douyin_fields: Optional[DouyinFields] = None
     douyin_assets: Optional[DouyinAssets] = None
 
+    def __post_init__(self) -> None:
+        if (self.douyin_fields is None) != (self.douyin_assets is None):
+            raise ValueError("抖音字段与素材必须成对提供或同时省略")
+
 
 def natural_key(path: Path) -> List[Any]:
     return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", path.name)]

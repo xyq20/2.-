@@ -258,6 +258,30 @@ class KuaimaiIntegrationTests(unittest.TestCase):
         self.assertIsNone(product.douyin_fields)
         self.assertIsNone(product.douyin_assets)
 
+    def test_product_data_rejects_unpaired_douyin_inputs(self):
+        product_args = {
+            "excel_path": Path("/input/产品信息.xlsx"),
+            "product_dir": Path("/input"),
+            "title": "标题",
+            "style_code": "款号",
+            "base_price": "586",
+            "main_images": [],
+            "main_images_34": [],
+            "detail_images": [],
+            "sku_images": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "抖音.*成对"):
+            kuaimai_erp.ProductData(
+                **product_args,
+                douyin_fields=parse_douyin_fields(CURRENT_PRODUCT_FIELDS),
+            )
+        with self.assertRaisesRegex(ValueError, "抖音.*成对"):
+            kuaimai_erp.ProductData(
+                **product_args,
+                douyin_assets=read_douyin_assets_for_summary(),
+            )
+
     def test_attributes_are_immutable_mappings(self):
         attributes = parse_douyin_fields(CURRENT_PRODUCT_FIELDS).attributes
 
