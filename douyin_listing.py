@@ -1495,3 +1495,34 @@ class DouyinListing:
         if len(applied) != len(visible_rows):
             raise DouyinListingError("运费模板处理店铺数与页面不一致")
         return applied
+
+    async def validate_douyin_form(
+        self,
+        report: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """收集页面可见错误，并返回可写入 JSON 的铺货前报告。"""
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+        errors = []
+        locator = self.panel.locator(".el-form-item__error:visible")
+        for index in range(await locator.count()):
+            text = (await locator.nth(index).inner_text()).strip()
+            if text and text not in errors:
+                errors.append(text)
+        if errors:
+            raise DouyinListingError("抖音资料存在页面校验错误：" + "；".join(errors))
+
+        def serializable(value: Any) -> Any:
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, Mapping):
+                return {str(key): serializable(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [serializable(item) for item in value]
+            if isinstance(value, Decimal):
+                return format(value, "f")
+            return value
+
+        result = serializable(report)
+        result["errors"] = []
+        return result

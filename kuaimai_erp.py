@@ -23,6 +23,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import unquote, urlsplit
 
 from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
+from douyin_listing import DouyinListing, DouyinListingError
+from size_image_recognition import RecognitionError, SkuRecommendation, recognize_recommendations
 
 
 ERP_ENTRY_URL = "https://erp.superboss.cc/index.html#/index/"
@@ -229,6 +231,26 @@ def product_summary(product: ProductData) -> Dict[str, Any]:
         return value
 
     return serialize(asdict(product))
+
+
+def recognize_product_recommendations(
+    product: ProductData,
+    artifact_dir: Path,
+) -> tuple[SkuRecommendation, ...]:
+    """在打开浏览器前完成本地尺码识别，失败则不进入页面。"""
+    if product.douyin_fields is None or product.douyin_assets is None:
+        return ()
+    recommendations = recognize_recommendations(
+        product.douyin_assets.size_chart_image,
+        product.douyin_assets.height_weight_image,
+        product.douyin_fields.sizes,
+    )
+    payload = [asdict(item) for item in recommendations]
+    (artifact_dir / "ocr-result.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return recommendations
 
 
 def setup_logging(artifact_dir: Path) -> logging.Logger:
@@ -1077,7 +1099,9 @@ async def click_save_and_confirm(
     sync_erp: bool,
     timeout_seconds: int,
     logger: logging.Logger,
+    button_text: str = "保存",
 ) -> Dict[str, Any]:
+    """单次点击指定保存按钮，通过同源编辑接口或成功提示确认。"""
     save_responses: List[Any] = []
 
     def on_response(response: Any) -> None:
@@ -1092,24 +1116,27 @@ async def click_save_and_confirm(
         if not await visible(candidate):
             continue
         text = re.sub(r"\s+", "", (await candidate.inner_text()))
-        if text == "保存":
+        if text == re.sub(r"\s+", "", button_text):
             save_button = candidate
             break
     if save_button is None:
-        raise AutomationError("商品编辑页找不到“保存”按钮")
+        raise AutomationError(f"商品编辑页找不到“{button_text}”按钮")
 
     await save_button.scroll_into_view_if_needed()
     await save_button.click()
-    logger.info("已点击“保存”，等待后端确认")
+    logger.info("已点击“%s”，等待后端确认", button_text)
     started_at = time.monotonic()
     deadline = time.monotonic() + timeout_seconds
     sync_dialog_handled = False
     unbound_dialog_handled = False
+    publish_dialog_handled = False
 
     while time.monotonic() < deadline:
-        success = page.locator(".el-message--success").filter(has_text="保存成功")
+        success = page.locator(".el-message--success").filter(
+            has_text=re.compile("保存成功|铺货成功|已提交铺货")
+        )
         if await visible(success.first):
-            return {"result": 1, "confirmed_by": "toast"}
+            return {"result": 1, "confirmed_by": "toast", "action": button_text}
 
         if save_responses:
             response = save_responses[-1]
@@ -1118,7 +1145,12 @@ async def click_save_and_confirm(
             except Exception:
                 payload = {"http_status": response.status}
             if int(payload.get("result", 0) or 0) == 1:
-                return {"result": 1, "confirmed_by": "api", "payload": payload}
+                return {
+                    "result": 1,
+                    "confirmed_by": "api",
+                    "action": button_text,
+                    "payload": payload,
+                }
             raise AutomationError(
                 "保存接口返回失败："
                 + str(payload.get("message") or payload.get("errmsg") or payload)
@@ -1142,6 +1174,20 @@ async def click_save_and_confirm(
             unbound_dialog_handled = True
             logger.warning("页面提示 SKU 未关联 ERP，已按页面流程继续保存")
 
+        if button_text == "保存并铺货到平台" and not publish_dialog_handled:
+            publish_dialog = page.locator(
+                ".el-message-box:visible, .el-dialog:visible"
+            ).filter(has_text=re.compile("确认.*铺货|铺货.*平台"))
+            if await visible(publish_dialog.first):
+                confirm = publish_dialog.first.get_by_role(
+                    "button", name=re.compile(r"^\s*(?:确定|确 定)\s*$")
+                )
+                if await confirm.count() != 1:
+                    raise AutomationError("铺货确认框中找不到唯一的“确定”按钮")
+                await confirm.click()
+                publish_dialog_handled = True
+                logger.info("已确认铺货对话框")
+
         duplicate_dialog = page.locator(".el-message-box:visible").filter(has_text=re.compile("编码.*重复|存在SPU编码相同"))
         if await visible(duplicate_dialog.first):
             raise AutomationError("保存时出现编码重复确认框，程序未自动创建新编码，请人工复核")
@@ -1149,13 +1195,13 @@ async def click_save_and_confirm(
         if time.monotonic() - started_at > 3:
             errors = await collect_visible_errors(drawer)
             if errors:
-                raise AutomationError("保存被页面校验拦截：" + "；".join(errors))
+                raise AutomationError(f"“{button_text}”被页面校验拦截：" + "；".join(errors))
 
         await asyncio.sleep(0.25)
 
     errors = await collect_visible_errors(drawer)
     if errors:
-        raise AutomationError("保存超时，页面校验错误：" + "；".join(errors))
+        raise AutomationError(f"“{button_text}”超时，页面校验错误：" + "；".join(errors))
     warnings: List[str] = []
     warning_locator = page.locator(".el-message--warning:visible, .el-message--error:visible")
     for index in range(await warning_locator.count()):
@@ -1163,7 +1209,7 @@ async def click_save_and_confirm(
         if text:
             warnings.append(text)
     suffix = "：" + "；".join(warnings) if warnings else ""
-    raise AutomationError("等待保存成功超时" + suffix)
+    raise AutomationError(f"等待“{button_text}”成功确认超时" + suffix)
 
 
 async def run_browser_automation(args: argparse.Namespace, product: ProductData, artifact_dir: Path, logger: logging.Logger) -> None:
@@ -1171,6 +1217,10 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
         from playwright.async_api import async_playwright
     except ImportError as exc:
         raise AutomationError("缺少 Playwright，请先运行：python3 -m pip install -r requirements.txt") from exc
+
+    recommendations = recognize_product_recommendations(product, artifact_dir)
+    if recommendations:
+        logger.info("本地尺码识别完成：%s", " / ".join(item.size for item in recommendations))
 
     async with async_playwright() as playwright:
         remote_browser = None
@@ -1285,27 +1335,85 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 raise AutomationError("保存前复核失败：商品名称发生变化")
             if Decimal(await price_input.input_value()) != Decimal(product.base_price):
                 raise AutomationError("保存前复核失败：基本售价发生变化")
-            errors = await collect_visible_errors(drawer)
-            if errors:
-                raise AutomationError("保存前页面存在校验错误：" + "；".join(errors))
+            base_errors = await collect_visible_errors(drawer)
+            if base_errors:
+                raise AutomationError("基础资料存在页面校验错误：" + "；".join(base_errors))
 
-            await safe_screenshot(page, artifact_dir / "before-save.png")
+            publish_mode = product.douyin_fields is not None
+            if publish_mode:
+                assert product.douyin_fields is not None
+                assert product.douyin_assets is not None
+                douyin = DouyinListing(page, drawer, logger, artifact_dir)
+                await douyin.open()
+                category_fields = await douyin.apply_category_and_fields(product.douyin_fields)
+                materials = await douyin.apply_materials(
+                    product.douyin_fields.materials,
+                    product.douyin_assets.wash_label_images,
+                )
+                size_rows = await douyin.fill_size_recommendations(recommendations)
+                image_actions = await douyin.sync_douyin_images(
+                    product.main_images,
+                    product.main_images_34,
+                    product.detail_images,
+                    timeout_seconds=args.upload_timeout,
+                )
+                delivery = await douyin.apply_delivery_mode()
+                sku_rows = await douyin.fill_sku_price_inventory(
+                    product.douyin_fields.price,
+                    product.douyin_fields.spot_stock,
+                    product.douyin_fields.presale_stock,
+                )
+                freight = await douyin.apply_freight_templates(
+                    product.douyin_fields.freight_aliases
+                )
+                douyin_report = await douyin.validate_douyin_form(
+                    {
+                        **category_fields,
+                        "materials": materials,
+                        "sizes": size_rows,
+                        "images": image_actions,
+                        "delivery": delivery,
+                        "sku": {
+                            "rows": sku_rows,
+                            "price": product.douyin_fields.price,
+                            "spot_stock": product.douyin_fields.spot_stock,
+                            "presale_stock": product.douyin_fields.presale_stock,
+                        },
+                        "freight": freight,
+                    }
+                )
+                (artifact_dir / "douyin-before-publish.json").write_text(
+                    json.dumps(douyin_report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                await safe_screenshot(page, artifact_dir / "before-publish.png")
+                logger.info("抖音资料填写与铺货前复核完成")
+            else:
+                await safe_screenshot(page, artifact_dir / "before-save.png")
+
             if not args.save:
-                logger.info("已完成填写与校验；--no-save 已启用，未点击保存")
+                logger.info(
+                    "已完成基础资料与抖音资料校验；"
+                    "--no-save 已启用，未点击保存或铺货"
+                )
                 return
 
+            action_text = "保存并铺货到平台" if publish_mode else "保存"
             result = await click_save_and_confirm(
                 page,
                 drawer,
                 args.sync_erp,
                 args.timeout,
                 logger,
+                button_text=action_text,
             )
-            (artifact_dir / "save-result.json").write_text(
+            result_name = "publish-result.json" if publish_mode else "save-result.json"
+            (artifact_dir / result_name).write_text(
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            await safe_screenshot(page, artifact_dir / "after-save.png")
-            logger.info("保存成功（确认来源：%s）", result.get("confirmed_by"))
+            screenshot_name = "after-publish.png" if publish_mode else "after-save.png"
+            await safe_screenshot(page, artifact_dir / screenshot_name)
+            logger.info("%s成功（确认来源：%s）", action_text, result.get("confirmed_by"))
         except Exception:
             await safe_screenshot(page, artifact_dir / "error.png")
             raise
@@ -1318,11 +1426,22 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="从 Excel 和产品图片文件夹自动编辑快麦 ERP 基础资料")
+    parser = argparse.ArgumentParser(description="从 Excel 和产品素材自动填写快麦基础/抖音资料")
     parser.add_argument("--excel-url", default=DEFAULT_EXCEL_URL, help="产品信息.xlsx 的 smb:// 或本地路径")
     parser.add_argument("--dry-run", action="store_true", help="只读取并校验 Excel/图片，不打开浏览器")
-    parser.add_argument("--save", dest="save", action="store_true", default=True, help="最后点击保存（默认）")
-    parser.add_argument("--no-save", dest="save", action="store_false", help="填写并校验，但不保存")
+    parser.add_argument(
+        "--save",
+        dest="save",
+        action="store_true",
+        default=True,
+        help="最后点击保存；含抖音资料时点击“保存并铺货到平台”（默认）",
+    )
+    parser.add_argument(
+        "--no-save",
+        dest="save",
+        action="store_false",
+        help="填写并校验基础/抖音资料，但不保存也不铺货",
+    )
     parser.add_argument("--sync-erp", action="store_true", help="出现 ERP 同步确认框时选择同步；默认跳过同步")
     parser.add_argument("--headless", action="store_true", help="无头模式（仅适用于专用 Chrome 配置已登录）")
     parser.add_argument("--cdp-url", help="连接已开启远程调试的 Chrome，例如 http://127.0.0.1:9222")
@@ -1371,7 +1490,7 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.error("用户中止了程序")
         return 130
-    except (AutomationError, DouyinDataError) as exc:
+    except (AutomationError, DouyinDataError, DouyinListingError, RecognitionError) as exc:
         logger.error("%s", exc)
         return 2
     except Exception:
