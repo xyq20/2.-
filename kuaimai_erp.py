@@ -958,7 +958,39 @@ async def replace_image_group(
     label: str,
     timeout_seconds: int,
 ) -> None:
+    """Backward-compatible alias for :func:`sync_image_group`."""
+    await sync_image_group(page, item, paths, label, timeout_seconds)
+
+
+async def sync_image_group(
+    page: Any,
+    item: Any,
+    paths: Sequence[Path],
+    label: str,
+    timeout_seconds: int,
+) -> str:
+    """Make one image group match the expected local image count.
+
+    The page does not expose stable image identifiers, so count is the only
+    deliberate synchronization criterion.  When the count already matches,
+    leave the group untouched; otherwise delete all existing images and upload
+    every path in the caller-provided order.
+    """
+    if not paths:
+        raise AutomationError(f"{label}没有可上传图片")
+
     await item.scroll_into_view_if_needed()
+    images = item.locator(".sc-upload .file-img")
+    existing_count = await images.count()
+    expected_count = len(paths)
+    if existing_count == expected_count:
+        logging.getLogger("kuaimai_erp").info(
+            "%s：页面已有 %s 张图片，与本地预期一致，跳过上传",
+            label,
+            expected_count,
+        )
+        return "skipped"
+
     deleted = await delete_uploaded_images(item, page)
     if deleted:
         logging.getLogger("kuaimai_erp").info("%s：已删除 %s 张原图", label, deleted)
@@ -966,7 +998,8 @@ async def replace_image_group(
     if not await inputs.count():
         raise AutomationError(f"{label}区域找不到本地上传控件")
     await inputs.first.set_input_files([str(path) for path in paths])
-    await wait_for_image_uploads(item, len(paths), label, timeout_seconds)
+    await wait_for_image_uploads(item, expected_count, label, timeout_seconds)
+    return "replaced"
 
 
 async def replace_sku_images(
@@ -1215,21 +1248,21 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
             title_input = await fill_input(title_item, product.title, "商品名称")
             logger.info("已填写商品名称")
 
-            await replace_image_group(
+            await sync_image_group(
                 page,
                 await form_item(drawer, "商品主图", timeout_seconds=args.timeout),
                 product.main_images,
                 "1:1 主图",
                 args.upload_timeout,
             )
-            await replace_image_group(
+            await sync_image_group(
                 page,
                 await form_item(drawer, "3:4主图", timeout_seconds=args.timeout),
                 product.main_images_34,
                 "3:4 主图",
                 args.upload_timeout,
             )
-            await replace_image_group(
+            await sync_image_group(
                 page,
                 await form_item(drawer, "商品详情图", timeout_seconds=args.timeout),
                 product.detail_images,
