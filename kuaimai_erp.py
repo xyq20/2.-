@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import unquote, urlsplit
 
+from douyin_data import DouyinAssets, DouyinFields, parse_douyin_fields, read_douyin_assets
+
 
 ERP_ENTRY_URL = "https://erp.superboss.cc/index.html#/index/"
 CENTER_URL = "https://scm.superboss.cc/supplier/prod/center"
@@ -61,6 +63,8 @@ class ProductData:
     main_images_34: List[Path]
     detail_images: List[Path]
     sku_images: List[Path]
+    douyin_fields: DouyinFields
+    douyin_assets: DouyinAssets
 
 
 def natural_key(path: Path) -> List[Any]:
@@ -84,6 +88,20 @@ def normalize_price(value: Any) -> str:
     if number < 0:
         raise AutomationError(f"基本售价不能小于 0：{text!r}")
     return format(number.normalize(), "f")
+
+
+def read_excel_fields(rows: Iterable[Sequence[Any]]) -> Dict[str, Any]:
+    """将产品信息 Excel 的键值行提取为可复用的原始字段映射。"""
+    fields: Dict[str, Any] = {}
+    for row in rows:
+        if not row:
+            continue
+        key = normalize_cell(row[0] if len(row) > 0 else None)
+        if not key:
+            continue
+        value = next((cell for cell in row[1:] if cell is not None and normalize_cell(cell)), None)
+        fields[key] = value
+    return fields
 
 
 def resolve_excel_path(value: str) -> Path:
@@ -139,15 +157,7 @@ def read_product_data(excel_path: Path) -> ProductData:
     if len(rows) < 2:
         raise AutomationError(f"Excel 内容不完整：{excel_path}")
 
-    fields: Dict[str, Any] = {}
-    for row in rows:
-        if not row:
-            continue
-        key = normalize_cell(row[0])
-        if not key:
-            continue
-        value = next((cell for cell in row[1:] if cell is not None and normalize_cell(cell)), None)
-        fields[key] = value
+    fields = read_excel_fields(rows)
 
     def field_containing(*aliases: str) -> Any:
         for key, value in fields.items():
@@ -194,16 +204,22 @@ def read_product_data(excel_path: Path) -> ProductData:
         main_images_34=list_images(main_34_dir, "3:4 主图"),
         detail_images=list_images(detail_dir, "商品详情图"),
         sku_images=list_images(sku_dir, "SKU 图"),
+        douyin_fields=parse_douyin_fields(fields),
+        douyin_assets=read_douyin_assets(product_dir),
     )
 
 
 def product_summary(product: ProductData) -> Dict[str, Any]:
-    data = asdict(product)
-    for key in ("excel_path", "product_dir"):
-        data[key] = str(data[key])
-    for key in ("main_images", "main_images_34", "detail_images", "sku_images"):
-        data[key] = [str(path) for path in data[key]]
-    return data
+    def serialize(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: serialize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [serialize(item) for item in value]
+        return value
+
+    return serialize(asdict(product))
 
 
 def setup_logging(artifact_dir: Path) -> logging.Logger:
