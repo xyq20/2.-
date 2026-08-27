@@ -422,14 +422,24 @@ def _number(text: str) -> Optional[Number]:
 
 def _measurement_kind(text: str) -> Optional[str]:
     compact = re.sub(r"[^A-Z\u4e00-\u9fff]", "", text.upper())
-    if len(compact) > 32:
+    if not compact or len(compact) > 32:
         return None
+
+    def is_alias_composition(aliases: Sequence[str]) -> bool:
+        reachable = {0}
+        for start in range(len(compact)):
+            if start not in reachable:
+                continue
+            for alias in aliases:
+                if compact.startswith(alias, start):
+                    reachable.add(start + len(alias))
+        return len(compact) in reachable
+
     matches = [
         kind
         for kind, aliases in _MEASUREMENT_ALIASES.items()
-        if any(alias in compact for alias in aliases)
+        if is_alias_composition(aliases)
     ]
-    # "裤脚围" also contains "脚围", but both aliases belong to one kind.
     return matches[0] if len(matches) == 1 else None
 
 
@@ -573,14 +583,14 @@ def _axis_candidates(
     return next(iter(best.values()))
 
 
-def _profile_transition(
+def _profile_transitions(
     gray: np.ndarray,
     *,
     horizontal_scan: bool,
     fixed_coordinate: int,
     start: int,
-) -> int:
-    """Find the nearest sustained grayscale boundary after a size label."""
+) -> Tuple[int, ...]:
+    """Find coherent grayscale transitions, ignoring thin grid/text artifacts."""
     height, width = gray.shape
     fixed_limit = height if horizontal_scan else width
     scan_limit = width if horizontal_scan else height
@@ -592,21 +602,58 @@ def _profile_transition(
     else:
         strip = gray[:, fixed_coordinate - half_strip : fixed_coordinate + half_strip + 1]
         profile = np.median(strip, axis=1)
-    profile = cv2.GaussianBlur(profile.astype(np.float32).reshape(1, -1), (5, 1), 0).ravel()
-    side = max(2, int(round(scan_limit * 0.002)))
+    side = max(4, int(round(scan_limit * 0.006)))
+    gap = max(1, side // 3)
     contrasts = np.zeros(scan_limit, dtype=np.float32)
+    coherent = np.zeros(scan_limit, dtype=bool)
     for coordinate in range(side, scan_limit - side):
-        before = np.median(profile[coordinate - side : coordinate])
-        after = np.median(profile[coordinate + 1 : coordinate + side + 1])
-        contrasts[coordinate] = abs(float(after) - float(before))
+        before = profile[coordinate - side : coordinate - gap]
+        after = profile[coordinate + gap : coordinate + side]
+        before_median = float(np.median(before))
+        after_median = float(np.median(after))
+        contrast = abs(after_median - before_median)
+        before_spread = float(np.percentile(before, 90) - np.percentile(before, 10))
+        after_spread = float(np.percentile(after, 90) - np.percentile(after, 10))
+        contrasts[coordinate] = contrast
+        stability_limit = max(6.0, contrast * 0.35)
+        coherent[coordinate] = (
+            contrast >= 7.0
+            and before_spread <= stability_limit
+            and after_spread <= stability_limit
+        )
 
-    candidates = np.flatnonzero(contrasts[max(start, side) : scan_limit - side] >= 7.0)
-    if not len(candidates):
+    points = np.flatnonzero(coherent[max(start, side) : scan_limit - side])
+    if not len(points):
         raise RecognitionError("身高体重推荐表：色块边界缺失或对比度不足")
-    candidates = candidates + max(start, side)
-    first = int(candidates[0])
-    nearby = candidates[candidates <= first + max(3, side * 2)]
-    return int(nearby[np.argmax(contrasts[nearby])])
+    points = points + max(start, side)
+    groups: List[List[int]] = []
+    max_gap = max(2, side // 3)
+    for point in points:
+        coordinate = int(point)
+        if not groups or coordinate - groups[-1][-1] > max_gap:
+            groups.append([coordinate])
+        else:
+            groups[-1].append(coordinate)
+    return tuple(
+        group[int(np.argmax(contrasts[group]))]
+        for group in groups
+    )
+
+
+def _profile_transition(
+    gray: np.ndarray,
+    *,
+    horizontal_scan: bool,
+    fixed_coordinate: int,
+    start: int,
+) -> int:
+    """Return the nearest sustained transition; primarily useful for diagnostics."""
+    return _profile_transitions(
+        gray,
+        horizontal_scan=horizontal_scan,
+        fixed_coordinate=fixed_coordinate,
+        start=start,
+    )[0]
 
 
 def _axis_cell_edges(axis: Sequence[Tuple[OCRToken, Number]], *, horizontal: bool) -> Tuple[float, ...]:
@@ -634,6 +681,45 @@ def _map_boundary_to_axis(
     if abs(edges[nearest_index] - boundary) > typical_spacing * 0.28:
         raise RecognitionError("身高体重推荐表：色块边界与坐标轴网格不对齐")
     return axis[nearest_index][1]
+
+
+def _enclosing_axis_boundary(
+    gray: np.ndarray,
+    *,
+    horizontal_scan: bool,
+    fixed_coordinate: int,
+    start: int,
+    axis: Sequence[Tuple[OCRToken, Number]],
+    horizontal_axis: bool,
+    image_scale: int,
+) -> int:
+    candidates = _profile_transitions(
+        gray,
+        horizontal_scan=horizontal_scan,
+        fixed_coordinate=fixed_coordinate,
+        start=start,
+    )
+    normalized_edges = _axis_cell_edges(axis, horizontal=horizontal_axis)
+    edges = [edge * image_scale for edge in normalized_edges]
+    coordinate = _center_x if horizontal_axis else _center_y
+    centers = [coordinate(token) * image_scale for token, _value in axis]
+    tolerance = float(np.median(np.diff(centers))) * 0.28
+
+    aligned = []
+    for candidate in candidates:
+        edge_index = min(
+            range(len(edges)),
+            key=lambda index: abs(edges[index] - candidate),
+        )
+        if abs(edges[edge_index] - candidate) <= tolerance:
+            aligned.append((candidate, edge_index))
+    if not aligned or aligned[0][0] != candidates[0]:
+        raise RecognitionError("身高体重推荐表：最近色块边界与坐标轴网格不对齐")
+    boundary, edge_index = aligned[0]
+    same_edge = [candidate for candidate, index in aligned if index == edge_index]
+    if len(same_edge) != 1:
+        raise RecognitionError("身高体重推荐表：同一网格存在多个有歧义的色块边界")
+    return boundary
 
 
 def parse_height_weight_chart(
@@ -680,24 +766,34 @@ def parse_height_weight_chart(
     height_min = min(value for _token, value in height_axis)
     weight_min = min(value for _token, value in weight_axis)
     result = {}
+    right_boundaries = []
+    lower_boundaries = []
     for size in expected_map:
         label = labels[size]
         label_center_x = int(round(_center_x(label) * image_width))
         label_center_y = int(round(_center_y(label) * image_height))
         right_start = int(round((label.x + label.width + x_spacing * 0.12) * image_width))
         lower_start = int(round((label.y + label.height + y_spacing * 0.12) * image_height))
-        right_boundary = _profile_transition(
+        right_boundary = _enclosing_axis_boundary(
             gray,
             horizontal_scan=True,
             fixed_coordinate=label_center_y,
             start=right_start,
+            axis=weight_axis,
+            horizontal_axis=True,
+            image_scale=image_width,
         )
-        lower_boundary = _profile_transition(
+        lower_boundary = _enclosing_axis_boundary(
             gray,
             horizontal_scan=False,
             fixed_coordinate=label_center_x,
             start=lower_start,
+            axis=height_axis,
+            horizontal_axis=False,
+            image_scale=image_height,
         )
+        right_boundaries.append(right_boundary)
+        lower_boundaries.append(lower_boundary)
         weight_max = _map_boundary_to_axis(
             right_boundary / image_width,
             weight_axis,
@@ -709,6 +805,10 @@ def parse_height_weight_chart(
             horizontal=False,
         )
         result[size] = (height_min, height_max, weight_min, weight_max)
+    if not _strictly_increasing(right_boundaries):
+        raise RecognitionError(f"{source}：尺码色块右边界不唯一或未严格递增")
+    if not _strictly_increasing(lower_boundaries):
+        raise RecognitionError(f"{source}：尺码色块下边界不唯一或未严格递增")
     return result
 
 
@@ -741,14 +841,14 @@ def recognize_recommendations(
     size_chart_path = Path(size_chart_path)
     height_weight_path = Path(height_weight_path)
     size_tokens = vision_ocr(size_chart_path)
-    height_weight_tokens = vision_ocr(height_weight_path)
     measurements = parse_measurement_table(
         size_tokens,
         expected,
         source=str(size_chart_path),
     )
-    ranges = parse_height_weight_chart(height_weight_path, height_weight_tokens, expected)
     _require_size_set(tuple(measurements), expected, str(size_chart_path))
+    height_weight_tokens = vision_ocr(height_weight_path)
+    ranges = parse_height_weight_chart(height_weight_path, height_weight_tokens, expected)
     _require_size_set(tuple(ranges), expected, str(height_weight_path))
 
     rows = []

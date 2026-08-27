@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 import size_image_recognition
 from size_image_recognition import (
     MIN_OCR_CONFIDENCE,
@@ -360,6 +362,28 @@ class SwiftBridgeCompilationTests(unittest.TestCase):
 
 
 class SizeRecommendationParserTests(unittest.TestCase):
+    def test_measurement_aliases_do_not_confuse_shipping_text_with_hip(self):
+        for text in ("HIPLINE", "臀围", "臀围/HIPLINE"):
+            with self.subTest(text=text):
+                self.assertEqual(size_image_recognition._measurement_kind(text), "hip")
+        for text in ("SHIPPING", "SHIP DATE"):
+            with self.subTest(text=text):
+                self.assertIsNone(size_image_recognition._measurement_kind(text))
+
+    def test_profile_transition_ignores_single_pixel_artifact(self):
+        gray = np.full((60, 160), 210, dtype=np.uint8)
+        gray[:, 60] = 30
+        gray[:, 100:] = 150
+
+        boundary = size_image_recognition._profile_transition(
+            gray,
+            horizontal_scan=True,
+            fixed_coordinate=30,
+            start=30,
+        )
+
+        self.assertAlmostEqual(boundary, 100, delta=2)
+
     @unittest.skipUnless(PRODUCT.is_dir(), "需要当前商品图片样例")
     def test_current_product_images_are_parsed_exactly(self):
         result = recognize_recommendations(
@@ -411,6 +435,24 @@ class SizeRecommendationParserTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RecognitionError, r"尺码顺序.*腰围.*递减"):
             recognize_recommendations("size.jpg", "height.jpg", ("S", "M"))
+
+    @patch("size_image_recognition.parse_height_weight_chart")
+    @patch("size_image_recognition.parse_measurement_table")
+    @patch("size_image_recognition.vision_ocr")
+    def test_invalid_measurement_chart_stops_before_second_ocr(
+        self,
+        ocr,
+        parse_measurements,
+        parse_height_weight,
+    ):
+        ocr.return_value = (_token("S", 0.1, 0.1),)
+        parse_measurements.side_effect = RecognitionError("尺码信息表无效")
+
+        with self.assertRaisesRegex(RecognitionError, "尺码信息表无效"):
+            recognize_recommendations("size.jpg", "height.jpg", ("S", "M"))
+
+        ocr.assert_called_once_with(Path("size.jpg"))
+        parse_height_weight.assert_not_called()
 
 
 @unittest.skipUnless(
