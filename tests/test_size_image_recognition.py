@@ -13,10 +13,38 @@ from pathlib import Path
 from unittest.mock import patch
 
 import size_image_recognition
-from size_image_recognition import MIN_OCR_CONFIDENCE, OCRToken, RecognitionError, vision_ocr
+from size_image_recognition import (
+    MIN_OCR_CONFIDENCE,
+    OCRToken,
+    RecognitionError,
+    SkuRecommendation,
+    parse_measurement_table,
+    recognize_recommendations,
+    vision_ocr,
+)
 
 
 FIXTURE_IMAGE = Path(__file__).with_name("fixtures") / "vision_ocr_oriented.jpg"
+PRODUCT = Path("/Volumes/共享文件/谭/products/绿巨人+NGBL-10588")
+
+
+def _token(text, x, y, *, width=0.04, height=0.04):
+    return OCRToken(text, 1.0, x, y, width, height)
+
+
+def _measurement_tokens(*, sizes=("S", "M")):
+    tokens = [
+        _token("腰围/WAISTLINE", 0.05, 0.30, width=0.20),
+        _token("裤长/LENGTH", 0.05, 0.50, width=0.20),
+        _token("臀围/HIPLINE", 0.05, 0.70, width=0.20),
+    ]
+    values = ((80, 104, 106), (84, 106, 110))
+    for column, (size, column_values) in enumerate(zip(sizes, values)):
+        x = 0.40 + column * 0.20
+        tokens.append(_token(size, x, 0.10))
+        for y, value in zip((0.30, 0.50, 0.70), column_values):
+            tokens.append(_token(str(value), x, y))
+    return tuple(tokens)
 
 
 def _completed_process(payload="", *, returncode=0, stderr=""):
@@ -329,6 +357,60 @@ class SwiftBridgeCompilationTests(unittest.TestCase):
             self.assertTrue(transient_binary.is_file())
             self.assertEqual(command[1], str(image))
         self.assertFalse(transient_binary.exists())
+
+
+class SizeRecommendationParserTests(unittest.TestCase):
+    @unittest.skipUnless(PRODUCT.is_dir(), "需要当前商品图片样例")
+    def test_current_product_images_are_parsed_exactly(self):
+        result = recognize_recommendations(
+            PRODUCT / "尺码信息表/1_09(1).jpg",
+            PRODUCT / "身高体重推荐表/1.jpg",
+            ("S", "M", "L", "XL", "2XL"),
+        )
+
+        self.assertEqual(
+            result,
+            (
+                SkuRecommendation("S", 155, 160, 50, 60, 80, 106, 104),
+                SkuRecommendation("M", 155, 170, 50, 70, 84, 110, 106),
+                SkuRecommendation("L", 155, 180, 50, 80, 88, 114, 108),
+                SkuRecommendation("XL", 155, 190, 50, 90, 92, 118, 110),
+                SkuRecommendation("2XL", 155, 200, 50, 100, 96, 122, 112),
+            ),
+        )
+
+    def test_measurement_table_rejects_missing_and_extra_sizes(self):
+        with self.assertRaisesRegex(
+            RecognitionError,
+            r"尺码信息表.*缺少.*M.*多出.*L",
+        ):
+            parse_measurement_table(
+                _measurement_tokens(sizes=("S", "L")),
+                ("S", "M"),
+                source="尺码信息表 synthetic.jpg",
+            )
+
+    @patch("size_image_recognition.parse_height_weight_chart")
+    @patch("size_image_recognition.parse_measurement_table")
+    @patch("size_image_recognition.vision_ocr")
+    def test_merge_rejects_nonmonotonic_measurements(
+        self,
+        ocr,
+        parse_measurements,
+        parse_height_weight,
+    ):
+        ocr.return_value = (_token("S", 0.1, 0.1),)
+        parse_measurements.return_value = {
+            "S": {"waist": 84, "hip": 110, "length": 106},
+            "M": {"waist": 80, "hip": 106, "length": 104},
+        }
+        parse_height_weight.return_value = {
+            "S": (155, 160, 50, 60),
+            "M": (155, 170, 50, 70),
+        }
+
+        with self.assertRaisesRegex(RecognitionError, r"尺码顺序.*腰围.*递减"):
+            recognize_recommendations("size.jpg", "height.jpg", ("S", "M"))
 
 
 @unittest.skipUnless(

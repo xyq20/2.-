@@ -9,7 +9,10 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+
+import cv2
+import numpy as np
 
 
 MIN_OCR_CONFIDENCE = 0.25
@@ -34,6 +37,29 @@ class OCRToken:
     y: float
     width: float
     height: float
+
+
+Number = Union[int, float]
+
+
+@dataclass(frozen=True)
+class SizeMeasurements:
+    waist: Number
+    hip: Number
+    length: Number
+    foot_opening: Optional[Number] = None
+
+
+@dataclass(frozen=True)
+class SkuRecommendation:
+    size: str
+    height_min: Number
+    height_max: Number
+    weight_min: Number
+    weight_max: Number
+    waist: Number
+    hip: Number
+    length: Number
 
 
 @dataclass(frozen=True)
@@ -321,3 +347,466 @@ def vision_ocr(image_path: Path) -> Tuple[OCRToken, ...]:
     if not tokens:
         raise RecognitionError(f"OCR 未识别到可信文字：{image_path}")
     return tokens
+
+
+_PLAIN_NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
+_SIZE_NAME = re.compile(r"^(?:XS|S|M|L|X{1,6}L|\d{1,2}XL)$", re.IGNORECASE)
+_MEASUREMENT_ALIASES = {
+    "waist": ("腰围", "WAISTLINE", "WAIST"),
+    "length": ("裤长", "LENGTH", "PANTSLENGTH", "TROUSERLENGTH"),
+    "hip": ("臀围", "HIPLINE", "HIPS", "HIP"),
+    "foot_opening": ("脚围", "裤脚围", "FOOTOPENING", "LEGOPENING"),
+}
+_REQUIRED_MEASUREMENTS = ("waist", "length", "hip")
+_MEASUREMENT_NAMES = {
+    "waist": "腰围",
+    "length": "裤长",
+    "hip": "臀围",
+    "foot_opening": "脚围",
+}
+
+
+def _center_x(token: OCRToken) -> float:
+    return token.x + token.width / 2.0
+
+
+def _center_y(token: OCRToken) -> float:
+    return token.y + token.height / 2.0
+
+
+def _normalize_size(text: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", "", text).upper()
+    return normalized if _SIZE_NAME.fullmatch(normalized) else None
+
+
+def _expected_size_map(expected_sizes: Sequence[str], source: str) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for raw_size in expected_sizes:
+        if not isinstance(raw_size, str):
+            raise RecognitionError(f"{source}：Excel 尺码必须是文本")
+        size = _normalize_size(raw_size)
+        if size is None:
+            raise RecognitionError(f"{source}：Excel 尺码无效：{raw_size!r}")
+        if size in result:
+            raise RecognitionError(f"{source}：Excel 尺码重复：{size}")
+        result[size] = raw_size.strip()
+    if not result:
+        raise RecognitionError(f"{source}：Excel 尺码为空")
+    return result
+
+
+def _require_size_set(actual: Sequence[str], expected: Sequence[str], source: str) -> None:
+    actual_set = set(actual)
+    expected_set = set(expected)
+    if actual_set == expected_set:
+        return
+    details = []
+    missing = sorted(expected_set - actual_set)
+    extra = sorted(actual_set - expected_set)
+    if missing:
+        details.append("缺少：" + ", ".join(missing))
+    if extra:
+        details.append("多出：" + ", ".join(extra))
+    raise RecognitionError(f"{source} 尺码集合不一致（{' ；'.join(details)}）")
+
+
+def _number(text: str) -> Optional[Number]:
+    compact = text.strip().replace(",", "")
+    if not _PLAIN_NUMBER.fullmatch(compact):
+        return None
+    value = float(compact)
+    if not math.isfinite(value):
+        return None
+    return int(value) if value.is_integer() else value
+
+
+def _measurement_kind(text: str) -> Optional[str]:
+    compact = re.sub(r"[^A-Z\u4e00-\u9fff]", "", text.upper())
+    if len(compact) > 32:
+        return None
+    matches = [
+        kind
+        for kind, aliases in _MEASUREMENT_ALIASES.items()
+        if any(alias in compact for alias in aliases)
+    ]
+    # "裤脚围" also contains "脚围", but both aliases belong to one kind.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cell_bounds(centers: Sequence[float]) -> Tuple[Tuple[float, float], ...]:
+    if len(centers) < 2:
+        raise RecognitionError("表格至少需要两个尺码或两行测量项")
+    ordered = tuple(centers)
+    if any(right <= left for left, right in zip(ordered, ordered[1:])):
+        raise RecognitionError("表格单元格坐标重叠或顺序无效")
+    midpoints = [(left + right) / 2.0 for left, right in zip(ordered, ordered[1:])]
+    first = ordered[0] - (ordered[1] - ordered[0]) / 2.0
+    last = ordered[-1] + (ordered[-1] - ordered[-2]) / 2.0
+    edges = [first, *midpoints, last]
+    return tuple((edges[index], edges[index + 1]) for index in range(len(ordered)))
+
+
+def parse_measurement_table(
+    tokens: Tuple[OCRToken, ...],
+    expected_sizes: Sequence[str],
+    *,
+    source: str = "尺码信息表",
+) -> Dict[str, SizeMeasurements]:
+    """Parse a coordinate-based garment measurement table."""
+    expected_map = _expected_size_map(expected_sizes, source)
+
+    row_tokens: Dict[str, OCRToken] = {}
+    for token in tokens:
+        kind = _measurement_kind(token.text)
+        if kind is None:
+            continue
+        if kind in row_tokens:
+            raise RecognitionError(f"{source}：{_MEASUREMENT_NAMES[kind]}行标题重复")
+        row_tokens[kind] = token
+    missing_rows = [
+        _MEASUREMENT_NAMES[kind]
+        for kind in _REQUIRED_MEASUREMENTS
+        if kind not in row_tokens
+    ]
+    if missing_rows:
+        raise RecognitionError(f"{source}：缺少测量行：{', '.join(missing_rows)}")
+
+    first_row_y = min(_center_y(row_tokens[kind]) for kind in _REQUIRED_MEASUREMENTS)
+    label_right = max(token.x + token.width for token in row_tokens.values())
+    header_candidates = [
+        (size, token)
+        for token in tokens
+        for size in [_normalize_size(token.text)]
+        if size is not None
+        and _center_y(token) < first_row_y
+        and _center_x(token) > label_right
+    ]
+    seen_headers: Dict[str, OCRToken] = {}
+    for size, token in header_candidates:
+        if size in seen_headers:
+            raise RecognitionError(f"{source}：尺码列标题重复：{size}")
+        seen_headers[size] = token
+    _require_size_set(tuple(seen_headers), tuple(expected_map), source)
+
+    columns = sorted(seen_headers.items(), key=lambda item: _center_x(item[1]))
+    column_centers = [_center_x(token) for _, token in columns]
+    column_bounds = _cell_bounds(column_centers)
+
+    ordered_rows = sorted(row_tokens.items(), key=lambda item: _center_y(item[1]))
+    row_centers = [_center_y(token) for _, token in ordered_rows]
+    row_bounds = _cell_bounds(row_centers)
+    numeric_tokens = [(token, _number(token.text)) for token in tokens]
+    numeric_tokens = [(token, value) for token, value in numeric_tokens if value is not None]
+
+    cells: Dict[Tuple[str, str], Number] = {}
+    for (kind, _row_token), (top, bottom) in zip(ordered_rows, row_bounds):
+        for (size, _header_token), (left, right) in zip(columns, column_bounds):
+            candidates = [
+                value
+                for token, value in numeric_tokens
+                if left <= _center_x(token) < right
+                and top <= _center_y(token) < bottom
+            ]
+            cell_name = f"{size} {_MEASUREMENT_NAMES[kind]}"
+            if not candidates:
+                raise RecognitionError(f"{source}：单元格 {cell_name} 缺失")
+            if len(candidates) != 1:
+                raise RecognitionError(f"{source}：单元格 {cell_name} 重复或有歧义")
+            value = candidates[0]
+            if isinstance(value, bool) or not math.isfinite(float(value)) or value <= 0:
+                raise RecognitionError(f"{source}：单元格 {cell_name} 必须是正数")
+            cells[(size, kind)] = value
+
+    result = {}
+    for size in expected_map:
+        result[size] = SizeMeasurements(
+            waist=cells[(size, "waist")],
+            hip=cells[(size, "hip")],
+            length=cells[(size, "length")],
+            foot_opening=cells.get((size, "foot_opening")),
+        )
+    return result
+
+
+# A descriptive alias for callers that prefer the source name in the API.
+parse_size_measurement_table = parse_measurement_table
+
+
+def _strictly_increasing(values: Sequence[Number]) -> bool:
+    return all(right > left for left, right in zip(values, values[1:]))
+
+
+def _axis_candidates(
+    numeric_tokens: Sequence[Tuple[OCRToken, Number]],
+    *,
+    horizontal: bool,
+) -> Tuple[Tuple[OCRToken, Number], ...]:
+    groups: Dict[Tuple[int, ...], Tuple[Tuple[OCRToken, Number], ...]] = {}
+    for anchor_index, (anchor, _value) in enumerate(numeric_tokens):
+        anchor_coordinate = _center_y(anchor) if horizontal else _center_x(anchor)
+        anchor_span = anchor.height if horizontal else anchor.width
+        members = []
+        for index, item in enumerate(numeric_tokens):
+            token = item[0]
+            coordinate = _center_y(token) if horizontal else _center_x(token)
+            span = token.height if horizontal else token.width
+            tolerance = max(0.012, 0.75 * max(anchor_span, span))
+            if abs(coordinate - anchor_coordinate) <= tolerance:
+                members.append((index, item))
+        key = tuple(index for index, _item in members)
+        if len(key) < 2:
+            continue
+        coordinate_key = _center_x if horizontal else _center_y
+        ordered = tuple(sorted((item for _index, item in members), key=lambda item: coordinate_key(item[0])))
+        coordinates = [coordinate_key(item[0]) for item in ordered]
+        values = [item[1] for item in ordered]
+        if _strictly_increasing(coordinates) and _strictly_increasing(values):
+            groups[key] = ordered
+    if not groups:
+        orientation = "体重横轴" if horizontal else "身高纵轴"
+        raise RecognitionError(f"身高体重推荐表：无法识别{orientation}")
+    longest = max(len(group) for group in groups.values())
+    best = {tuple(id(item[0]) for item in group): group for group in groups.values() if len(group) == longest}
+    if len(best) != 1:
+        orientation = "体重横轴" if horizontal else "身高纵轴"
+        raise RecognitionError(f"身高体重推荐表：{orientation}候选有歧义")
+    return next(iter(best.values()))
+
+
+def _profile_transition(
+    gray: np.ndarray,
+    *,
+    horizontal_scan: bool,
+    fixed_coordinate: int,
+    start: int,
+) -> int:
+    """Find the nearest sustained grayscale boundary after a size label."""
+    height, width = gray.shape
+    fixed_limit = height if horizontal_scan else width
+    scan_limit = width if horizontal_scan else height
+    half_strip = max(3, int(round(fixed_limit * 0.004)))
+    fixed_coordinate = min(max(half_strip, fixed_coordinate), fixed_limit - half_strip - 1)
+    if horizontal_scan:
+        strip = gray[fixed_coordinate - half_strip : fixed_coordinate + half_strip + 1, :]
+        profile = np.median(strip, axis=0)
+    else:
+        strip = gray[:, fixed_coordinate - half_strip : fixed_coordinate + half_strip + 1]
+        profile = np.median(strip, axis=1)
+    profile = cv2.GaussianBlur(profile.astype(np.float32).reshape(1, -1), (5, 1), 0).ravel()
+    side = max(2, int(round(scan_limit * 0.002)))
+    contrasts = np.zeros(scan_limit, dtype=np.float32)
+    for coordinate in range(side, scan_limit - side):
+        before = np.median(profile[coordinate - side : coordinate])
+        after = np.median(profile[coordinate + 1 : coordinate + side + 1])
+        contrasts[coordinate] = abs(float(after) - float(before))
+
+    candidates = np.flatnonzero(contrasts[max(start, side) : scan_limit - side] >= 7.0)
+    if not len(candidates):
+        raise RecognitionError("身高体重推荐表：色块边界缺失或对比度不足")
+    candidates = candidates + max(start, side)
+    first = int(candidates[0])
+    nearby = candidates[candidates <= first + max(3, side * 2)]
+    return int(nearby[np.argmax(contrasts[nearby])])
+
+
+def _axis_cell_edges(axis: Sequence[Tuple[OCRToken, Number]], *, horizontal: bool) -> Tuple[float, ...]:
+    coordinate = _center_x if horizontal else _center_y
+    centers = [coordinate(token) for token, _value in axis]
+    if len(centers) < 2 or not _strictly_increasing(centers):
+        raise RecognitionError("身高体重推荐表：坐标轴刻度坐标无效")
+    return tuple(
+        [(left + right) / 2.0 for left, right in zip(centers, centers[1:])]
+        + [centers[-1] + (centers[-1] - centers[-2]) / 2.0]
+    )
+
+
+def _map_boundary_to_axis(
+    boundary: float,
+    axis: Sequence[Tuple[OCRToken, Number]],
+    *,
+    horizontal: bool,
+) -> Number:
+    edges = _axis_cell_edges(axis, horizontal=horizontal)
+    nearest_index = min(range(len(edges)), key=lambda index: abs(edges[index] - boundary))
+    coordinate = _center_x if horizontal else _center_y
+    centers = [coordinate(token) for token, _value in axis]
+    typical_spacing = float(np.median(np.diff(centers)))
+    if abs(edges[nearest_index] - boundary) > typical_spacing * 0.28:
+        raise RecognitionError("身高体重推荐表：色块边界与坐标轴网格不对齐")
+    return axis[nearest_index][1]
+
+
+def parse_height_weight_chart(
+    image_path: Path,
+    tokens: Tuple[OCRToken, ...],
+    expected_sizes: Sequence[str],
+) -> Dict[str, Tuple[Number, Number, Number, Number]]:
+    """Return size -> (height_min, height_max, weight_min, weight_max)."""
+    source = str(image_path)
+    expected_map = _expected_size_map(expected_sizes, source)
+    numeric_tokens = tuple(
+        (token, value)
+        for token in tokens
+        for value in [_number(token.text)]
+        if value is not None and value > 0
+    )
+    weight_axis = _axis_candidates(numeric_tokens, horizontal=True)
+    height_axis = _axis_candidates(numeric_tokens, horizontal=False)
+    weight_y = float(np.median([_center_y(token) for token, _value in weight_axis]))
+    height_x = float(np.median([_center_x(token) for token, _value in height_axis]))
+    first_weight_x = _center_x(weight_axis[0][0])
+    first_height_y = _center_y(height_axis[0][0])
+    body_left = (height_x + first_weight_x) / 2.0
+    body_top = (weight_y + first_height_y) / 2.0
+
+    labels: Dict[str, OCRToken] = {}
+    for token in tokens:
+        size = _normalize_size(token.text)
+        if size is None or _center_x(token) <= body_left or _center_y(token) <= body_top:
+            continue
+        if size in labels:
+            raise RecognitionError(f"{source}：尺码色块标签重复：{size}")
+        labels[size] = token
+    _require_size_set(tuple(labels), tuple(expected_map), source)
+
+    image_path = Path(image_path)
+    gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if gray is None or gray.ndim != 2:
+        raise RecognitionError(f"{source}：无法读取身高体重推荐图片")
+    image_height, image_width = gray.shape
+    x_spacing = float(np.median(np.diff([_center_x(token) for token, _value in weight_axis])))
+    y_spacing = float(np.median(np.diff([_center_y(token) for token, _value in height_axis])))
+
+    height_min = min(value for _token, value in height_axis)
+    weight_min = min(value for _token, value in weight_axis)
+    result = {}
+    for size in expected_map:
+        label = labels[size]
+        label_center_x = int(round(_center_x(label) * image_width))
+        label_center_y = int(round(_center_y(label) * image_height))
+        right_start = int(round((label.x + label.width + x_spacing * 0.12) * image_width))
+        lower_start = int(round((label.y + label.height + y_spacing * 0.12) * image_height))
+        right_boundary = _profile_transition(
+            gray,
+            horizontal_scan=True,
+            fixed_coordinate=label_center_y,
+            start=right_start,
+        )
+        lower_boundary = _profile_transition(
+            gray,
+            horizontal_scan=False,
+            fixed_coordinate=label_center_x,
+            start=lower_start,
+        )
+        weight_max = _map_boundary_to_axis(
+            right_boundary / image_width,
+            weight_axis,
+            horizontal=True,
+        )
+        height_max = _map_boundary_to_axis(
+            lower_boundary / image_height,
+            height_axis,
+            horizontal=False,
+        )
+        result[size] = (height_min, height_max, weight_min, weight_max)
+    return result
+
+
+def _measurement_field(measurement: Any, field: str, source: str, size: str) -> Number:
+    if isinstance(measurement, Mapping):
+        if field not in measurement:
+            raise RecognitionError(f"{source}：{size} 缺少{_MEASUREMENT_NAMES[field]}")
+        return measurement[field]
+    try:
+        return getattr(measurement, field)
+    except AttributeError as error:
+        raise RecognitionError(f"{source}：{size} 缺少{_MEASUREMENT_NAMES[field]}") from error
+
+
+def _positive_number(value: Any, source: str, size: str, field: str) -> Number:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RecognitionError(f"{source}：{size} {field}必须是数字")
+    if not math.isfinite(float(value)) or value <= 0:
+        raise RecognitionError(f"{source}：{size} {field}必须是正数")
+    return value
+
+
+def recognize_recommendations(
+    size_chart_path: Path,
+    height_weight_path: Path,
+    expected_sizes: Sequence[str],
+) -> Tuple[SkuRecommendation, ...]:
+    expected_map = _expected_size_map(expected_sizes, "Excel")
+    expected = tuple(expected_map)
+    size_chart_path = Path(size_chart_path)
+    height_weight_path = Path(height_weight_path)
+    size_tokens = vision_ocr(size_chart_path)
+    height_weight_tokens = vision_ocr(height_weight_path)
+    measurements = parse_measurement_table(
+        size_tokens,
+        expected,
+        source=str(size_chart_path),
+    )
+    ranges = parse_height_weight_chart(height_weight_path, height_weight_tokens, expected)
+    _require_size_set(tuple(measurements), expected, str(size_chart_path))
+    _require_size_set(tuple(ranges), expected, str(height_weight_path))
+
+    rows = []
+    for size in expected:
+        chart_range = ranges[size]
+        if not isinstance(chart_range, (tuple, list)) or len(chart_range) != 4:
+            raise RecognitionError(f"{height_weight_path}：{size} 身高体重范围格式无效")
+        height_min, height_max, weight_min, weight_max = [
+            _positive_number(value, str(height_weight_path), size, field)
+            for value, field in zip(chart_range, ("身高下限", "身高上限", "体重下限", "体重上限"))
+        ]
+        if height_min > height_max:
+            raise RecognitionError(f"{height_weight_path}：{size} 身高下限大于上限")
+        if weight_min > weight_max:
+            raise RecognitionError(f"{height_weight_path}：{size} 体重下限大于上限")
+        measurement = measurements[size]
+        waist = _positive_number(
+            _measurement_field(measurement, "waist", str(size_chart_path), size),
+            str(size_chart_path),
+            size,
+            "腰围",
+        )
+        hip = _positive_number(
+            _measurement_field(measurement, "hip", str(size_chart_path), size),
+            str(size_chart_path),
+            size,
+            "臀围",
+        )
+        length = _positive_number(
+            _measurement_field(measurement, "length", str(size_chart_path), size),
+            str(size_chart_path),
+            size,
+            "裤长",
+        )
+        rows.append(
+            SkuRecommendation(
+                expected_map[size],
+                height_min,
+                height_max,
+                weight_min,
+                weight_max,
+                waist,
+                hip,
+                length,
+            )
+        )
+
+    monotonic_fields = (
+        ("height_max", "身高上限"),
+        ("weight_max", "体重上限"),
+        ("waist", "腰围"),
+        ("hip", "臀围"),
+        ("length", "裤长"),
+    )
+    for previous, current in zip(rows, rows[1:]):
+        for field, display_name in monotonic_fields:
+            if getattr(current, field) < getattr(previous, field):
+                raise RecognitionError(
+                    f"尺码顺序 {previous.size} → {current.size} 的{display_name}递减"
+                )
+    return tuple(rows)
