@@ -36,6 +36,94 @@ class OptionMatchingTests(unittest.TestCase):
             choose_unique_option("羊毛", options)
 
 
+class _EventPage:
+    url = "https://scma.superboss.cc/supplier/prod/center"
+
+    def __init__(self):
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners.setdefault(event, []).append(callback)
+
+    def emit(self, event, value):
+        for callback in self.listeners.get(event, ()):
+            callback(value)
+
+
+class _PropertyRequest:
+    url = "https://scma.superboss.cc/fxg/getCategoryProperties.json"
+
+    def __init__(self, leaf_id):
+        self.post_data = f"shopId=fixture&leafCategoryId={leaf_id}"
+
+
+class _PropertyResponse:
+    url = "https://scma.superboss.cc/fxg/getCategoryProperties.json"
+
+    def __init__(self, request, property_id, option_name):
+        self.request = request
+        self.property_id = property_id
+        self.option_name = option_name
+
+    async def json(self):
+        return {
+            "result": 1,
+            "data": [
+                {
+                    "propertyName": "厚度",
+                    "propertyId": self.property_id,
+                    "type": "select",
+                    "options": [{"name": self.option_name, "value": "option-id"}],
+                }
+            ],
+        }
+
+
+class CategoryPropertyCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_fresh_request_generation_can_replace_category_cache(self):
+        page = _EventPage()
+        listing = DouyinListing(page, None, LOGGER, Path("ignored-artifacts"))
+
+        stale_generation = await listing._begin_category_property_capture()
+        first_request = _PropertyRequest("old-leaf")
+        late_request = _PropertyRequest("old-leaf")
+        page.emit("request", first_request)
+        page.emit("request", late_request)
+        page.emit(
+            "response",
+            _PropertyResponse(first_request, "old-property", "旧选项"),
+        )
+        await listing._drain_property_response_tasks()
+        self.assertTrue(
+            await listing._wait_for_fresh_category_properties(stale_generation)
+        )
+        self.assertEqual((await listing._api_property("厚度"))["id"], "old-property")
+
+        fresh_generation = await listing._begin_category_property_capture()
+        self.assertIsNone(await listing._api_property("厚度"))
+
+        # This response started during the previous generation and arrives late.
+        page.emit(
+            "response",
+            _PropertyResponse(late_request, "late-old-property", "迟到旧选项"),
+        )
+        await listing._drain_property_response_tasks()
+        self.assertIsNone(await listing._api_property("厚度"))
+
+        fresh_request = _PropertyRequest("new-leaf")
+        page.emit("request", fresh_request)
+        page.emit(
+            "response",
+            _PropertyResponse(fresh_request, "fresh-property", "新选项"),
+        )
+        self.assertTrue(
+            await listing._wait_for_fresh_category_properties(fresh_generation)
+        )
+        fresh_property = await listing._api_property("厚度")
+        self.assertEqual(fresh_property["id"], "fresh-property")
+        self.assertEqual(fresh_property["options"][0]["name"], "新选项")
+
+
 DOUYIN_FIXTURE = r"""
 <meta charset="utf-8">
 <div id="prod-center-edit-dialog">
@@ -233,6 +321,41 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             r"未按规范化别名精确匹配.*当前类目不存在/未知属性",
         ):
             await self.listing.apply_category_and_fields(fields)
+
+    async def test_apply_category_and_fields_accepts_bijective_aliases(self):
+        await self.listing.open()
+        fields = SimpleNamespace(
+            short_title="复古工装裤",
+            attributes={
+                "厚度/厚薄": "常规款",
+                "里料材质/里料": "棉/亚麻",
+            },
+        )
+
+        actual = await self.listing.apply_category_and_fields(fields)
+
+        self.assertEqual(actual["short_title"], "复古工装裤")
+        self.assertEqual(actual["attributes"]["厚度"], ("常规款",))
+        self.assertEqual(actual["attributes"]["里料材质"], ("棉", "亚麻"))
+
+    async def test_apply_category_and_fields_rejects_one_excel_alias_for_two_fields(self):
+        await self.listing.open()
+        fields = SimpleNamespace(
+            short_title="不应填写",
+            attributes={"厚度/里料材质": "常规款"},
+        )
+
+        with self.assertRaisesRegex(
+            DouyinListingError,
+            r"同时匹配多个页面字段.*厚度.*里料材质",
+        ):
+            await self.listing.apply_category_and_fields(fields)
+
+        title_input = self.page.locator(
+            ".el-form-item:has(> .el-form-item__label:text-is('导购短标题')) input"
+        )
+        self.assertEqual(await title_input.input_value(), "")
+        self.assertEqual(await self.page.locator("#attributes .el-tag").count(), 0)
 
     async def test_material_total_must_be_exactly_100_before_page_changes(self):
         with self.assertRaisesRegex(DouyinListingError, "合计必须为 100"):

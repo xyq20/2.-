@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 # 2026-08-27 在真实抖音资料页选择预测类目后观测到的精确路径。
@@ -69,6 +69,11 @@ class DouyinListing:
         self.panel: Optional[Any] = None
         self._category_properties: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
         self._property_response_tasks: set[asyncio.Task[Any]] = set()
+        self._property_request_generations: Dict[int, Tuple[int, str]] = {}
+        self._property_generation = 0
+        self._property_capture_generation: Optional[int] = None
+        self._category_properties_generation: Optional[int] = None
+        self._category_properties_leaf_id: Optional[str] = None
         self._category_properties_seen = asyncio.Event()
         self._response_listener_installed = False
 
@@ -76,31 +81,79 @@ class DouyinListing:
         if self._response_listener_installed or not hasattr(self.page, "on"):
             return
 
+        def on_request(request: Any) -> None:
+            if not self._is_category_properties_url(getattr(request, "url", "")):
+                return
+            generation = self._property_capture_generation
+            leaf_id = self._request_leaf_category_id(request)
+            if generation is None or leaf_id is None:
+                return
+            self._property_request_generations[id(request)] = (generation, leaf_id)
+
         def on_response(response: Any) -> None:
             if not self._is_category_properties_response(response):
                 return
-            task = asyncio.create_task(self._consume_category_properties(response))
+            request = getattr(response, "request", None)
+            request_context = self._property_request_generations.pop(id(request), None)
+            if request_context is None:
+                # Without request-time correlation, a late response could belong to
+                # the previous category and must not populate the active cache.
+                return
+            generation, leaf_id = request_context
+            task = asyncio.create_task(
+                self._consume_category_properties(response, generation, leaf_id)
+            )
             self._property_response_tasks.add(task)
             task.add_done_callback(self._property_response_tasks.discard)
 
+        def on_request_failed(request: Any) -> None:
+            self._property_request_generations.pop(id(request), None)
+
+        self.page.on("request", on_request)
         self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
         self._response_listener_installed = True
 
-    def _is_category_properties_response(self, response: Any) -> bool:
+    def _is_category_properties_url(self, raw_url: object) -> bool:
         try:
-            response_url = urlsplit(response.url)
+            response_url = urlsplit(str(raw_url))
             page_url = urlsplit(self.page.url)
         except Exception:
             return False
         if response_url.path != CATEGORY_PROPERTIES_ENDPOINT:
             return False
-        if page_url.scheme in {"http", "https"}:
-            return (response_url.scheme, response_url.netloc) == (page_url.scheme, page_url.netloc)
-        return False
+        if page_url.scheme not in {"http", "https"}:
+            return False
+        return (response_url.scheme, response_url.netloc) == (page_url.scheme, page_url.netloc)
 
-    async def _consume_category_properties(self, response: Any) -> None:
+    def _is_category_properties_response(self, response: Any) -> bool:
+        return self._is_category_properties_url(getattr(response, "url", ""))
+
+    @staticmethod
+    def _request_leaf_category_id(request: Any) -> Optional[str]:
+        try:
+            values = parse_qs(str(request.post_data or ""), keep_blank_values=True).get(
+                "leafCategoryId", []
+            )
+        except Exception:
+            return None
+        if len(values) != 1 or not str(values[0]).strip():
+            return None
+        return str(values[0]).strip()
+
+    async def _consume_category_properties(
+        self,
+        response: Any,
+        generation: int,
+        leaf_category_id: str,
+    ) -> None:
+        if self._property_capture_generation != generation or not leaf_category_id:
+            return
         try:
             payload = await response.json()
+            # Parsing yields control; a newer category may have started meanwhile.
+            if self._property_capture_generation != generation:
+                return
             if not isinstance(payload, dict) or int(payload.get("result", 0) or 0) != 1:
                 return
             data = payload.get("data")
@@ -139,30 +192,78 @@ class DouyinListing:
                         "options": tuple(options),
                     }
                 )
-            if records:
+            if records and self._property_capture_generation == generation:
+                if (
+                    self._category_properties_leaf_id is not None
+                    and self._category_properties_leaf_id != leaf_category_id
+                ):
+                    # More than one leaf response in one click cannot be correlated
+                    # safely to the final visible category, so force DOM fallback.
+                    self._invalidate_property_capture(generation)
+                    return
                 self._category_properties = {
                     label: tuple(items) for label, items in records.items()
                 }
+                self._category_properties_generation = generation
+                self._category_properties_leaf_id = leaf_category_id
                 self._category_properties_seen.set()
         except Exception as exc:
             self.logger.warning("抖音类目属性接口解析失败，将使用 DOM 选项：%s", exc)
 
-    async def _wait_for_property_responses(self, *, wait_for_first: bool = False) -> None:
-        # response 回调在页面结构完成后可能还有一个 event-loop tick 才入队。
+    async def _drain_property_response_tasks(self) -> None:
+        # response 回调可能还需一个 event-loop tick 才入队。
         await asyncio.sleep(0)
-        if (
-            wait_for_first
-            and not self._category_properties
-            and urlsplit(self.page.url).scheme in {"http", "https"}
-        ):
+        while self._property_response_tasks:
+            tasks = tuple(self._property_response_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    async def _begin_category_property_capture(self) -> int:
+        self._install_property_response_listener()
+        await self._drain_property_response_tasks()
+        self._property_generation += 1
+        generation = self._property_generation
+        self._property_capture_generation = generation
+        self._category_properties = {}
+        self._category_properties_generation = None
+        self._category_properties_leaf_id = None
+        self._category_properties_seen = asyncio.Event()
+        return generation
+
+    def _invalidate_property_capture(self, generation: int) -> None:
+        if self._property_capture_generation != generation:
+            return
+        self._property_capture_generation = None
+        self._category_properties = {}
+        self._category_properties_generation = None
+        self._category_properties_leaf_id = None
+        self._category_properties_seen.set()
+
+    async def _wait_for_fresh_category_properties(self, generation: int) -> bool:
+        if urlsplit(self.page.url).scheme not in {"http", "https"}:
+            self._invalidate_property_capture(generation)
+            return False
+        if self._property_capture_generation != generation:
+            return False
+        if self._category_properties_generation != generation:
             try:
                 await asyncio.wait_for(self._category_properties_seen.wait(), timeout=2)
             except asyncio.TimeoutError:
-                # 页面未调用已观测接口时才进入受限的 DOM 回退。
-                pass
-        tasks = tuple(self._property_response_tasks)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                self._invalidate_property_capture(generation)
+                return False
+        await self._drain_property_response_tasks()
+        fresh = (
+            self._property_capture_generation == generation
+            and self._category_properties_generation == generation
+            and bool(self._category_properties)
+            and self._category_properties_leaf_id is not None
+        )
+        if fresh:
+            # Keep the verified cache, but stop tagging later unrelated requests.
+            self._property_capture_generation = None
+            return True
+        self._invalidate_property_capture(generation)
+        return False
 
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -216,7 +317,7 @@ class DouyinListing:
         self.panel = panel
         await self._wait_for_loading_masks()
         await self._wait_for_field("导购短标题")
-        await self._wait_for_property_responses()
+        await self._drain_property_response_tasks()
         return self
 
     async def _category_text(self) -> str:
@@ -259,7 +360,12 @@ class DouyinListing:
         if not expected:
             raise DouyinListingError("无法读取第一个抖音预测类目")
 
-        await button.click()
+        generation = await self._begin_category_property_capture()
+        try:
+            await button.click()
+        except Exception:
+            self._invalidate_property_capture(generation)
+            raise
         await self._wait_for_loading_masks()
         # 类目完成后类目属性会重新渲染，用它作为稳定信号。
         try:
@@ -269,7 +375,7 @@ class DouyinListing:
         except Exception:
             # 某些测试/类目可能只有基础信息，最终类目回读仍是权威校验。
             pass
-        await self._wait_for_property_responses(wait_for_first=True)
+        await self._wait_for_fresh_category_properties(generation)
 
         actual = await self._category_text()
         normalize_path = lambda value: re.sub(r"[\s>]", "", value).casefold()
@@ -322,7 +428,9 @@ class DouyinListing:
         return item[1]
 
     async def _api_property(self, label: str) -> Optional[Mapping[str, Any]]:
-        await self._wait_for_property_responses()
+        await self._drain_property_response_tasks()
+        if self._category_properties_generation is None:
+            return None
         records = self._category_properties.get(_normalize_label(label))
         if not records:
             return None
@@ -540,34 +648,29 @@ class DouyinListing:
     async def apply_category_and_fields(self, fields: Any) -> Mapping[str, Any]:
         """应用类目、短标题和所有 Excel 属性；未匹配的属性立即报错。"""
         category = await self.apply_first_recommended_category()
-        short_title = await self.fill_short_title(fields.short_title)
         page_items = await self._attribute_items()
 
         excel_attributes = list(fields.attributes.items())
-        assignments: List[Tuple[str, object]] = []
-        matched_indexes: set[int] = set()
-        for normalized_label, (page_label, _item) in page_items.items():
+        target_sources: Dict[str, List[Tuple[object, object]]] = {}
+        unmatched: List[str] = []
+        for key, value in excel_attributes:
+            aliases = set(_excel_aliases(key))
             matches = [
-                (index, key, value)
-                for index, (key, value) in enumerate(excel_attributes)
-                if normalized_label in _excel_aliases(key)
+                (normalized_label, page_label)
+                for normalized_label, (page_label, _item) in page_items.items()
+                if normalized_label in aliases
             ]
             if not matches:
+                unmatched.append(str(key))
                 continue
-            if len(matches) != 1:
-                keys = "、".join(str(key) for _index, key, _value in matches)
+            if len(matches) > 1:
+                labels = "、".join(page_label for _normalized, page_label in matches)
                 raise DouyinListingError(
-                    f"抖音属性“{page_label}”匹配到多个 Excel 字段：{keys}"
+                    f"Excel 抖音属性“{key}”同时匹配多个页面字段：{labels}"
                 )
-            index, _key, value = matches[0]
-            matched_indexes.add(index)
-            assignments.append((page_label, value))
+            normalized_label, _page_label = matches[0]
+            target_sources.setdefault(normalized_label, []).append((key, value))
 
-        unmatched = [
-            str(key)
-            for index, (key, _value) in enumerate(excel_attributes)
-            if index not in matched_indexes
-        ]
         if unmatched:
             names = "、".join(unmatched)
             raise DouyinListingError(
@@ -575,6 +678,19 @@ class DouyinListing:
                 f"{names}"
             )
 
+        assignments: List[Tuple[str, object]] = []
+        for normalized_label, sources in target_sources.items():
+            page_label = page_items[normalized_label][0]
+            if len(sources) > 1:
+                keys = "、".join(str(key) for key, _value in sources)
+                raise DouyinListingError(
+                    f"抖音属性“{page_label}”匹配到多个 Excel 字段：{keys}"
+                )
+            _key, value = sources[0]
+            assignments.append((page_label, value))
+
+        # Mapping is fully validated before any title/attribute value is written.
+        short_title = await self.fill_short_title(fields.short_title)
         applied: Dict[str, Tuple[str, ...]] = {}
         for page_label, value in assignments:
             # 已唯一映射的页面字段不能静默跳过；选项缺失/重名立即终止。
