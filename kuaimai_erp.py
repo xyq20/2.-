@@ -15,13 +15,14 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import unquote, urlsplit
 
-from douyin_data import DouyinAssets, DouyinFields, parse_douyin_fields, read_douyin_assets
+from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
 
 
 ERP_ENTRY_URL = "https://erp.superboss.cc/index.html#/index/"
@@ -63,8 +64,8 @@ class ProductData:
     main_images_34: List[Path]
     detail_images: List[Path]
     sku_images: List[Path]
-    douyin_fields: DouyinFields
-    douyin_assets: DouyinAssets
+    douyin_fields: Optional[DouyinFields] = None
+    douyin_assets: Optional[DouyinAssets] = None
 
 
 def natural_key(path: Path) -> List[Any]:
@@ -193,6 +194,10 @@ def read_product_data(excel_path: Path) -> ProductData:
     )
     detail_dir = find_image_dir(product_dir, ("详情页图", "商品详情图"), "商品详情图")
     sku_dir = find_image_dir(product_dir, ("SKU图", "sku图", "Sku图"), "SKU 图")
+    has_douyin_signals = field_lookup(fields, "导购短标题") is not None or any(
+        (product_dir / directory_name).is_dir()
+        for directory_name in ("水洗标图片", "尺码信息表", "身高体重推荐表")
+    )
 
     return ProductData(
         excel_path=excel_path,
@@ -204,8 +209,8 @@ def read_product_data(excel_path: Path) -> ProductData:
         main_images_34=list_images(main_34_dir, "3:4 主图"),
         detail_images=list_images(detail_dir, "商品详情图"),
         sku_images=list_images(sku_dir, "SKU 图"),
-        douyin_fields=parse_douyin_fields(fields),
-        douyin_assets=read_douyin_assets(product_dir),
+        douyin_fields=parse_douyin_fields(fields) if has_douyin_signals else None,
+        douyin_assets=read_douyin_assets(product_dir) if has_douyin_signals else None,
     )
 
 
@@ -213,7 +218,7 @@ def product_summary(product: ProductData) -> Dict[str, Any]:
     def serialize(value: Any) -> Any:
         if isinstance(value, Path):
             return str(value)
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             return {key: serialize(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [serialize(item) for item in value]
@@ -1329,7 +1334,7 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.error("用户中止了程序")
         return 130
-    except AutomationError as exc:
+    except (AutomationError, DouyinDataError) as exc:
         logger.error("%s", exc)
         return 2
     except Exception:

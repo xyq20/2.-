@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Any, Dict, Optional, Tuple
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+MATERIAL_COMPONENT_PATTERN = re.compile(
+    r"\s*(?P<name>[^/()（）]+?)\s*(?:[（(]\s*(?P<parenthesized>\d+)\s*%\s*[）)]|/\s*(?P<slashed>\d+)\s*%)"
+)
 
 # 不应作为抖音商品属性匹配的业务输入字段。每项均为 Excel 键中可能出现的别名。
 RESERVED_FIELD_ALIAS_NAMES = frozenset(
@@ -56,6 +60,36 @@ class DouyinDataError(ValueError):
     """可直接向用户展示的抖音资料输入错误。"""
 
 
+class FrozenAttributes(Mapping[str, str]):
+    """可按字典读取、但不可变的抖音商品属性映射。"""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_items", tuple(values.items()))
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("抖音商品属性不可修改")
+
+    def __delattr__(self, _name: str) -> None:
+        raise AttributeError("抖音商品属性不可修改")
+
+    def __getitem__(self, key: str) -> str:
+        for item_key, value in self._items:
+            if item_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __deepcopy__(self, _memo: Dict[int, Any]) -> "FrozenAttributes":
+        return self
+
+
 @dataclass(frozen=True)
 class MaterialComponent:
     name: str
@@ -65,7 +99,7 @@ class MaterialComponent:
 @dataclass(frozen=True)
 class DouyinFields:
     short_title: str
-    attributes: Dict[str, Any]
+    attributes: Mapping[str, str]
     materials: Tuple[MaterialComponent, ...]
     sizes: Tuple[str, ...]
     price: str
@@ -121,10 +155,15 @@ def _required_value(fields: Dict[str, Any], label: str, *aliases: str) -> Any:
     return found[1]
 
 
-def _normalized_decimal(value: Any, label: str) -> Decimal:
-    text = _cell_text(value).replace(",", "")
+def _normalized_decimal(value: Any, label: str, *, allow_grouped_thousands: bool = False) -> Decimal:
+    text = _cell_text(value)
+    ungrouped_number = r"-?\d+(?:\.\d+)?"
+    grouped_number = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+    pattern = rf"(?:{ungrouped_number}|{grouped_number})" if allow_grouped_thousands else ungrouped_number
+    if not re.fullmatch(pattern, text):
+        raise DouyinDataError(f"{label}不是有效数字：{text!r}")
     try:
-        number = Decimal(text)
+        number = Decimal(text.replace(",", ""))
     except InvalidOperation as exc:
         raise DouyinDataError(f"{label}不是有效数字：{text!r}") from exc
     if not number.is_finite():
@@ -133,7 +172,7 @@ def _normalized_decimal(value: Any, label: str) -> Decimal:
 
 
 def _normalize_price(value: Any) -> str:
-    number = _normalized_decimal(value, "价格")
+    number = _normalized_decimal(value, "价格", allow_grouped_thousands=True)
     if number < 0:
         raise DouyinDataError("价格不能小于 0")
     return format(number.normalize(), "f")
@@ -149,16 +188,32 @@ def _parse_stock(value: Any, label: str) -> int:
 def parse_materials(value: Any) -> Tuple[MaterialComponent, ...]:
     """解析“棉（100%）”或“棉/100%”格式的面料成分。"""
     text = _cell_text(value)
-    match = re.fullmatch(r"\s*(.+?)\s*(?:[（(]\s*(\d+)\s*%\s*[）)]|/\s*(\d+)\s*%)\s*", text)
-    if not match:
-        raise DouyinDataError(f"面料材质格式不正确：{text!r}，请使用“棉（100%）”或“棉/100%”")
-    name = match.group(1).strip()
-    percentage = int(match.group(2) or match.group(3))
-    if not name:
-        raise DouyinDataError("面料材质名称不能为空")
-    if not 0 <= percentage <= 100:
-        raise DouyinDataError("面料材质百分比必须在 0 到 100 之间")
-    return (MaterialComponent(name, percentage),)
+    components = []
+    position = 0
+    while position < len(text):
+        match = MATERIAL_COMPONENT_PATTERN.match(text, position)
+        if not match:
+            raise DouyinDataError(f"面料材质格式不正确：{text!r}，请使用“棉（100%）”或“棉/100%”")
+        name = match.group("name").strip()
+        percentage = int(match.group("parenthesized") or match.group("slashed"))
+        if not name:
+            raise DouyinDataError("面料材质名称不能为空")
+        if not 0 <= percentage <= 100:
+            raise DouyinDataError("面料材质百分比必须在 0 到 100 之间")
+        components.append(MaterialComponent(name, percentage))
+        position = match.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position == len(text):
+            break
+        if text[position] != "/":
+            raise DouyinDataError(f"面料材质格式不正确：{text!r}")
+        position += 1
+        if not text[position:].strip():
+            raise DouyinDataError(f"面料材质格式不正确：{text!r}")
+    if not components or sum(component.percentage for component in components) != 100:
+        raise DouyinDataError("面料材质百分比合计必须为 100")
+    return tuple(components)
 
 
 def _split_nonempty(value: Any, separator: str, label: str) -> Tuple[str, ...]:
@@ -168,7 +223,7 @@ def _split_nonempty(value: Any, separator: str, label: str) -> Tuple[str, ...]:
     return values
 
 
-def _douyin_attributes(fields: Dict[str, Any]) -> Dict[str, str]:
+def _douyin_attributes(fields: Dict[str, Any]) -> FrozenAttributes:
     """保留可用于后续抖音页面属性匹配的非空 Excel 键值。"""
     attributes: Dict[str, str] = {}
     for key, value in fields.items():
@@ -177,7 +232,7 @@ def _douyin_attributes(fields: Dict[str, Any]) -> Dict[str, str]:
         text = _cell_text(value)
         if text:
             attributes[key] = text
-    return attributes
+    return FrozenAttributes(attributes)
 
 
 def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import kuaimai_erp
 from douyin_data import (
@@ -78,6 +79,18 @@ class DouyinFieldParsingTests(unittest.TestCase):
         self.assertEqual(parse_materials("棉（100%）"), (MaterialComponent("棉", 100),))
         self.assertEqual(parse_materials("棉/100%"), (MaterialComponent("棉", 100),))
 
+    def test_parses_multiple_materials_in_source_order(self):
+        self.assertEqual(
+            parse_materials("棉（70%）/聚酯纤维（30%）"),
+            (MaterialComponent("棉", 70), MaterialComponent("聚酯纤维", 30)),
+        )
+
+    def test_rejects_incomplete_or_malformed_material_percentages(self):
+        for value in ("棉（80%）", "棉（70%）/聚酯纤维（20%）", "棉（70%）/聚酯纤维（30%）x"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(DouyinDataError, "百分比合计|格式不正确"):
+                    parse_materials(value)
+
     def test_uses_standalone_material_common_name_as_material_source(self):
         fields = dict(CURRENT_PRODUCT_FIELDS)
         del fields["面料材质/水洗标/吊牌图/面料"]
@@ -139,6 +152,15 @@ class DouyinFieldParsingTests(unittest.TestCase):
         fields["价格/京东价/市场价/售卖价/售价"] = -0.01
 
         with self.assertRaisesRegex(DouyinDataError, "价格不能小于 0"):
+            parse_douyin_fields(fields)
+
+    def test_accepts_correctly_grouped_price_and_rejects_malformed_grouping(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        fields["价格/京东价/市场价/售卖价/售价"] = "1,586.00"
+        self.assertEqual(parse_douyin_fields(fields).price, "1586")
+
+        fields["价格/京东价/市场价/售卖价/售价"] = "58,6"
+        with self.assertRaisesRegex(DouyinDataError, "价格不是有效数字"):
             parse_douyin_fields(fields)
 
     def test_rejects_invalid_material_percentages(self):
@@ -217,7 +239,122 @@ class KuaimaiIntegrationTests(unittest.TestCase):
         summary = kuaimai_erp.product_summary(product)
         self.assertEqual(summary["douyin_assets"]["wash_label_images"], ["/input/wash.png"])
         self.assertEqual(summary["douyin_assets"]["size_chart_image"], "/input/size.png")
+        self.assertIsInstance(summary["douyin_fields"]["attributes"], dict)
         json.dumps(summary, ensure_ascii=False)
+
+    def test_product_data_can_be_directly_constructed_without_douyin_data(self):
+        product = kuaimai_erp.ProductData(
+            excel_path=Path("/input/产品信息.xlsx"),
+            product_dir=Path("/input"),
+            title="标题",
+            style_code="款号",
+            base_price="586",
+            main_images=[],
+            main_images_34=[],
+            detail_images=[],
+            sku_images=[],
+        )
+
+        self.assertIsNone(product.douyin_fields)
+        self.assertIsNone(product.douyin_assets)
+
+    def test_attributes_are_immutable_mappings(self):
+        attributes = parse_douyin_fields(CURRENT_PRODUCT_FIELDS).attributes
+
+        with self.assertRaises(TypeError):
+            attributes["厚度"] = "加厚"
+        with self.assertRaises(AttributeError):
+            attributes.clear()
+        with self.assertRaises(AttributeError):
+            del attributes._items
+
+
+class ProductDataReadIntegrationTests(unittest.TestCase):
+    def _write_image(self, directory: Path, name: str = "1.png") -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_bytes(b"image")
+        return path
+
+    def _write_excel(self, product_dir: Path, fields):
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        for key, value in fields:
+            sheet.append((key, value))
+        path = product_dir / "产品信息.xlsx"
+        workbook.save(path)
+        return path
+
+    def _write_legacy_images(self, product_dir: Path):
+        self._write_image(product_dir / "1：1主图")
+        self._write_image(product_dir / "3：4主图")
+        self._write_image(product_dir / "详情页图")
+        self._write_image(product_dir / "SKU图")
+
+    def _base_fields(self):
+        return [
+            ("商品分类", "休闲裤"),
+            ("商品标题/商品名称", "基础商品标题"),
+            ("货号/商家外部编码", "NGBL-10588"),
+            ("吊牌价/价格/基本售价", 586),
+        ]
+
+    def test_read_product_data_keeps_basic_only_products_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            excel_path = self._write_excel(product_dir, self._base_fields())
+
+            product = kuaimai_erp.read_product_data(excel_path)
+
+            self.assertEqual(product.title, "基础商品标题")
+            self.assertEqual(product.style_code, "NGBL-10588")
+            self.assertEqual(product.base_price, "586")
+            self.assertIsNone(product.douyin_fields)
+            self.assertIsNone(product.douyin_assets)
+
+    def test_read_product_data_rejects_partial_douyin_signals(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            excel_path = self._write_excel(product_dir, self._base_fields() + [("导购短标题", "短标题")])
+
+            with self.assertRaisesRegex(DouyinDataError, "面料材质"):
+                kuaimai_erp.read_product_data(excel_path)
+
+    def test_read_product_data_loads_complete_legacy_and_douyin_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            self._write_image(product_dir / "水洗标图片", "2.png")
+            self._write_image(product_dir / "尺码信息表")
+            self._write_image(product_dir / "身高体重推荐表")
+            excel_path = self._write_excel(product_dir, self._base_fields() + list(CURRENT_PRODUCT_FIELDS.items()))
+
+            product = kuaimai_erp.read_product_data(excel_path)
+            summary = kuaimai_erp.product_summary(product)
+
+            self.assertEqual(product.main_images, [product_dir / "1：1主图" / "1.png"])
+            self.assertEqual(product.douyin_fields.short_title, "重磅洗水宽松多口袋工装裤")
+            self.assertEqual(product.douyin_fields.materials, (MaterialComponent("棉", 100),))
+            self.assertEqual(product.douyin_assets.size_chart_image, product_dir / "尺码信息表" / "1.png")
+            self.assertEqual(summary["douyin_fields"]["price"], "586")
+            json.dumps(summary, ensure_ascii=False)
+
+
+class MainErrorHandlingTests(unittest.TestCase):
+    def test_main_handles_douyin_input_errors_as_expected_input_failures(self):
+        logger = Mock()
+        with patch.object(kuaimai_erp, "setup_logging", return_value=logger), patch.object(
+            kuaimai_erp, "resolve_excel_path", return_value=Path("/input/产品信息.xlsx")
+        ), patch.object(kuaimai_erp, "read_product_data", side_effect=DouyinDataError("抖音资料不完整")), patch(
+            "sys.argv", ["kuaimai_erp", "--dry-run"]
+        ):
+            self.assertEqual(kuaimai_erp.main(), 2)
+
+        logger.error.assert_called_once_with("%s", unittest.mock.ANY)
 
 
 def read_douyin_assets_for_summary():
