@@ -13,6 +13,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
@@ -23,6 +24,8 @@ from urllib.parse import parse_qs, urlsplit
 CATEGORY_PROPERTIES_ENDPOINT = "/fxg/getCategoryProperties.json"
 CATEGORY_PROPERTIES_QUIET_SECONDS = 0.2
 CATEGORY_PROPERTIES_TIMEOUT_SECONDS = 2.0
+SHOP_INFO_ENDPOINT = "/shop/info.json"
+DISTRIBUTION_CONFIG_ENDPOINT = "/dsb/queryDistributionConfig.json"
 SIZE_NAME_PATTERN = re.compile(
     r"^(?:XS|S|M|L|X{1,6}L|\d{1,2}XL)$",
     re.IGNORECASE,
@@ -81,6 +84,66 @@ def _form_number(value: object) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def _decimal(value: object, label: str) -> Decimal:
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise DouyinListingError(f"{label}不是有效数字：{value!r}") from exc
+    if not number.is_finite():
+        raise DouyinListingError(f"{label}不是有效数字：{value!r}")
+    return number
+
+
+def _shop_aliases(item: Mapping[str, Any]) -> Tuple[str, ...]:
+    aliases = []
+    for key in ("title", "priorityTitle", "nick", "name"):
+        text = str(item.get(key) or "").strip()
+        if text and normalize_option(text) not in {normalize_option(value) for value in aliases}:
+            aliases.append(text)
+    return tuple(aliases)
+
+
+def _freight_api_data(
+    shop_payload: Mapping[str, Any],
+    config_payload: Mapping[str, Any],
+) -> Tuple[Tuple[Mapping[str, Any], ...], Mapping[str, Tuple[Mapping[str, str], ...]]]:
+    """只保留运费匹配所需的店铺 ID/名称和模板 ID/名称。"""
+    shop_data = shop_payload.get("data")
+    raw_shops = shop_data.get("list") if isinstance(shop_data, Mapping) else None
+    config_data = config_payload.get("data")
+    raw_templates = (
+        config_data.get("templateList") if isinstance(config_data, Mapping) else None
+    )
+    if not isinstance(raw_shops, list) or not isinstance(raw_templates, list):
+        raise DouyinListingError("运费接口返回结构不完整")
+
+    shops: List[Mapping[str, Any]] = []
+    for raw_shop in raw_shops:
+        if not isinstance(raw_shop, Mapping) or raw_shop.get("id") is None:
+            continue
+        aliases = _shop_aliases(raw_shop)
+        if aliases:
+            shops.append({"id": str(raw_shop["id"]), "aliases": aliases})
+
+    templates: Dict[str, List[Mapping[str, str]]] = {}
+    for raw_template in raw_templates:
+        if not isinstance(raw_template, Mapping) or raw_template.get("shopId") is None:
+            continue
+        name = str(raw_template.get("templateName") or "").strip()
+        if not name:
+            continue
+        option = {
+            "id": str(raw_template.get("templateId") or ""),
+            "name": name,
+        }
+        bucket = templates.setdefault(str(raw_template["shopId"]), [])
+        if (option["id"], normalize_option(option["name"])) not in {
+            (item["id"], normalize_option(item["name"])) for item in bucket
+        }:
+            bucket.append(option)
+    return tuple(shops), {key: tuple(value) for key, value in templates.items()}
 
 
 async def _size_header_label(header: Any) -> str:
@@ -1135,3 +1198,300 @@ class DouyinListing:
                 timeout_seconds,
             )
         return results
+
+    async def _section(self, title: str, timeout_seconds: float = 30) -> Any:
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        wanted = _normalize_label(title)
+        while asyncio.get_running_loop().time() < deadline:
+            titles = self.panel.locator(".title")
+            matches = []
+            for index in range(await titles.count()):
+                candidate = titles.nth(index)
+                try:
+                    if (
+                        await candidate.is_visible()
+                        and _normalize_label(await candidate.inner_text()) == wanted
+                    ):
+                        matches.append(candidate)
+                except Exception:
+                    continue
+            if len(matches) == 1:
+                return matches[0].locator("xpath=..")
+            if len(matches) > 1:
+                raise DouyinListingError(f"抖音板块“{title}”匹配数为 {len(matches)}")
+            await asyncio.sleep(0.05)
+        raise DouyinListingError(f"等待抖音板块“{title}”加载超时")
+
+    async def _exact_toggle(self, scope: Any, text: str, timeout_seconds: float = 10) -> Any:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        wanted = normalize_option(text)
+        while asyncio.get_running_loop().time() < deadline:
+            labels = scope.locator("label")
+            matches = []
+            for index in range(await labels.count()):
+                label = labels.nth(index)
+                try:
+                    if not await label.is_visible():
+                        continue
+                    if normalize_option(await label.inner_text()) != wanted:
+                        continue
+                    inputs = label.locator("input[type=radio], input[type=checkbox]")
+                    if await inputs.count() == 1:
+                        matches.append((label, inputs.first))
+                except Exception:
+                    continue
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise DouyinListingError(f"选项“{text}”匹配数为 {len(matches)}")
+            await asyncio.sleep(0.05)
+        raise DouyinListingError(f"等待选项“{text}”加载超时")
+
+    async def _ensure_toggle_checked(self, scope: Any, text: str) -> None:
+        label, input_box = await self._exact_toggle(scope, text)
+        if await input_box.is_checked():
+            return
+        await label.click()
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
+            if await input_box.is_checked():
+                return
+            await asyncio.sleep(0.05)
+        raise DouyinListingError(f"选项“{text}”点击后未处于选中状态")
+
+    async def apply_delivery_mode(self) -> Tuple[str, str, str]:
+        """按依赖顺序选择混合发货、48 小时和 15 天预售。"""
+        section = await self._section("价格库存")
+        await section.scroll_into_view_if_needed()
+        values = ("现货预售混合模式", "48小时内发货", "15天内")
+        for value in values:
+            await self._ensure_toggle_checked(section, value)
+        return values
+
+    async def _sku_header_label(self, header: Any) -> str:
+        cell = header.locator(":scope > .cell")
+        if await cell.count():
+            title = (await cell.first.get_attribute("title") or "").strip()
+            if title:
+                return title
+            text = await cell.first.inner_text()
+        else:
+            text = await header.inner_text()
+        return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+    async def _sku_table_and_columns(self, section: Any) -> Tuple[Any, Mapping[str, int]]:
+        required = ("价格", "现货库存", "预售库存")
+        matches = []
+        tables = section.locator(".el-table")
+        for table_index in range(await tables.count()):
+            table = tables.nth(table_index)
+            try:
+                if not await table.is_visible():
+                    continue
+                headers = table.locator(
+                    ":scope > .el-table__main-wrapper > .el-table__header-wrapper thead th, "
+                    ":scope > .el-table__header-wrapper thead th"
+                )
+                labels = [
+                    await self._sku_header_label(headers.nth(index))
+                    for index in range(await headers.count())
+                ]
+            except Exception:
+                continue
+            indexes: Dict[str, int] = {}
+            for wanted in required:
+                normalized = _normalize_label(wanted)
+                found = [
+                    index
+                    for index, label in enumerate(labels)
+                    if (
+                        _normalize_label(label) == normalized
+                        if wanted != "预售库存"
+                        else _normalize_label(label).startswith(normalized)
+                    )
+                ]
+                if len(found) == 1:
+                    indexes[wanted] = found[0]
+            if len(indexes) == len(required):
+                matches.append((table, indexes))
+        if len(matches) != 1:
+            raise DouyinListingError(
+                f"抖音 SKU 价格库存表匹配数为 {len(matches)}"
+            )
+        return matches[0]
+
+    async def fill_sku_price_inventory(
+        self,
+        price: object,
+        spot_stock: object,
+        presale_stock: object,
+    ) -> int:
+        """逐行填写并回读价格、现货库存和预售库存。"""
+        expected = {
+            "价格": _decimal(price, "价格"),
+            "现货库存": _decimal(spot_stock, "现货库存"),
+            "预售库存": _decimal(presale_stock, "预售库存"),
+        }
+        if expected["价格"] < 0 or any(
+            expected[label] < 0 or expected[label] != expected[label].to_integral_value()
+            for label in ("现货库存", "预售库存")
+        ):
+            raise DouyinListingError("价格和库存数值不符合要求")
+
+        section = await self._section("价格库存")
+        table, indexes = await self._sku_table_and_columns(section)
+        rows = table.locator(
+            ":scope > .el-table__main-wrapper > .el-table__body-wrapper tbody > tr, "
+            ":scope > .el-table__body-wrapper tbody > tr"
+        )
+        if await rows.count() == 0:
+            raise DouyinListingError("抖音 SKU 表中没有可填写行")
+
+        # 先确认每行三个目标单元格都有唯一可写输入框。
+        controls = []
+        for row_index in range(await rows.count()):
+            cells = rows.nth(row_index).locator(":scope > td")
+            row_controls = {}
+            for label, column_index in indexes.items():
+                if await cells.count() <= column_index:
+                    raise DouyinListingError(f"第 {row_index + 1} 个 SKU 缺少“{label}”单元格")
+                inputs = cells.nth(column_index).locator(
+                    "input:not([disabled]):not([readonly])"
+                )
+                if await inputs.count() != 1:
+                    raise DouyinListingError(
+                        f"第 {row_index + 1} 个 SKU 的“{label}”输入框匹配数为 "
+                        f"{await inputs.count()}"
+                    )
+                row_controls[label] = inputs.first
+            controls.append(row_controls)
+
+        for row_index, row_controls in enumerate(controls, start=1):
+            for label, input_box in row_controls.items():
+                value = format(expected[label], "f")
+                await input_box.fill(value)
+                await input_box.press("Tab")
+            for label, input_box in row_controls.items():
+                actual = _decimal(await input_box.input_value(), f"第 {row_index} 个 SKU {label}")
+                if actual != expected[label]:
+                    raise DouyinListingError(
+                        f"第 {row_index} 个 SKU 的“{label}”回读失败："
+                        f"期望 {expected[label]}，页面为 {actual}"
+                    )
+        return len(controls)
+
+    async def _fetch_freight_payloads(
+        self,
+    ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+        current = urlsplit(self.page.url)
+        if current.scheme not in {"http", "https"} or not current.netloc:
+            raise DouyinListingError("当前页面不是可验证的快麦同源页面")
+        origin = f"{current.scheme}://{current.netloc}"
+        urls = (
+            origin + SHOP_INFO_ENDPOINT + "?pageNo=1&pageSize=9999&api_name=shop_info",
+            origin
+            + DISTRIBUTION_CONFIG_ENDPOINT
+            + "?shopType=TouTiaoFXG&api_name=dsb_queryDistributionConfig",
+        )
+        payloads = []
+        for url in urls:
+            try:
+                response = await self.page.request.get(url, timeout=30_000)
+                if not response.ok:
+                    raise DouyinListingError(
+                        f"运费只读接口请求失败：{urlsplit(url).path} HTTP {response.status}"
+                    )
+                payload = await response.json()
+            except DouyinListingError:
+                raise
+            except Exception as exc:
+                raise DouyinListingError(
+                    f"运费只读接口请求异常：{urlsplit(url).path}"
+                ) from exc
+            if not isinstance(payload, Mapping) or payload.get("result") != 1:
+                raise DouyinListingError(
+                    f"运费只读接口返回失败：{urlsplit(url).path}"
+                )
+            payloads.append(payload)
+        return payloads[0], payloads[1]
+
+    async def apply_freight_templates(
+        self,
+        aliases: Sequence[str],
+    ) -> Mapping[str, str]:
+        """使用只读 API 匹配每个可见授权店铺，再用 DOM 选择回读。"""
+        wanted_aliases = tuple(str(value).strip() for value in aliases if str(value).strip())
+        if not wanted_aliases:
+            raise DouyinListingError("运费模板别名为空")
+        shop_payload, config_payload = await self._fetch_freight_payloads()
+        shops, templates_by_shop = _freight_api_data(shop_payload, config_payload)
+
+        section = await self._section("运费模板")
+        rows = section.locator(".set-ship")
+        visible_rows = []
+        seen_names = set()
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            if not await row.is_visible():
+                continue
+            names = row.locator(":scope > .shop-title")
+            selects = row.locator(":scope > .el-select")
+            if await names.count() != 1 or await selects.count() != 1:
+                raise DouyinListingError(f"第 {index + 1} 个运费店铺行结构不唯一")
+            store_name = (await names.first.inner_text()).strip()
+            normalized_store = normalize_option(store_name)
+            if not normalized_store or normalized_store in seen_names:
+                raise DouyinListingError(f"运费店铺名为空或重复：{store_name!r}")
+            seen_names.add(normalized_store)
+            visible_rows.append((store_name, row, selects.first))
+        if not visible_rows:
+            raise DouyinListingError("页面没有可见的授权店铺运费行")
+
+        # 所有店铺与模板先通过 API 唯一匹配，再修改页面。
+        assignments = []
+        for store_name, row, select in visible_rows:
+            store_matches = [
+                shop
+                for shop in shops
+                if normalize_option(store_name)
+                in {normalize_option(value) for value in shop["aliases"]}
+            ]
+            if len(store_matches) != 1:
+                raise DouyinListingError(
+                    f"店铺“{store_name}”在店铺 API 中匹配数为 {len(store_matches)}"
+                )
+            shop_id = str(store_matches[0]["id"])
+            options = templates_by_shop.get(shop_id, ())
+            option_matches: Dict[Tuple[str, str], Mapping[str, str]] = {}
+            for alias in wanted_aliases:
+                for option in options:
+                    if normalize_option(option["name"]) == normalize_option(alias):
+                        option_matches[(option["id"], normalize_option(option["name"]))] = option
+            if len(option_matches) != 1:
+                candidates = "、".join(option["name"] for option in options) or "<无>"
+                raise DouyinListingError(
+                    f"店铺“{store_name}”运费模板匹配数为 {len(option_matches)}；"
+                    f"Excel 别名：{' / '.join(wanted_aliases)}；候选：{candidates}"
+                )
+            assignments.append((store_name, select, next(iter(option_matches.values())), options))
+
+        applied: Dict[str, str] = {}
+        for store_name, select, chosen, options in assignments:
+            current = await self._read_select_values(select, multi=False)
+            if not current or normalize_option(current[0]) != normalize_option(chosen["name"]):
+                current = await self._select_values(
+                    select,
+                    (chosen["name"],),
+                    multi=False,
+                    api_options=options,
+                )
+            if normalize_option(current[0]) != normalize_option(chosen["name"]):
+                raise DouyinListingError(
+                    f"店铺“{store_name}”运费模板回读失败：{current[0]!r}"
+                )
+            applied[store_name] = current[0]
+        if len(applied) != len(visible_rows):
+            raise DouyinListingError("运费模板处理店铺数与页面不一致")
+        return applied

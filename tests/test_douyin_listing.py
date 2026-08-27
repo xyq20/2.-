@@ -226,6 +226,58 @@ function sizeTable() {
   </div>`;
 }
 
+function deliveryInventory() {
+  const skuRow = size => `<tr data-sku="${size}">
+    <td><div class="cell">${size}</div></td>
+    <td><div class="cell"><input value="0"></div></td>
+    <td><div class="cell"><input value="0"></div></td>
+    <td><div class="cell"><input value="0"></div></td>
+  </tr>`;
+  const header = label => `<th><div class="cell" title="${label}">${label}</div></th>`;
+  return `<section class="price-inventory">
+    <div class="title"><span>价格库存</span></div>
+    <div class="conf">
+      <label class="el-radio"><input type="radio" name="delivery-mode">现货预售混合模式</label>
+      <label class="el-checkbox"><input type="checkbox">48小时内发货</label>
+      <label class="el-checkbox"><input type="checkbox">15天内</label>
+      <div class="el-table sku-table">
+        <div class="el-table__main-wrapper">
+          <div class="el-table__header-wrapper"><table><thead><tr>
+            ${header('尺码')}${header('价格')}${header('现货库存')}${header('预售库存(15天内)')}
+          </tr></thead></table></div>
+          <div class="el-table__body-wrapper"><table><tbody>
+            ${['S', 'M', 'L', 'XL', '2XL'].map(skuRow).join('')}
+          </tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </section>`;
+}
+
+function freightSelect(current) {
+  return `<div class="el-select">
+    <input class="el-input__inner" readonly value="${current}" onclick="openSelect(this)">
+    <div class="el-select-dropdown" style="display:none"><ul>
+      <li class="el-select-dropdown__item" onclick="pickOption(this, '新疆，西藏，不包邮-T恤，裤子，装饰品', false)">新疆，西藏，不包邮-T恤，裤子，装饰品</li>
+      <li class="el-select-dropdown__item" onclick="pickOption(this, '包邮', false)">包邮</li>
+    </ul></div>
+  </div>`;
+}
+
+function freightSection() {
+  const row = (name, current) => `<div class="set-ship">
+    <span class="shop-title">${name}</span>${freightSelect(current)}
+  </div>`;
+  return `<section class="freight-section">
+    <div class="title"><span>运费模板</span></div>
+    <div class="el-row">
+      ${row('钊叔 NEIGBORL 制', '新疆，西藏，不包邮-T恤，裤子，装饰品')}
+      ${row('夏一制', '包邮')}
+      ${row('啊亮穿搭', '包邮')}
+    </div>
+  </section>`;
+}
+
 window.renderSizeRows = sizes => {
   document.querySelector('#size-rows').innerHTML = sizes.map(sizeRow).join('');
 };
@@ -318,6 +370,8 @@ function openDouyin() {
         <label class="el-form-item__label">商品详情图</label>
         <div class="el-form-item__content" data-image-group="details" data-existing-count="2"></div>
       </div>
+      ${deliveryInventory()}
+      ${freightSection()}
       <div id="attributes"></div>
     </section>`;
     renderSizeRows(['XL', 'S', '2XL', 'M', 'L']);
@@ -471,6 +525,78 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][1], main_34)
         self.assertEqual(calls[2][1], details)
         self.assertTrue(all(call[3] == 45 for call in calls))
+
+    async def test_delivery_mode_and_every_sku_row_are_verified(self):
+        await self.listing.open()
+
+        self.assertEqual(
+            await self.listing.apply_delivery_mode(),
+            ("现货预售混合模式", "48小时内发货", "15天内"),
+        )
+        self.assertEqual(await self.listing.fill_sku_price_inventory("586", 0, 100), 5)
+
+        self.assertTrue(
+            await self.page.locator("label", has_text="现货预售混合模式").locator("input").is_checked()
+        )
+        for row_index in range(5):
+            values = await self.page.locator(".sku-table tbody tr").nth(row_index).locator(
+                "input"
+            ).evaluate_all("inputs => inputs.map(input => input.value)")
+            self.assertEqual(values, ["586", "0", "100"])
+
+    @staticmethod
+    def freight_payloads(missing_store_id=None):
+        desired = "新疆，西藏，不包邮-T恤，裤子，装饰品"
+        shops = [
+            {"id": 1, "title": "钊叔 NEIGBORL 制"},
+            {"id": 2, "title": "夏一制"},
+            {"id": 3, "title": "啊亮穿搭"},
+        ]
+        templates = [
+            {
+                "shopId": shop["id"],
+                "templateId": "0" if shop["id"] == missing_store_id else f"t-{shop['id']}",
+                "templateName": "包邮" if shop["id"] == missing_store_id else desired,
+            }
+            for shop in shops
+        ]
+        return (
+            {"result": 1, "data": {"list": shops}},
+            {"result": 1, "data": {"templateList": templates}},
+        )
+
+    async def test_every_visible_store_freight_is_api_matched_and_read_back(self):
+        await self.listing.open()
+        payloads = self.freight_payloads()
+
+        async def fake_fetch():
+            return payloads
+
+        self.listing._fetch_freight_payloads = fake_fetch
+        actual = await self.listing.apply_freight_templates(
+            ("新疆西藏不包邮T恤裤子装饰品", "新疆，西藏，不包邮-T恤，裤子，装饰品")
+        )
+
+        self.assertEqual(set(actual), {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"})
+        self.assertTrue(all("新疆" in value for value in actual.values()))
+
+    async def test_missing_store_freight_fails_before_any_selection(self):
+        await self.listing.open()
+        payloads = self.freight_payloads(missing_store_id=2)
+
+        async def fake_fetch():
+            return payloads
+
+        self.listing._fetch_freight_payloads = fake_fetch
+        with self.assertRaisesRegex(
+            DouyinListingError,
+            r"店铺“夏一制”.*Excel 别名.*候选：包邮",
+        ):
+            await self.listing.apply_freight_templates(
+                ("新疆，西藏，不包邮-T恤，裤子，装饰品",)
+            )
+        first_value = await self.page.locator(".set-ship .el-select input").nth(1).input_value()
+        self.assertEqual(first_value, "包邮")
 
     async def test_apply_category_and_fields_rejects_unmatched_supplied_attribute(self):
         await self.listing.open()
