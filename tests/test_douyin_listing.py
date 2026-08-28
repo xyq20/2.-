@@ -676,7 +676,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("新疆" in value for value in actual["applied"].values()))
         self.assertEqual(actual["preserved"], {})
 
-    async def test_store_without_requested_freight_is_preserved(self):
+    async def test_store_missing_initial_api_option_uses_dom_fallback(self):
         await self.listing.open()
         payloads = self.freight_payloads(missing_store_id=2)
 
@@ -687,10 +687,44 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.apply_freight_templates(
             ("新疆，西藏，不包邮-T恤，裤子，装饰品",)
         )
-        self.assertEqual(actual["preserved"], {"夏一制": "包邮"})
-        self.assertEqual(set(actual["applied"]), {"钊叔 NEIGBORL 制", "啊亮穿搭"})
+        self.assertEqual(actual["preserved"], {})
+        self.assertEqual(
+            set(actual["applied"]),
+            {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"},
+        )
         first_value = await self.page.locator(".set-ship .el-select input").nth(1).input_value()
-        self.assertEqual(first_value, "包邮")
+        self.assertEqual(first_value, "新疆，西藏，不包邮-T恤，裤子，装饰品")
+
+    async def test_freight_only_changes_configured_stores(self):
+        await self.listing.open()
+        payloads = self.freight_payloads()
+
+        async def fake_fetch():
+            return payloads
+
+        self.listing._fetch_freight_payloads = fake_fetch
+        actual = await self.listing.apply_freight_templates(
+            ("新疆，西藏，不包邮-T恤，裤子，装饰品",),
+            target_shops=("钊叔 NEIGBORL 制", "啊亮穿搭"),
+            default_untargeted_template="包邮",
+        )
+
+        self.assertEqual(
+            set(actual["applied"]),
+            {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"},
+        )
+        self.assertEqual(actual["preserved"], {})
+        values = await self.page.locator(".set-ship .el-select input").evaluate_all(
+            "inputs => inputs.map(input => input.value)"
+        )
+        self.assertEqual(
+            values,
+            [
+                "新疆，西藏，不包邮-T恤，裤子，装饰品",
+                "包邮",
+                "新疆，西藏，不包邮-T恤，裤子，装饰品",
+            ],
+        )
 
     async def test_apply_category_and_fields_reports_unmatched_current_category_attribute(self):
         await self.listing.open()

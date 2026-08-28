@@ -67,6 +67,16 @@ KNOWN_DOUYIN_SHOPS = (
     "小马客服",
 )
 
+# 只有这些抖音店铺按产品 Excel 的“运费设置”匹配模板；
+# 其他授权店铺统一使用“包邮”。
+DOUYIN_FREIGHT_TEMPLATE_SHOPS = (
+    "钊叔 NEIGBORL 制",
+    "啊亮穿搭",
+    "泰美了穿搭",
+    "老朱和NEIGBORL",
+    "NEIGBORL钊哥小店",
+)
+
 
 class AutomationError(RuntimeError):
     """可向用户直接展示的自动化异常。"""
@@ -1803,7 +1813,9 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                     product.douyin_fields.presale_stock,
                 )
                 freight = await douyin.apply_freight_templates(
-                    product.douyin_fields.freight_aliases
+                    product.douyin_fields.freight_aliases,
+                    target_shops=DOUYIN_FREIGHT_TEMPLATE_SHOPS,
+                    default_untargeted_template="包邮",
                 )
                 douyin_report = await douyin.validate_douyin_form(
                     {

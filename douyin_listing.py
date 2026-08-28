@@ -934,8 +934,11 @@ class DouyinListing:
                     name: (option.innerText || '').trim(),
                     id: '',
                     index: String(index),
-                    disabled: option.classList.contains('is-disabled')
-                  })).filter(item => item.name && !item.disabled)
+                    disabled: option.classList.contains('is-disabled'),
+                    visible: option.getClientRects().length > 0
+                      && getComputedStyle(option).display !== 'none'
+                      && getComputedStyle(option).visibility !== 'hidden'
+                  })).filter(item => item.name && !item.disabled && item.visible)
                 """
             )
             if result:
@@ -2173,9 +2176,21 @@ class DouyinListing:
     async def apply_freight_templates(
         self,
         aliases: Sequence[str],
+        *,
+        target_shops: Optional[Sequence[str]] = None,
+        default_untargeted_template: Optional[str] = None,
     ) -> Mapping[str, Mapping[str, str]]:
-        """使用只读 API 匹配每个可见授权店铺，再用 DOM 选择回读。"""
-        wanted_aliases = tuple(str(value).strip() for value in aliases if str(value).strip())
+        """API 优先匹配每个店铺，初始无候选时用 DOM 远程搜索回退。"""
+        wanted_aliases_list: List[str] = []
+        seen_aliases = set()
+        for value in aliases:
+            text = str(value).strip()
+            normalized = normalize_option(text)
+            if not text or not normalized or normalized in seen_aliases:
+                continue
+            seen_aliases.add(normalized)
+            wanted_aliases_list.append(text)
+        wanted_aliases = tuple(wanted_aliases_list)
         if not wanted_aliases:
             raise DouyinListingError("运费模板别名为空")
         shop_payload, config_payload = await self._fetch_freight_payloads()
@@ -2202,10 +2217,52 @@ class DouyinListing:
         if not visible_rows:
             raise DouyinListingError("页面没有可见的授权店铺运费行")
 
+        target_names = None
+        if target_shops is not None:
+            target_names = {
+                normalize_option(value)
+                for value in target_shops
+                if normalize_option(value)
+            }
+            visible_names = {
+                normalize_option(store_name) for store_name, _row, _select in visible_rows
+            }
+            missing_targets = target_names - visible_names
+            if missing_targets:
+                missing_labels = [
+                    str(value)
+                    for value in target_shops
+                    if normalize_option(value) in missing_targets
+                ]
+                raise DouyinListingError(
+                    "指定按 Excel 填写运费的店铺未出现："
+                    + "、".join(missing_labels)
+                )
+
         # 所有店铺与模板先通过 API 唯一匹配，再修改页面。
         assignments = []
         preserved: Dict[str, str] = {}
         for store_name, row, select in visible_rows:
+            if target_names is not None and normalize_option(store_name) not in target_names:
+                if default_untargeted_template:
+                    assignments.append(
+                        (
+                            store_name,
+                            select,
+                            {"id": "", "name": default_untargeted_template},
+                            (),
+                        )
+                    )
+                else:
+                    current = await self._read_select_values(select, multi=False)
+                    preserved[store_name] = current[0] if current else ""
+                    if self.logger is not None:
+                        self.logger.info(
+                            "店铺“%s”未配置按 Excel 填写运费，保持原值：%s",
+                            store_name,
+                            preserved[store_name] or "<空>",
+                        )
+                continue
             store_matches = [
                 shop
                 for shop in shops
@@ -2219,9 +2276,11 @@ class DouyinListing:
 
             qualified = []
             candidate_names = []
+            candidate_options: List[Mapping[str, str]] = []
             for shop in store_matches:
                 shop_id = str(shop["id"])
                 options = templates_by_shop.get(shop_id, ())
+                candidate_options.extend(options)
                 option_matches: Dict[Tuple[str, str], Mapping[str, str]] = {}
                 for alias in wanted_aliases:
                     for option in options:
@@ -2243,14 +2302,12 @@ class DouyinListing:
                     f"Excel 别名：{' / '.join(wanted_aliases)}；候选：{candidates}"
                 )
             if not qualified:
-                current = await self._read_select_values(select, multi=False)
-                preserved[store_name] = current[0] if current else ""
-                if self.logger is not None:
-                    self.logger.info(
-                        "店铺“%s”无 Excel 指定运费模板，保持原值：%s",
-                        store_name,
-                        preserved[store_name] or "<空>",
-                    )
+                # queryDistributionConfig 只返回初始候选。可输入的
+                # Element Select 在逐字搜索后会通过独立接口返回
+                # 店铺的其他模板，因此留到 DOM 阶段再做精确搜索。
+                assignments.append(
+                    (store_name, select, None, tuple(candidate_options))
+                )
                 continue
             _shop_id, chosen, options = qualified[0]
             assignments.append((store_name, select, chosen, options))
@@ -2261,19 +2318,48 @@ class DouyinListing:
         applied: Dict[str, str] = {}
         for store_name, select, chosen, options in assignments:
             current = await self._read_select_values(select, multi=False)
-            if not current or normalize_option(current[0]) != normalize_option(chosen["name"]):
-                current = await self._select_values(
-                    select,
-                    (chosen["name"],),
-                    label=f"运费模板-{store_name}",
-                    multi=False,
-                    api_options=options,
-                )
-            if normalize_option(current[0]) != normalize_option(chosen["name"]):
+            if chosen is not None:
+                expected_names = (chosen["name"],)
+            else:
+                expected_names = wanted_aliases
+
+            selected = None
+            for expected_name in expected_names:
+                if current and normalize_option(current[0]) == normalize_option(expected_name):
+                    selected = current
+                    break
+                try:
+                    selected = await self._select_values(
+                        select,
+                        (expected_name,),
+                        label=f"运费模板-{store_name}",
+                        multi=False,
+                        api_options=options,
+                    )
+                    break
+                except DouyinListingError as exc:
+                    if "匹配数为 0" not in str(exc):
+                        raise
+
+            if selected is None:
+                preserved[store_name] = current[0] if current else ""
+                if self.logger is not None:
+                    self.logger.info(
+                        "店铺“%s”远程搜索仍无 Excel 指定运费模板，"
+                        "保持原值：%s",
+                        store_name,
+                        preserved[store_name] or "<空>",
+                    )
+                continue
+            # 远程搜索型 Element Select 点击候选后可能仍保持
+            # popper 可见。在进入下一店铺前显式关闭，避免误用
+            # 上一行的活动候选层。
+            await self._dismiss_select_dropdown(select)
+            if not matches_any(selected, expected_names, normalize_option):
                 raise DouyinListingError(
-                    f"店铺“{store_name}”运费模板回读失败：{current[0]!r}"
+                    f"店铺“{store_name}”运费模板回读失败：{selected[0]!r}"
                 )
-            applied[store_name] = current[0]
+            applied[store_name] = selected[0]
         if len(applied) + len(preserved) != len(visible_rows):
             raise DouyinListingError("运费模板处理店铺数与页面不一致")
         return {"applied": applied, "preserved": preserved}
