@@ -161,6 +161,11 @@ DOUYIN_FIXTURE = r"""
 <script>
 let selectSequence = 0;
 window.sizeWriteCount = 0;
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    document.querySelectorAll('.el-select-dropdown').forEach(item => item.style.display = 'none');
+  }
+});
 
 function selectBox(label, values, multi=false) {
   const dropdownId = `attribute-popper-${++selectSequence}`;
@@ -191,6 +196,13 @@ function materialRow() {
     <div class="el-input el-input-digit"><input class="el-input__inner"></div>
     <i class="el-icon-delete" onclick="this.closest('.measure-item').remove()"></i>
   </div>`;
+}
+
+function textAttribute(label) {
+  return `<div class="attr-item"><div class="el-form-item">
+    <label class="el-form-item__label">${label}</label>
+    <div class="el-form-item__content"><input class="el-input__inner"></div>
+  </div></div>`;
 }
 
 function sizeRow(size) {
@@ -322,7 +334,11 @@ function pickOption(option, value, multi) {
 function renderAttributes() {
   document.querySelector('#attributes').innerHTML =
     selectBox('厚度', ['常规款', '常规款（加厚）'], false) +
+    textAttribute('裤门襟') +
     selectBox('里料材质', ['棉', '亚麻', '棉麻'], true) +
+    textAttribute('里料材质成分含量') +
+    textAttribute('材质成分含量') +
+    `<div class="wash-upload"><span>水洗标/吊牌图</span><div class="sc-upload"><input type="file"></div></div>` +
     `<div class="attr-item"><div class="el-form-item">
       <label class="el-form-item__label">面料材质</label>
       <div class="el-form-item__content">
@@ -352,6 +368,10 @@ function openDouyin() {
         <div class="el-form-item__content"><div class="platform-category-input">请选择类目
           <div class="prediction-item"><span>推荐</span><span class="path">服装>男装>休闲裤</span><button onclick="applyCategory(this)">点击使用</button></div>
         </div></div>
+      </div>
+      <div class="el-form-item">
+        <label class="el-form-item__label">货号</label>
+        <div class="el-form-item__content"><input placeholder="请输入货号"></div>
       </div>
       <div class="el-form-item">
         <label class="el-form-item__label">导购短标题</label>
@@ -409,18 +429,24 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             await self.listing.apply_first_recommended_category(),
             "服装 > 男装 > 休闲裤",
         )
+        self.assertEqual(
+            await self.listing.apply_first_recommended_category(),
+            "服装 > 男装 > 休闲裤",
+        )
         self.assertEqual(await self.page.locator("#attributes > .el-select-dropdown").count(), 2)
+        self.assertEqual(await self.listing.fill_short_title("重磅水洗工装裤"), "重磅水洗工装裤")
         self.assertEqual(await self.listing.fill_short_title("重磅水洗工装裤"), "重磅水洗工装裤")
 
         self.assertEqual(await self.listing.fill_attribute("厚度", "常 规-款"), ("常规款",))
+        self.assertEqual(await self.listing.fill_attribute("厚度", "常 规-款"), ("常规款",))
         self.assertEqual(
             await self.listing.fill_attribute("里料材质", "棉/亚麻"),
-            ("棉", "亚麻"),
+            ("棉",),
         )
         tags = self.page.locator(
             ".attr-item:has(.el-form-item__label:text-is('里料材质')) .el-tag"
         )
-        self.assertEqual(await tags.count(), 2)
+        self.assertEqual(await tags.count(), 1)
 
     async def test_material_rows_selection_percentages_and_upload_adapter(self):
         await self.listing.open()
@@ -432,6 +458,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             return "skipped"
 
         materials = (MaterialComponent("棉", 60), MaterialComponent("亚麻", 40))
+
         with patch("kuaimai_erp.sync_image_group", new=fake_sync):
             actual = await self.listing.apply_materials(materials, (Path("wash-label.jpg"),))
 
@@ -439,6 +466,14 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator("#material-rows .measure-item").count(), 2)
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
+
+    async def test_or_value_prefers_existing_later_candidate_before_creating(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        actual = await self.listing.fill_attribute("里料材质", "不存在/亚麻")
+
+        self.assertEqual(actual, ("亚麻",))
 
     @staticmethod
     def recommendations():
@@ -577,10 +612,14 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ("新疆西藏不包邮T恤裤子装饰品", "新疆，西藏，不包邮-T恤，裤子，装饰品")
         )
 
-        self.assertEqual(set(actual), {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"})
-        self.assertTrue(all("新疆" in value for value in actual.values()))
+        self.assertEqual(
+            set(actual["applied"]),
+            {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"},
+        )
+        self.assertTrue(all("新疆" in value for value in actual["applied"].values()))
+        self.assertEqual(actual["preserved"], {})
 
-    async def test_missing_store_freight_fails_before_any_selection(self):
+    async def test_store_without_requested_freight_is_preserved(self):
         await self.listing.open()
         payloads = self.freight_payloads(missing_store_id=2)
 
@@ -588,28 +627,74 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             return payloads
 
         self.listing._fetch_freight_payloads = fake_fetch
-        with self.assertRaisesRegex(
-            DouyinListingError,
-            r"店铺“夏一制”.*Excel 别名.*候选：包邮",
-        ):
-            await self.listing.apply_freight_templates(
-                ("新疆，西藏，不包邮-T恤，裤子，装饰品",)
-            )
+        actual = await self.listing.apply_freight_templates(
+            ("新疆，西藏，不包邮-T恤，裤子，装饰品",)
+        )
+        self.assertEqual(actual["preserved"], {"夏一制": "包邮"})
+        self.assertEqual(set(actual["applied"]), {"钊叔 NEIGBORL 制", "啊亮穿搭"})
         first_value = await self.page.locator(".set-ship .el-select input").nth(1).input_value()
         self.assertEqual(first_value, "包邮")
 
-    async def test_apply_category_and_fields_rejects_unmatched_supplied_attribute(self):
+    async def test_apply_category_and_fields_reports_unmatched_current_category_attribute(self):
         await self.listing.open()
         fields = SimpleNamespace(
             short_title="复古工装裤",
             attributes={"厚度/厚薄": "常规款", "当前类目不存在/未知属性": "不能静默跳过"},
         )
 
-        with self.assertRaisesRegex(
-            DouyinListingError,
-            r"未按规范化别名精确匹配.*当前类目不存在/未知属性",
-        ):
-            await self.listing.apply_category_and_fields(fields)
+        actual = await self.listing.apply_category_and_fields(fields)
+
+        self.assertEqual(actual["skipped_attributes"], ["当前类目不存在/未知属性"])
+        self.assertEqual(actual["attributes"]["厚度"], ("常规款",))
+
+    async def test_goods_code_and_sku_values_survive_read_only_recheck(self):
+        await self.listing.open()
+        fields = SimpleNamespace(
+            short_title="复古工装裤",
+            attributes={
+                "货号/商家外部编码": "NGBL-10588",
+                "厚度": "常规款",
+            },
+        )
+
+        applied = await self.listing.apply_category_and_fields(fields)
+        await self.listing.fill_sku_price_inventory("586", 0, 100)
+        persisted = await self.listing.verify_persisted_values(
+            applied["category"],
+            applied["short_title"],
+            applied["attributes"],
+            "586",
+            0,
+            100,
+        )
+
+        self.assertEqual(applied["attributes"]["货号"], ("NGBL-10588",))
+        self.assertEqual(persisted["attributes"]["货号"], ("NGBL-10588",))
+        self.assertTrue(all(row["价格"] == "586" for row in persisted["sku"]))
+
+    async def test_apply_category_and_fields_maps_historical_trouser_fly_typo(self):
+        await self.listing.open()
+        fields = SimpleNamespace(
+            short_title="复古工装裤",
+            attributes={"裤门禁": "拉链"},
+        )
+
+        actual = await self.listing.apply_category_and_fields(fields)
+
+        self.assertEqual(actual["attributes"]["裤门襟"], ("拉链",))
+
+    async def test_apply_category_and_fields_reports_value_missing_from_platform_options(self):
+        await self.listing.open()
+        fields = SimpleNamespace(
+            short_title="复古工装裤",
+            attributes={"厚度": "平台没有这个值"},
+        )
+
+        actual = await self.listing.apply_category_and_fields(fields)
+
+        self.assertEqual(actual["attributes"], {})
+        self.assertEqual(actual["skipped_values"], {"厚度": "平台没有这个值"})
+        self.assertEqual(await self.page.locator(".el-select-dropdown:visible").count(), 0)
 
     async def test_apply_category_and_fields_accepts_bijective_aliases(self):
         await self.listing.open()
@@ -625,26 +710,24 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual["short_title"], "复古工装裤")
         self.assertEqual(actual["attributes"]["厚度"], ("常规款",))
-        self.assertEqual(actual["attributes"]["里料材质"], ("棉", "亚麻"))
+        self.assertEqual(actual["attributes"]["里料材质"], ("棉",))
 
-    async def test_apply_category_and_fields_rejects_one_excel_alias_for_two_fields(self):
+    async def test_apply_category_and_fields_fills_all_explicit_slash_alias_targets(self):
         await self.listing.open()
         fields = SimpleNamespace(
-            short_title="不应填写",
-            attributes={"厚度/里料材质": "常规款"},
+            short_title="复古工装裤",
+            attributes={"里料材质成分含量/材质成分含量": "95%及以上"},
         )
 
-        with self.assertRaisesRegex(
-            DouyinListingError,
-            r"同时匹配多个页面字段.*厚度.*里料材质",
-        ):
-            await self.listing.apply_category_and_fields(fields)
+        actual = await self.listing.apply_category_and_fields(fields)
 
-        title_input = self.page.locator(
-            ".el-form-item:has(> .el-form-item__label:text-is('导购短标题')) input"
+        self.assertEqual(
+            actual["attributes"],
+            {
+                "里料材质成分含量": ("95%及以上",),
+                "材质成分含量": ("95%及以上",),
+            },
         )
-        self.assertEqual(await title_input.input_value(), "")
-        self.assertEqual(await self.page.locator("#attributes .el-tag").count(), 0)
 
     async def test_material_total_must_be_exactly_100_before_page_changes(self):
         with self.assertRaisesRegex(DouyinListingError, "合计必须为 100"):

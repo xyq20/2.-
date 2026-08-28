@@ -73,7 +73,14 @@ class DouyinFieldParsingTests(unittest.TestCase):
 
         result = parse_douyin_fields(fields)
 
-        self.assertEqual(result.attributes, {"厚度": "常规款", "流行元素/款式细节": "430"})
+        self.assertEqual(
+            result.attributes,
+            {
+                "厚度": "常规款",
+                "流行元素/款式细节": "430",
+                "货号/商家外部编码": "NGBL-10588",
+            },
+        )
 
     def test_parses_supported_material_syntaxes(self):
         self.assertEqual(parse_materials("棉（100%）"), (MaterialComponent("棉", 100),))

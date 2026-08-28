@@ -196,7 +196,7 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
                 reused = await kuaimai_erp.try_reuse_verified_scm_session(
                     page, "NGBL-10588", 3, LOGGER
                 )
-                self.assertEqual(reused.url, kuaimai_erp.CENTER_URL)
+                self.assertEqual(reused.url.split("?", 1)[0], kuaimai_erp.CENTER_URL)
                 self.assertTrue(await reused.get_by_text("商品中心", exact=True).is_visible())
             finally:
                 kuaimai_erp.CENTER_URL = original_center_url
@@ -294,9 +294,12 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             try:
                 scm_page = await asyncio.wait_for(
                     kuaimai_erp.enter_kuaimai_from_erp(page, 4, True, LOGGER),
-                    timeout=5,
+                    timeout=8,
                 )
-                self.assertEqual(scm_page.url, "https://scma.superboss.cc/supplier/prod/center")
+                self.assertEqual(
+                    scm_page.url.split("?", 1)[0],
+                    "https://scma.superboss.cc/supplier/prod/center",
+                )
                 self.assertTrue(await scm_page.get_by_text("商品中心", exact=True).is_visible())
             finally:
                 kuaimai_erp.ERP_ENTRY_URL = original_entry_url

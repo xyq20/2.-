@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from sync_validation import matches_any, sequences_match, split_or_values
+
 
 # 2026-08-27 在真实抖音资料页选择预测类目后观测到的精确路径。
 # 请勿放宽为 list/query 等通用子串，避免误解析其他业务接口。
@@ -65,7 +67,16 @@ def _normalize_label(value: object) -> str:
 
 def _excel_aliases(value: object) -> Tuple[str, ...]:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
-    return tuple(_normalize_label(part) for part in text.split("/") if _normalize_label(part))
+    aliases = []
+    for part in text.split("/"):
+        normalized = _normalize_label(part)
+        if not normalized:
+            continue
+        aliases.append(normalized)
+        historical_alias = {"裤门禁": "裤门襟"}.get(normalized)
+        if historical_alias:
+            aliases.append(_normalize_label(historical_alias))
+    return tuple(dict.fromkeys(aliases))
 
 
 def _normalize_size_name(value: object) -> Optional[str]:
@@ -438,7 +449,10 @@ class DouyinListing:
                     )
                     if not await labels.count():
                         continue
-                    if _normalize_label(await labels.first.inner_text()) == wanted:
+                    if (
+                        _normalize_label(await labels.first.inner_text()) == wanted
+                        and await item.is_visible()
+                    ):
                         return item
             except Exception:
                 # Vue 切换类目时会短暂销毁子树，下一轮重新取 locator。
@@ -508,6 +522,16 @@ class DouyinListing:
         if not expected:
             raise DouyinListingError("无法读取第一个抖音预测类目")
 
+        try:
+            current = await self._category_text()
+        except DouyinListingError:
+            current = ""
+        normalize_path = lambda value: re.sub(r"[\s>]", "", value).casefold()
+        if current and normalize_path(current) == normalize_path(expected):
+            if self.logger is not None:
+                self.logger.info("抖音商品分类已匹配，跳过重复应用：%s", current)
+            return current
+
         generation = await self._begin_category_property_capture()
         try:
             await button.click()
@@ -526,7 +550,6 @@ class DouyinListing:
         await self._wait_for_fresh_category_properties(generation)
 
         actual = await self._category_text()
-        normalize_path = lambda value: re.sub(r"[\s>]", "", value).casefold()
         if normalize_path(actual) != normalize_path(expected):
             raise DouyinListingError(
                 f"抖音类目应用后校验失败：期望 {expected!r}，页面为 {actual!r}"
@@ -540,12 +563,49 @@ class DouyinListing:
         if not await input_box.count():
             raise DouyinListingError("导购短标题中找不到输入框")
         await item.scroll_into_view_if_needed()
+        current = await input_box.input_value()
+        if current == str(value):
+            if self.logger is not None:
+                self.logger.info("导购短标题已匹配，跳过填写")
+            return current
         await input_box.fill(str(value))
         await input_box.press("Tab")
         actual = await input_box.input_value()
         if actual != str(value):
             raise DouyinListingError(
                 f"导购短标题填写后校验失败：期望 {value!r}，页面为 {actual!r}"
+            )
+        return actual
+
+    async def fill_text_field(self, label: str, value: object) -> str:
+        """填写抖音页中不属于动态类目属性区的普通文本字段。"""
+        item = await self._wait_for_field(label)
+        inputs = item.locator(
+            ":scope > .el-form-item__content input:not([readonly]):not([disabled])"
+        )
+        visible_inputs = []
+        for index in range(await inputs.count()):
+            candidate = inputs.nth(index)
+            if await candidate.is_visible():
+                visible_inputs.append(candidate)
+        if len(visible_inputs) != 1:
+            raise DouyinListingError(
+                f"抖音字段“{label}”可写输入框匹配数为 {len(visible_inputs)}"
+            )
+        input_box = visible_inputs[0]
+        expected = str(value)
+        current = (await input_box.input_value()).strip()
+        if current == expected:
+            if self.logger is not None:
+                self.logger.info("抖音字段“%s”已匹配，跳过填写", label)
+            return current
+        await item.scroll_into_view_if_needed()
+        await input_box.fill(expected)
+        await input_box.press("Tab")
+        actual = (await input_box.input_value()).strip()
+        if actual != expected:
+            raise DouyinListingError(
+                f"抖音字段“{label}”填写后校验失败：期望 {expected!r}，页面为 {actual!r}"
             )
         return actual
 
@@ -591,12 +651,38 @@ class DouyinListing:
         if multi:
             search = select.locator(".el-select__tags input.el-select__input").first
             if await search.count():
-                await search.click()
+                await search.click(timeout=4000)
                 return
         input_box = select.locator("input.el-input__inner").first
         if not await input_box.count():
             raise DouyinListingError("属性下拉框中找不到可点击输入框")
-        await input_box.click()
+        await input_box.click(timeout=4000)
+
+    async def _dismiss_select_dropdown(self, select: Any) -> None:
+        """关闭未选中值的下拉层，避免它遮住下一个属性控件。"""
+        inputs = select.locator("input")
+        if await inputs.count():
+            try:
+                await inputs.first.press("Escape", timeout=2000)
+            except Exception:
+                await self.page.keyboard.press("Escape")
+        else:
+            await self.page.keyboard.press("Escape")
+        await asyncio.sleep(0.1)
+        if await self.page.locator(".el-select-dropdown:visible").count():
+            label = select.locator(
+                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), "
+                "' el-form-item ')][1]/*[contains(concat(' ', normalize-space(@class), ' '), "
+                "' el-form-item__label ')]"
+            )
+            if await label.count():
+                await label.first.click(force=True, timeout=2000)
+        deadline = asyncio.get_running_loop().time() + 1.5
+        while asyncio.get_running_loop().time() < deadline:
+            if not await self.page.locator(".el-select-dropdown:visible").count():
+                return
+            await asyncio.sleep(0.05)
+        raise DouyinListingError("未匹配属性值的下拉层无法关闭")
 
     async def _active_select_dropdown(self, select: Any) -> Optional[Any]:
         linked_ids: List[str] = []
@@ -664,28 +750,26 @@ class DouyinListing:
     async def _visible_dom_options(
         self,
         select: Any,
+        timeout_seconds: float = 5,
     ) -> Tuple[Any, List[Mapping[str, str]]]:
-        deadline = asyncio.get_running_loop().time() + 5
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             dropdown = await self._active_select_dropdown(select)
             if dropdown is None:
                 await asyncio.sleep(0.05)
                 continue
-            result: List[Mapping[str, str]] = []
-            options = dropdown.locator(".el-select-dropdown__item")
-            for index in range(await options.count()):
-                option = options.nth(index)
-                classes = await option.get_attribute("class") or ""
-                if "is-disabled" in classes:
-                    continue
-                try:
-                    if not await option.is_visible():
-                        continue
-                except Exception:
-                    continue
-                name = (await option.inner_text()).strip()
-                if name:
-                    result.append({"name": name, "id": "", "index": str(index)})
+            # 在浏览器进程中一次取完，避免数百个候选逐项跨进程 inner_text。
+            result = await dropdown.evaluate(
+                """element => Array.from(
+                    element.querySelectorAll('.el-select-dropdown__item')
+                  ).map((option, index) => ({
+                    name: (option.innerText || '').trim(),
+                    id: '',
+                    index: String(index),
+                    disabled: option.classList.contains('is-disabled')
+                  })).filter(item => item.name && !item.disabled)
+                """
+            )
             if result:
                 return dropdown, result
             await asyncio.sleep(0.05)
@@ -723,20 +807,157 @@ class DouyinListing:
         select: Any,
         expected_values: Sequence[str],
         *,
+        label: str,
         multi: bool,
         api_options: Optional[Sequence[Mapping[str, str]]] = None,
     ) -> Tuple[str, ...]:
+        current = await self._read_select_values(select, multi=multi)
+        if sequences_match(current, expected_values, normalize_option):
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”已匹配，跳过选择", label)
+            return current
         if multi:
             await self._clear_multi_select(select)
         for expected in expected_values:
             if api_options:
-                # API 给出稳定 ID/name 时先用其检查缺失或重名。
-                choose_unique_option(expected, api_options)
+                # API 只作为优先索引；远程搜索型下拉的初始接口可能只返回
+                # 部分候选，零匹配时继续搜索真实 DOM，重名仍立即报错。
+                api_matches = [
+                    item
+                    for item in api_options
+                    if normalize_option(item.get("name", "")) == normalize_option(expected)
+                ]
+                if len(api_matches) > 1:
+                    choose_unique_option(expected, api_options)
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”：准备展开下拉", label)
             await self._open_select(select, multi=multi)
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”：下拉已展开，读取 DOM 候选", label)
             dropdown, dom_options = await self._visible_dom_options(select)
-            chosen = choose_unique_option(expected, dom_options)
-            option = dropdown.locator(".el-select-dropdown__item").nth(int(chosen["index"]))
-            await option.click()
+            if self.logger is not None:
+                self.logger.info(
+                    "抖音属性“%s”：读取到 %s 个 DOM 候选",
+                    label,
+                    len(dom_options),
+                )
+            matches = [
+                item
+                for item in dom_options
+                if normalize_option(item.get("name", "")) == normalize_option(expected)
+            ]
+            if len(matches) > 1:
+                await self._dismiss_select_dropdown(select)
+                choose_unique_option(expected, dom_options)
+            chosen = matches[0] if matches else None
+
+            if chosen is None:
+                # 部分 Element UI 下拉初始只渲染基础候选；必须像人工操作
+                # 一样逐字输入，才会触发远程搜索/allow-create 候选。
+                search = select.locator(
+                    "input.el-select__input:not([readonly]), "
+                    "input.el-input__inner:not([readonly])"
+                ).first
+                if await search.count():
+                    # 输入事件必须在浏览器进程内原子完成：Vue 会在收到
+                    # input 后立即重建搜索框，跨进程连续操作会握着旧节点卡住。
+                    typed = await select.evaluate(
+                        """async (element, value) => {
+                          const input = Array.from(element.querySelectorAll('input'))
+                            .find(node => !node.hasAttribute('readonly'));
+                          if (!input) return false;
+                          input.focus();
+                          input.dispatchEvent(new CompositionEvent('compositionstart', {
+                            bubbles: true,
+                            data: ''
+                          }));
+                          const setter = Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype, 'value'
+                          ).set;
+                          setter.call(input, value);
+                          input.dispatchEvent(new CompositionEvent('compositionupdate', {
+                            bubbles: true,
+                            data: value
+                          }));
+                          input.dispatchEvent(new InputEvent('input', {
+                            bubbles: true,
+                            inputType: 'insertText',
+                            data: value,
+                            isComposing: true
+                          }));
+                          input.dispatchEvent(new CompositionEvent('compositionend', {
+                            bubbles: true,
+                            data: value
+                          }));
+                          input.dispatchEvent(new Event('change', {bubbles: true}));
+                          const component = element.__vue__;
+                          if (component && component.filterable) {
+                            component.query = value;
+                            if (typeof component.handleQueryChange === 'function') {
+                              component.handleQueryChange(value);
+                            }
+                            if (typeof component.$nextTick === 'function') {
+                              await new Promise(resolve => component.$nextTick(resolve));
+                            }
+                          }
+                          return true;
+                        }""",
+                        expected,
+                    )
+                    if not typed:
+                        await self._dismiss_select_dropdown(select)
+                        choose_unique_option(expected, dom_options)
+                    search_deadline = asyncio.get_running_loop().time() + 3
+                    while asyncio.get_running_loop().time() < search_deadline:
+                        await asyncio.sleep(0.1)
+                        try:
+                            dropdown, dom_options = await self._visible_dom_options(
+                                select,
+                                timeout_seconds=0.35,
+                            )
+                        except DouyinListingError:
+                            continue
+                        matches = [
+                            item
+                            for item in dom_options
+                            if normalize_option(item.get("name", ""))
+                            == normalize_option(expected)
+                        ]
+                        if len(matches) > 1:
+                            await self._dismiss_select_dropdown(select)
+                            choose_unique_option(expected, dom_options)
+                        if matches:
+                            chosen = matches[0]
+                            if self.logger is not None:
+                                self.logger.info(
+                                    "抖音属性“%s”：搜索后加载精确候选 %s",
+                                    label,
+                                    expected,
+                                )
+                            break
+            if chosen is None:
+                await self._dismiss_select_dropdown(select)
+                choose_unique_option(expected, dom_options)
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”：已精确定位候选 %s", label, expected)
+            # Vue 会在滚动长列表时重建 option 节点；在活动下拉容器中
+            # 原子地按已唯一确定的索引重新取节点并点击，避免持有失效 Locator。
+            clicked = await dropdown.evaluate(
+                """(element, index) => {
+                    const option = element.querySelectorAll(
+                      '.el-select-dropdown__item'
+                    )[index];
+                    if (!option || option.classList.contains('is-disabled')) return false;
+                    option.scrollIntoView({block: 'nearest'});
+                    option.click();
+                    return true;
+                }""",
+                int(chosen["index"]),
+            )
+            if not clicked:
+                raise DouyinListingError(f"属性“{label}”的精确候选节点已失效")
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”：候选点击完成", label)
 
         actual = await self._read_select_values(select, multi=multi)
         expected_counter = Counter(normalize_option(value) for value in expected_values)
@@ -745,33 +966,122 @@ class DouyinListing:
             raise DouyinListingError(
                 f"属性选择后校验失败：期望 {list(expected_values)!r}，页面为 {list(actual)!r}"
             )
+        if multi:
+            await self._dismiss_select_dropdown(select)
+        if self.logger is not None:
+            self.logger.info("抖音属性“%s”：回读完成", label)
         return actual
 
     async def fill_attribute(self, label: str, expected: str) -> Tuple[str, ...]:
-        """在指定属性内精确选择；仅真实多选控件才拆分斜杠值。"""
+        """在指定属性内精确选择；斜杠表示从左到右的 OR 候选。"""
         item = await self._attribute_item(label)
         await item.scroll_into_view_if_needed()
         selects = item.locator(":scope > .el-form-item__content > .el-select")
         if not await selects.count():
             selects = item.locator(".el-select")
+
+        # 克重等字段由“数值输入框 + 单位下拉框”组成，不能把 430g
+        # 当作下拉选项。只匹配表单项内容直属的独立输入控件，排除
+        # el-select 内部用于搜索的 input。
+        standalone_inputs = item.locator(
+            ":scope > .el-form-item__content > .el-input input:not([readonly])"
+        )
+        if await standalone_inputs.count() != 1:
+            standalone_inputs = item.locator(
+                ".measure-wrap input.el-input__inner:not([readonly])"
+            )
+        compound_match = re.fullmatch(
+            r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([^\d\s]+)\s*",
+            str(expected),
+        )
+        if await standalone_inputs.count() == 1 and await selects.count() and compound_match:
+            number, unit = compound_match.groups()
+            input_box = standalone_inputs.first
+            current_number = (await input_box.input_value()).strip()
+            current_unit = await self._read_select_values(selects.first, multi=False)
+            try:
+                number_matches = _decimal(current_number, label) == _decimal(number, label)
+            except DouyinListingError:
+                number_matches = False
+            if number_matches and matches_any(current_unit, (unit,), normalize_option):
+                if self.logger is not None:
+                    self.logger.info("抖音属性“%s”已匹配，跳过填写", label)
+                return (f"{current_number}{current_unit[0]}",)
+            await input_box.fill(number)
+            await input_box.press("Tab")
+            actual_number = (await input_box.input_value()).strip()
+            if actual_number != number:
+                raise DouyinListingError(
+                    f"属性“{label}”数值填写后校验失败：期望 {number!r}，页面为 {actual_number!r}"
+                )
+            select = selects.first
+            actual_unit = await self._select_values(
+                select,
+                (unit,),
+                label=f"{label}单位",
+                multi=False,
+            )
+            return (f"{actual_number}{actual_unit[0]}",)
+
         if await selects.count():
             select = selects.first
             multi = await select.locator(".el-select__tags").count() > 0
-            expected_values = (
-                tuple(part.strip() for part in str(expected).split("/") if part.strip())
-                if multi
-                else (str(expected).strip(),)
-            )
-            if not expected_values or any(not value.strip() for value in expected_values):
+            alternatives = split_or_values(expected)
+            if not alternatives:
                 raise DouyinListingError(f"属性“{label}”期望值为空")
+
+            current = await self._read_select_values(select, multi=multi)
+            if matches_any(current, alternatives, normalize_option):
+                if self.logger is not None:
+                    self.logger.info("抖音属性“%s”已匹配，跳过选择", label)
+                return current
 
             api_property = await self._api_property(label)
             api_options: Optional[Sequence[Mapping[str, str]]] = None
             if api_property and api_property.get("options"):
                 api_options = api_property["options"]  # type: ignore[assignment]
+
+            # “/”是 OR。抖音允许搜索创建值，但必须先检查所有 OR 候选
+            # 中是否已有平台选项；例如 A/B 中 A 不存在、B 已存在时选 B，
+            # 不能抢先创建 A。API 缺失时再读取初始 DOM 候选。
+            existing_names = {
+                normalize_option(option.get("name", ""))
+                for option in (api_options or ())
+            }
+            existing_alternatives = [
+                value
+                for value in alternatives
+                if normalize_option(value) in existing_names
+            ]
+            if len(alternatives) > 1 and not existing_alternatives:
+                await self._open_select(select, multi=multi)
+                _dropdown, dom_options = await self._visible_dom_options(select)
+                await self._dismiss_select_dropdown(select)
+                dom_names = {
+                    normalize_option(option.get("name", ""))
+                    for option in dom_options
+                }
+                existing_alternatives = [
+                    value
+                    for value in alternatives
+                    if normalize_option(value) in dom_names
+                ]
+
+            chosen_expected = (
+                existing_alternatives[0]
+                if existing_alternatives
+                else alternatives[0]
+            )
+            if existing_alternatives and self.logger is not None:
+                self.logger.info(
+                    "抖音属性“%s”：OR 候选优先使用平台已有值 %s",
+                    label,
+                    chosen_expected,
+                )
             return await self._select_values(
                 select,
-                expected_values,
+                (chosen_expected,),
+                label=label,
                 multi=multi,
                 api_options=api_options,
             )
@@ -784,6 +1094,11 @@ class DouyinListing:
                 f"属性“{label}”不是唯一的单选、多选或文本输入控件"
             )
         input_box = inputs.first
+        current = await input_box.input_value()
+        if current == str(expected):
+            if self.logger is not None:
+                self.logger.info("抖音属性“%s”已匹配，跳过填写", label)
+            return (current,)
         await input_box.fill(str(expected))
         await input_box.press("Tab")
         actual = await input_box.input_value()
@@ -793,15 +1108,159 @@ class DouyinListing:
             )
         return (actual,)
 
+    async def read_field_values(self, label: str) -> Tuple[str, ...]:
+        """只读回查一个已渲染字段，供保存后重新打开页面核验。"""
+        item = await self._wait_for_field(label)
+        await item.scroll_into_view_if_needed()
+
+        selects = item.locator(":scope > .el-form-item__content > .el-select")
+        visible_selects = []
+        for index in range(await selects.count()):
+            candidate = selects.nth(index)
+            if await candidate.is_visible():
+                visible_selects.append(candidate)
+
+        standalone_inputs = item.locator(
+            ":scope > .el-form-item__content > .el-input input:not([readonly]):not([disabled]), "
+            ":scope > .el-form-item__content > input:not([readonly]):not([disabled])"
+        )
+        visible_inputs = []
+        for index in range(await standalone_inputs.count()):
+            candidate = standalone_inputs.nth(index)
+            if await candidate.is_visible() and not await candidate.evaluate(
+                "element => Boolean(element.closest('.el-select'))"
+            ):
+                visible_inputs.append(candidate)
+
+        # 克重的数值和单位嵌套在 measure-wrap 的内层表单中，不是外层
+        # el-form-item__content 的直属子节点。
+        if not visible_inputs:
+            measure_inputs = item.locator(
+                ".measure-wrap input.el-input__inner:not([readonly]):not([disabled])"
+            )
+            for index in range(await measure_inputs.count()):
+                candidate = measure_inputs.nth(index)
+                if await candidate.is_visible() and not await candidate.evaluate(
+                    "element => Boolean(element.closest('.el-select'))"
+                ):
+                    visible_inputs.append(candidate)
+        if not visible_selects:
+            measure_selects = item.locator(".measure-wrap .el-select")
+            for index in range(await measure_selects.count()):
+                candidate = measure_selects.nth(index)
+                if await candidate.is_visible():
+                    visible_selects.append(candidate)
+
+        if len(visible_selects) == 1 and len(visible_inputs) == 1:
+            number = (await visible_inputs[0].input_value()).strip()
+            unit = await self._read_select_values(visible_selects[0], multi=False)
+            return (f"{number}{unit[0]}",)
+        if len(visible_selects) == 1:
+            select = visible_selects[0]
+            multi = await select.locator(".el-select__tags").count() > 0
+            return await self._read_select_values(select, multi=multi)
+        if len(visible_selects) > 1:
+            raise DouyinListingError(
+                f"保存后字段“{label}”可见下拉框匹配数为 {len(visible_selects)}"
+            )
+        if len(visible_inputs) != 1:
+            raise DouyinListingError(
+                f"保存后字段“{label}”可见输入框匹配数为 {len(visible_inputs)}"
+            )
+        return ((await visible_inputs[0].input_value()).strip(),)
+
+    async def verify_persisted_values(
+        self,
+        category: object,
+        short_title: object,
+        attributes: Mapping[str, Sequence[object]],
+        price: object,
+        spot_stock: object,
+        presale_stock: object,
+    ) -> Mapping[str, Any]:
+        """重新打开商品后，只读核对关键抖音字段和每一行 SKU 数值。"""
+        expected_category = str(category).strip()
+        actual_category = await self._category_text()
+        normalize_path = lambda value: re.sub(r"[\s>]", "", str(value)).casefold()
+        if normalize_path(actual_category) != normalize_path(expected_category):
+            raise DouyinListingError(
+                f"保存后商品分类不一致：期望 {expected_category!r}，页面为 {actual_category!r}"
+            )
+
+        actual_short_title = (await self.read_field_values("导购短标题"))[0]
+        if actual_short_title != str(short_title):
+            raise DouyinListingError(
+                f"保存后导购短标题不一致：期望 {short_title!r}，页面为 {actual_short_title!r}"
+            )
+
+        actual_attributes: Dict[str, Tuple[str, ...]] = {}
+        for label, expected_values in attributes.items():
+            expected = tuple(str(value) for value in expected_values)
+            actual = await self.read_field_values(str(label))
+            if Counter(normalize_option(value) for value in actual) != Counter(
+                normalize_option(value) for value in expected
+            ):
+                raise DouyinListingError(
+                    f"保存后字段“{label}”不一致：期望 {list(expected)!r}，页面为 {list(actual)!r}"
+                )
+            actual_attributes[str(label)] = actual
+
+        expected_sku = {
+            "价格": _decimal(price, "价格"),
+            "现货库存": _decimal(spot_stock, "现货库存"),
+            "预售库存": _decimal(presale_stock, "预售库存"),
+        }
+        controls = await self._sku_input_controls()
+        actual_sku = []
+        for row_index, row_controls in enumerate(controls, start=1):
+            row_values = {}
+            for label, input_box in row_controls.items():
+                actual = _decimal(
+                    await input_box.input_value(),
+                    f"保存后第 {row_index} 个 SKU {label}",
+                )
+                if actual != expected_sku[label]:
+                    raise DouyinListingError(
+                        f"保存后第 {row_index} 个 SKU 的“{label}”不一致："
+                        f"期望 {expected_sku[label]}，页面为 {actual}"
+                    )
+                row_values[label] = format(actual, "f")
+            actual_sku.append(row_values)
+
+        return {
+            "category": actual_category,
+            "short_title": actual_short_title,
+            "attributes": actual_attributes,
+            "sku": actual_sku,
+        }
+
     async def apply_category_and_fields(self, fields: Any) -> Mapping[str, Any]:
-        """应用类目、短标题和所有 Excel 属性；未匹配的属性立即报错。"""
+        """应用类目、短标题和当前类目页面实际存在的 Excel 属性。"""
         category = await self.apply_first_recommended_category()
         page_items = await self._attribute_items()
 
         excel_attributes = list(fields.attributes.items())
+        goods_code_sources = [
+            (key, value)
+            for key, value in excel_attributes
+            if {
+                _normalize_label("货号"),
+                _normalize_label("商家外部编码"),
+            }.intersection(_excel_aliases(key))
+        ]
+        if len(goods_code_sources) > 1:
+            keys = "、".join(str(key) for key, _value in goods_code_sources)
+            raise DouyinListingError(f"抖音货号匹配到多个 Excel 字段：{keys}")
+        goods_code = None
+        if goods_code_sources:
+            _key, goods_code_value = goods_code_sources[0]
+            goods_code = await self.fill_text_field("货号", goods_code_value)
+
         target_sources: Dict[str, List[Tuple[object, object]]] = {}
         unmatched: List[str] = []
         for key, value in excel_attributes:
+            if goods_code_sources and key == goods_code_sources[0][0]:
+                continue
             aliases = set(_excel_aliases(key))
             matches = [
                 (normalized_label, page_label)
@@ -811,19 +1270,15 @@ class DouyinListing:
             if not matches:
                 unmatched.append(str(key))
                 continue
-            if len(matches) > 1:
-                labels = "、".join(page_label for _normalized, page_label in matches)
-                raise DouyinListingError(
-                    f"Excel 抖音属性“{key}”同时匹配多个页面字段：{labels}"
-                )
-            normalized_label, _page_label = matches[0]
-            target_sources.setdefault(normalized_label, []).append((key, value))
+            # Excel 以斜杠明确列出的多个页面名称代表共用同一值；
+            # 例如“里料材质成分含量/材质成分含量”需要两处都填。
+            for normalized_label, _page_label in matches:
+                target_sources.setdefault(normalized_label, []).append((key, value))
 
-        if unmatched:
-            names = "、".join(unmatched)
-            raise DouyinListingError(
-                "以下 Excel 抖音属性未按规范化别名精确匹配当前页面字段："
-                f"{names}"
+        if unmatched and self.logger is not None:
+            self.logger.info(
+                "当前抖音类目无对应页面字段，已跳过：%s",
+                "、".join(unmatched),
             )
 
         assignments: List[Tuple[str, object]] = []
@@ -840,10 +1295,40 @@ class DouyinListing:
         # Mapping is fully validated before any title/attribute value is written.
         short_title = await self.fill_short_title(fields.short_title)
         applied: Dict[str, Tuple[str, ...]] = {}
+        if goods_code is not None:
+            applied["货号"] = (goods_code,)
+        skipped_values: Dict[str, str] = {}
         for page_label, value in assignments:
-            # 已唯一映射的页面字段不能静默跳过；选项缺失/重名立即终止。
-            applied[page_label] = await self.fill_attribute(page_label, str(value))
-        return {"category": category, "short_title": short_title, "attributes": applied}
+            if self.logger is not None:
+                self.logger.info("正在填写抖音属性：%s", page_label)
+            try:
+                applied[page_label] = await asyncio.wait_for(
+                    self.fill_attribute(page_label, str(value)),
+                    timeout=12,
+                )
+            except asyncio.TimeoutError as exc:
+                raise DouyinListingError(
+                    f"抖音属性“{page_label}”填写或回读超过 12 秒"
+                ) from exc
+            except DouyinListingError as exc:
+                # 平台类目的下拉候选可能比产品表窄。无精确候选时不猜测，
+                # 保留到铺货前报告；重名/歧义及控件异常仍立即终止。
+                if "匹配数为 0" not in str(exc):
+                    raise
+                skipped_values[page_label] = str(value)
+                if self.logger is not None:
+                    self.logger.info(
+                        "抖音属性“%s”无平台精确候选，已跳过 Excel 值：%s",
+                        page_label,
+                        value,
+                    )
+        return {
+            "category": category,
+            "short_title": short_title,
+            "attributes": applied,
+            "skipped_attributes": unmatched,
+            "skipped_values": skipped_values,
+        }
 
     async def _wait_row_count(self, rows: Any, expected: int) -> None:
         deadline = asyncio.get_running_loop().time() + 5
@@ -889,23 +1374,77 @@ class DouyinListing:
                 f"面料百分比合计必须为 100，当前为 {sum(percentages)}"
             )
 
-        item = await self._wait_for_field("面料材质")
+        summary_item = await self._wait_for_field("面料材质")
         from kuaimai_erp import sync_image_group
+
+        upload_scope = summary_item
+        if not await upload_scope.locator('input[type="file"]').count():
+            if self.panel is None:
+                raise DouyinListingError("抖音资料面板尚未打开")
+            wash_label = self.panel.get_by_text("水洗标/吊牌图", exact=True)
+            if await wash_label.count() != 1:
+                raise DouyinListingError("水洗标/吊牌图标签不是唯一项")
+            # 真实页面把上传组件放在“面料材质”表单项的相邻子块中；
+            # 从可见业务标签向上寻找最近且包含 file input 的共同容器。
+            upload_scope = wash_label.locator(
+                'xpath=ancestor::*[.//input[@type="file"]][1]'
+            )
+            if await upload_scope.count() != 1:
+                raise DouyinListingError("水洗标/吊牌图附近找不到唯一上传区域")
+            if self.artifact_dir is not None:
+                markup = await upload_scope.evaluate("element => element.outerHTML")
+                (self.artifact_dir / "wash-label-scope.html").write_text(
+                    markup,
+                    encoding="utf-8",
+                )
 
         await sync_image_group(
             self.page,
-            item,
+            upload_scope,
             tuple(Path(path) for path in wash_label_paths),
             "抖音水洗标/吊牌图",
             300,
         )
 
-        rows = item.locator(".measure-item")
-        add_button = item.get_by_role("button", name="+ 添加材质", exact=True)
+        if self.panel is None:
+            raise DouyinListingError("抖音资料面板尚未打开")
+        add_candidates = self.panel.locator(
+            "xpath=.//*[contains(normalize-space(.), '添加材质') and "
+            "not(.//*[contains(normalize-space(.), '添加材质')])]"
+        )
+        visible_add_buttons = []
+        for index in range(await add_candidates.count()):
+            candidate = add_candidates.nth(index)
+            text = re.sub(r"\s+", "", await candidate.inner_text())
+            if text in {"添加材质", "+添加材质"} and await candidate.is_visible():
+                visible_add_buttons.append(candidate)
+        if len(visible_add_buttons) != 1:
+            raise DouyinListingError(
+                f"面料材质区域的“添加材质”入口数量为 {len(visible_add_buttons)}"
+            )
+        add_button = visible_add_buttons[0]
+        material_scope = add_button.locator(
+            "xpath=ancestor::*[.//*[contains(concat(' ', normalize-space(@class), ' '), "
+            "' el-select ')] and .//*[contains(concat(' ', normalize-space(@class), ' '), "
+            "' el-icon-delete ')]][1]"
+        )
+        if await material_scope.count() != 1:
+            raise DouyinListingError("无法从“添加材质”定位唯一材质编辑区域")
+
+        if self.artifact_dir is not None:
+            markup = await material_scope.evaluate("element => element.outerHTML")
+            (self.artifact_dir / "material-scope.html").write_text(
+                markup,
+                encoding="utf-8",
+            )
+
+        rows = material_scope.locator(
+            "xpath=.//*[contains(concat(' ', normalize-space(@class), ' '), "
+            "' el-icon-delete ')]/ancestor::*[.//*[contains(concat(' ', "
+            "normalize-space(@class), ' '), ' el-select ')]][1]"
+        )
         while await rows.count() < len(materials):
             before = await rows.count()
-            if not await add_button.count():
-                raise DouyinListingError("面料材质区域中找不到“添加材质”按钮")
             await add_button.click()
             await self._wait_row_count(rows, before + 1)
         while await rows.count() > len(materials):
@@ -925,12 +1464,19 @@ class DouyinListing:
             selected = await self._select_values(
                 selects.first,
                 (str(component.name),),
+                label=f"面料材质第 {index + 1} 行",
                 multi=False,
             )
             percent_input = await self._percentage_input(row)
-            await percent_input.fill(str(percentages[index]))
-            await percent_input.press("Tab")
             raw_percentage = (await percent_input.input_value()).strip()
+            if raw_percentage != str(percentages[index]):
+                await percent_input.fill(str(percentages[index]))
+                await percent_input.press("Tab")
+                raw_percentage = (await percent_input.input_value()).strip()
+            elif self.logger is not None:
+                self.logger.info(
+                    "面料材质第 %s 行百分比已匹配，跳过填写", index + 1
+                )
             try:
                 page_percentage = int(raw_percentage)
             except ValueError as exc:
@@ -1137,8 +1683,9 @@ class DouyinListing:
         actual: Dict[str, Tuple[str, ...]] = {}
         for size, controls in controls_by_size.items():
             for control, value in zip(controls, expected_values[size]):
-                await control.fill(value)
-                await control.press("Tab")
+                if (await control.input_value()).strip() != value:
+                    await control.fill(value)
+                    await control.press("Tab")
             row_values_list = []
             for control in controls:
                 row_values_list.append((await control.input_value()).strip())
@@ -1340,6 +1887,30 @@ class DouyinListing:
         ):
             raise DouyinListingError("价格和库存数值不符合要求")
 
+        controls = await self._sku_input_controls()
+
+        for row_index, row_controls in enumerate(controls, start=1):
+            for label, input_box in row_controls.items():
+                value = format(expected[label], "f")
+                current = _decimal(
+                    await input_box.input_value(),
+                    f"第 {row_index} 个 SKU {label}",
+                )
+                if current != expected[label]:
+                    await input_box.fill(value)
+                    await input_box.press("Tab")
+            for label, input_box in row_controls.items():
+                actual = _decimal(await input_box.input_value(), f"第 {row_index} 个 SKU {label}")
+                if actual != expected[label]:
+                    raise DouyinListingError(
+                        f"第 {row_index} 个 SKU 的“{label}”回读失败："
+                        f"期望 {expected[label]}，页面为 {actual}"
+                    )
+        return len(controls)
+
+    async def _sku_input_controls(self) -> List[Mapping[str, Any]]:
+        """定位唯一可见 SKU 表及其价格、现货、预售输入框。"""
+
         section = await self._section("价格库存")
         table, indexes = await self._sku_table_and_columns(section)
         rows = table.locator(
@@ -1367,20 +1938,7 @@ class DouyinListing:
                     )
                 row_controls[label] = inputs.first
             controls.append(row_controls)
-
-        for row_index, row_controls in enumerate(controls, start=1):
-            for label, input_box in row_controls.items():
-                value = format(expected[label], "f")
-                await input_box.fill(value)
-                await input_box.press("Tab")
-            for label, input_box in row_controls.items():
-                actual = _decimal(await input_box.input_value(), f"第 {row_index} 个 SKU {label}")
-                if actual != expected[label]:
-                    raise DouyinListingError(
-                        f"第 {row_index} 个 SKU 的“{label}”回读失败："
-                        f"期望 {expected[label]}，页面为 {actual}"
-                    )
-        return len(controls)
+        return controls
 
     async def _fetch_freight_payloads(
         self,
@@ -1420,7 +1978,7 @@ class DouyinListing:
     async def apply_freight_templates(
         self,
         aliases: Sequence[str],
-    ) -> Mapping[str, str]:
+    ) -> Mapping[str, Mapping[str, str]]:
         """使用只读 API 匹配每个可见授权店铺，再用 DOM 选择回读。"""
         wanted_aliases = tuple(str(value).strip() for value in aliases if str(value).strip())
         if not wanted_aliases:
@@ -1451,6 +2009,7 @@ class DouyinListing:
 
         # 所有店铺与模板先通过 API 唯一匹配，再修改页面。
         assignments = []
+        preserved: Dict[str, str] = {}
         for store_name, row, select in visible_rows:
             store_matches = [
                 shop
@@ -1458,24 +2017,51 @@ class DouyinListing:
                 if normalize_option(store_name)
                 in {normalize_option(value) for value in shop["aliases"]}
             ]
-            if len(store_matches) != 1:
+            if not store_matches:
                 raise DouyinListingError(
-                    f"店铺“{store_name}”在店铺 API 中匹配数为 {len(store_matches)}"
+                    f"店铺“{store_name}”在店铺 API 中匹配数为 0"
                 )
-            shop_id = str(store_matches[0]["id"])
-            options = templates_by_shop.get(shop_id, ())
-            option_matches: Dict[Tuple[str, str], Mapping[str, str]] = {}
-            for alias in wanted_aliases:
-                for option in options:
-                    if normalize_option(option["name"]) == normalize_option(alias):
-                        option_matches[(option["id"], normalize_option(option["name"]))] = option
-            if len(option_matches) != 1:
-                candidates = "、".join(option["name"] for option in options) or "<无>"
+
+            qualified = []
+            candidate_names = []
+            for shop in store_matches:
+                shop_id = str(shop["id"])
+                options = templates_by_shop.get(shop_id, ())
+                option_matches: Dict[Tuple[str, str], Mapping[str, str]] = {}
+                for alias in wanted_aliases:
+                    for option in options:
+                        if normalize_option(option["name"]) == normalize_option(alias):
+                            option_matches[
+                                (option["id"], normalize_option(option["name"]))
+                            ] = option
+                candidate_names.extend(option["name"] for option in options)
+                if len(option_matches) == 1:
+                    qualified.append(
+                        (shop_id, next(iter(option_matches.values())), options)
+                    )
+
+            if len(qualified) > 1:
+                candidates = "、".join(dict.fromkeys(candidate_names)) or "<无>"
                 raise DouyinListingError(
-                    f"店铺“{store_name}”运费模板匹配数为 {len(option_matches)}；"
+                    f"店铺“{store_name}”的同名 API 店铺中，指定运费模板匹配数为 "
+                    f"{len(qualified)}；"
                     f"Excel 别名：{' / '.join(wanted_aliases)}；候选：{candidates}"
                 )
-            assignments.append((store_name, select, next(iter(option_matches.values())), options))
+            if not qualified:
+                current = await self._read_select_values(select, multi=False)
+                preserved[store_name] = current[0] if current else ""
+                if self.logger is not None:
+                    self.logger.info(
+                        "店铺“%s”无 Excel 指定运费模板，保持原值：%s",
+                        store_name,
+                        preserved[store_name] or "<空>",
+                    )
+                continue
+            _shop_id, chosen, options = qualified[0]
+            assignments.append((store_name, select, chosen, options))
+
+        if not assignments:
+            raise DouyinListingError("所有可见店铺都没有 Excel 指定的运费模板")
 
         applied: Dict[str, str] = {}
         for store_name, select, chosen, options in assignments:
@@ -1484,6 +2070,7 @@ class DouyinListing:
                 current = await self._select_values(
                     select,
                     (chosen["name"],),
+                    label=f"运费模板-{store_name}",
                     multi=False,
                     api_options=options,
                 )
@@ -1492,9 +2079,9 @@ class DouyinListing:
                     f"店铺“{store_name}”运费模板回读失败：{current[0]!r}"
                 )
             applied[store_name] = current[0]
-        if len(applied) != len(visible_rows):
+        if len(applied) + len(preserved) != len(visible_rows):
             raise DouyinListingError("运费模板处理店铺数与页面不一致")
-        return applied
+        return {"applied": applied, "preserved": preserved}
 
     async def validate_douyin_form(
         self,

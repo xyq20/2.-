@@ -35,6 +35,39 @@ DEFAULT_EXCEL_URL = "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
+def shared_runtime_root(script_dir: Path) -> Path:
+    """让隔离 worktree 与主项目共用登录配置，避免每个 worktree 重登。"""
+    for parent in (script_dir, *script_dir.parents):
+        if parent.name == ".worktrees":
+            return parent.parent
+    return script_dir
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+RUNTIME_ROOT = shared_runtime_root(SCRIPT_DIR)
+DEFAULT_PROFILE_DIR = RUNTIME_ROOT / "output/kuaimai/chrome-profile"
+DEFAULT_AUTH_STATE = RUNTIME_ROOT / "output/kuaimai/auth-state.json"
+DEFAULT_DOUYIN_PUBLISH_SHOPS = (
+    "钊叔 NEIGBORL 制",
+    "啊亮穿搭",
+    "老朱和NEIGBORL",
+    "泰美了穿搭",
+    "NEIGBORL钊哥小店",
+    "小马客服",
+)
+KNOWN_DOUYIN_SHOPS = (
+    "钊叔 NEIGBORL 制",
+    "夏一制",
+    "啊亮穿搭",
+    "老朱和NEIGBORL",
+    "泰美了穿搭",
+    "杰叔抖店",
+    "Li Napping",
+    "NEIGBORL钊哥小店",
+    "小马客服",
+)
+
+
 class AutomationError(RuntimeError):
     """可向用户直接展示的自动化异常。"""
 
@@ -48,6 +81,11 @@ def center_url_for(value: str) -> str:
     if parsed.hostname in SCM_HOSTS:
         return f"{parsed.scheme}://{parsed.netloc}/supplier/prod/center"
     return CENTER_URL
+
+
+def center_navigation_url_for(value: str) -> str:
+    """首次从供应商首页进入商品中心时保留站点要求的 Cookie 标记。"""
+    return f"{center_url_for(value)}?hasCookie=true"
 
 
 def is_scm_cookie(cookie: Dict[str, Any]) -> bool:
@@ -568,7 +606,11 @@ async def try_reuse_verified_scm_session(
     fast_timeout = max(3, min(timeout_seconds, 12))
     fast_timeout_ms = fast_timeout * 1000
     center_url = center_url_for(page.url)
-    await page.goto(center_url, wait_until="domcontentloaded", timeout=fast_timeout_ms)
+    await page.goto(
+        center_navigation_url_for(page.url),
+        wait_until="domcontentloaded",
+        timeout=fast_timeout_ms,
+    )
     await wait_for_scm_api_session(page, style_code, fast_timeout, logger)
 
     deadline = time.monotonic() + fast_timeout
@@ -582,6 +624,61 @@ async def try_reuse_verified_scm_session(
             return page
         await asyncio.sleep(0.1)
     raise AutomationError("快速打开商品中心超时")
+
+
+async def open_product_center_from_supplier(
+    page: Any,
+    timeout_seconds: int,
+    logger: logging.Logger,
+) -> None:
+    """优先沿页面菜单进入商品中心，避免直接跳转触发重新登录。"""
+    timeout_ms = timeout_seconds * 1000
+    center_url = center_url_for(page.url)
+    if urlsplit(page.url).path == "/supplier/prod/center":
+        return
+
+    deadline = time.monotonic() + min(timeout_seconds, 3)
+    while time.monotonic() < deadline:
+        direct_link = page.locator('a[href*="/supplier/prod/center"]').first
+        if await visible(direct_link):
+            await direct_link.click()
+            break
+
+        management = page.get_by_text("商品管理", exact=True).first
+        if await visible(management):
+            try:
+                await management.click(timeout=2000)
+            except Exception:
+                pass
+
+        center_entry = page.get_by_text("商品中心", exact=True).first
+        if await visible(center_entry):
+            await center_entry.click()
+            break
+        await asyncio.sleep(0.2)
+    else:
+        logger.info("供应商首页未找到商品中心菜单，使用带 Cookie 标记的页面地址")
+        await page.goto(
+            center_navigation_url_for(page.url),
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        return
+
+    navigation_deadline = time.monotonic() + min(timeout_seconds, 20)
+    while time.monotonic() < navigation_deadline:
+        if urlsplit(page.url).path == "/supplier/prod/center":
+            return
+        if urlsplit(page.url).path.startswith("/login"):
+            raise AutomationError("从页面菜单进入商品中心时被跳转到登录页")
+        await asyncio.sleep(0.2)
+
+    logger.info("商品中心菜单未完成跳转，使用带 Cookie 标记的页面地址")
+    await page.goto(
+        f"{center_url}?hasCookie=true",
+        wait_until="domcontentloaded",
+        timeout=timeout_ms,
+    )
 
 
 async def enter_kuaimai_from_erp(
@@ -685,12 +782,7 @@ async def enter_kuaimai_from_erp(
 
     await scm_page.wait_for_load_state("domcontentloaded", timeout=operation_timeout_ms)
     await wait_for_scm_api_session(scm_page, style_code, operation_timeout, logger)
-    if auth_state_path is not None:
-        await save_auth_state(context, auth_state_path, logger)
-
-    center_url = center_url_for(scm_page.url)
-    if scm_page.url.split("?", 1)[0] != center_url:
-        await scm_page.goto(center_url, wait_until="domcontentloaded", timeout=operation_timeout_ms)
+    await open_product_center_from_supplier(scm_page, operation_timeout, logger)
     center_deadline = time.monotonic() + operation_timeout
     while time.monotonic() < center_deadline:
         current_path = urlsplit(scm_page.url).path
@@ -1053,8 +1145,13 @@ async def replace_sku_images(
 
 
 async def set_base_price(drawer: Any, price: str) -> Any:
-    block = drawer.locator(".block-specification-list").first
-    await block.scroll_into_view_if_needed()
+    block = await first_visible(drawer.locator(".block-specification-list"))
+    if block is None:
+        raise AutomationError("页面没有可见的基础资料规格明细")
+    try:
+        await block.scroll_into_view_if_needed(timeout=10_000)
+    except Exception as exc:
+        raise AutomationError("基础资料规格明细在 10 秒内无法滚动到可见区域") from exc
     batch_items = block.locator(".sku-batch-item")
     price_item = None
     for index in range(await batch_items.count()):
@@ -1067,19 +1164,80 @@ async def set_base_price(drawer: Any, price: str) -> Any:
         raise AutomationError("规格明细中找不到“基本售价”批量输入框")
 
     input_box = price_item.locator("input").first
-    await input_box.fill(price)
-    await input_box.press("Tab")
+
+    async def rows_match() -> bool:
+        """在页面内一次扫描大表格，避免虚拟滚动表逐元素等待。"""
+        try:
+            values = await block.evaluate(
+                """
+                (root) => {
+                  const visible = element => {
+                    const style = getComputedStyle(element);
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                      && element.getClientRects().length > 0;
+                  };
+                  for (const table of root.querySelectorAll('.el-table')) {
+                    if (!visible(table)) continue;
+                    const headerRoot = table.querySelector(':scope > .el-table__main-wrapper > .el-table__header-wrapper')
+                      || table.querySelector(':scope > .el-table__header-wrapper');
+                    const bodyRoot = table.querySelector(':scope > .el-table__main-wrapper > .el-table__body-wrapper')
+                      || table.querySelector(':scope > .el-table__body-wrapper');
+                    if (!headerRoot || !bodyRoot) continue;
+                    const headers = [...headerRoot.querySelectorAll('thead th')];
+                    const indexes = headers.map((header, index) => {
+                      const cell = header.querySelector(':scope > .cell');
+                      const text = (cell?.getAttribute('title') || cell?.innerText || header.innerText || '')
+                        .replace(/[\\s*:：]+/g, '');
+                      return text.startsWith('基本售价') ? index : -1;
+                    }).filter(index => index >= 0);
+                    if (indexes.length !== 1) continue;
+                    const rows = [...bodyRoot.querySelectorAll('tbody > tr')];
+                    if (!rows.length) continue;
+                    const result = [];
+                    for (const row of rows) {
+                      const cell = row.querySelectorAll(':scope > td')[indexes[0]];
+                      const inputs = cell ? cell.querySelectorAll('input:not([disabled])') : [];
+                      if (inputs.length !== 1) return [];
+                      result.push(inputs[0].value);
+                    }
+                    return result;
+                  }
+                  return [];
+                }
+                """,
+                timeout=10_000,
+            )
+        except Exception as exc:
+            raise AutomationError("基本售价 SKU 列在 10 秒内无法读取") from exc
+        if not values:
+            return False
+        try:
+            return all(Decimal(str(value)) == Decimal(price) for value in values)
+        except InvalidOperation:
+            return False
+
+    if await rows_match():
+        await input_box.fill(price, timeout=10_000)
+        return input_box
+
+    try:
+        await input_box.fill(price, timeout=10_000)
+        await input_box.press("Tab", timeout=10_000)
+    except Exception as exc:
+        raise AutomationError("基本售价输入框在 10 秒内无法填写") from exc
     batch_button = await first_visible(block.get_by_role("button", name=re.compile(r"^\s*批量设置\s*$")))
     if batch_button is None:
         raise AutomationError("规格明细中找不到“批量设置”按钮")
-    await batch_button.click()
-    await asyncio.sleep(0.5)
-    actual = await input_box.input_value()
     try:
-        if Decimal(actual) != Decimal(price):
-            raise AutomationError(f"基本售价校验失败：期望 {price}，页面为 {actual}")
-    except InvalidOperation as exc:
-        raise AutomationError(f"基本售价页面值无效：{actual!r}") from exc
+        await batch_button.click(timeout=10_000)
+    except Exception as exc:
+        # 部分版本在 Tab 失焦后已经同步到 SKU，此时按钮可能不再可点。
+        if await rows_match():
+            return input_box
+        raise AutomationError("基本售价“批量设置”在 10 秒内无法点击") from exc
+    await asyncio.sleep(0.5)
+    if not await rows_match():
+        raise AutomationError(f"基本售价逐行校验失败：期望所有 SKU 为 {price}")
     return input_box
 
 
@@ -1138,6 +1296,17 @@ async def click_save_and_confirm(
         if await visible(success.first):
             return {"result": 1, "confirmed_by": "toast", "action": button_text}
 
+        if button_text == "保存并铺货到平台":
+            shop_dialog = page.locator('[role="dialog"]:visible').filter(
+                has_text="铺货到店铺"
+            ).first
+            if await visible(shop_dialog):
+                return {
+                    "result": 1,
+                    "confirmed_by": "publish_dialog_open",
+                    "action": button_text,
+                }
+
         if save_responses:
             response = save_responses[-1]
             try:
@@ -1175,9 +1344,11 @@ async def click_save_and_confirm(
             logger.warning("页面提示 SKU 未关联 ERP，已按页面流程继续保存")
 
         if button_text == "保存并铺货到平台" and not publish_dialog_handled:
-            publish_dialog = page.locator(
-                ".el-message-box:visible, .el-dialog:visible"
-            ).filter(has_text=re.compile("确认.*铺货|铺货.*平台"))
+            # 这里只处理保存后的简短确认框；“铺货到店铺”大弹窗必须在选择并
+            # 校验店铺后单独提交，不能用唯一“确定”按钮直接略过。
+            publish_dialog = page.locator(".el-message-box:visible").filter(
+                has_text=re.compile("确认.*铺货|铺货.*平台")
+            )
             if await visible(publish_dialog.first):
                 confirm = publish_dialog.first.get_by_role(
                     "button", name=re.compile(r"^\s*(?:确定|确 定)\s*$")
@@ -1212,13 +1383,202 @@ async def click_save_and_confirm(
     raise AutomationError(f"等待“{button_text}”成功确认超时" + suffix)
 
 
+async def publish_to_selected_douyin_shops(
+    page: Any,
+    selected_shops: Sequence[str],
+    timeout_seconds: int,
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """在铺货弹窗中精确选择抖音店铺，确认店铺资料后提交铺货。"""
+    expected = tuple(dict.fromkeys(shop.strip() for shop in selected_shops if shop.strip()))
+    if not expected:
+        raise AutomationError("没有指定要铺货的抖音店铺")
+
+    dialog = page.locator('[role="dialog"]:visible').filter(has_text="铺货到店铺").first
+    await dialog.wait_for(state="visible", timeout=timeout_seconds * 1000)
+    douyin_platform = dialog.get_by_text("抖音", exact=True)
+    if not await douyin_platform.count():
+        raise AutomationError("铺货弹窗中找不到抖音平台")
+    await douyin_platform.first.click()
+    logger.info("铺货弹窗已选择抖音平台")
+
+    async def checkbox_by_text(label: str) -> tuple[Any, Any]:
+        candidates = dialog.locator(".el-checkbox").filter(has_text=label)
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            text = re.sub(r"\s+", " ", (await candidate.inner_text()).strip())
+            if text == label or text.startswith(label):
+                checkbox = candidate.locator('input[type="checkbox"]').first
+                if await checkbox.count():
+                    return candidate, checkbox
+        raise AutomationError(f"铺货弹窗中找不到唯一复选框：{label}")
+
+    # 等待店铺文字出现，不依赖 Element UI 未绑定的 accessibility name。
+    first_shop_visible = None
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            first_shop_visible, _ = await checkbox_by_text(KNOWN_DOUYIN_SHOPS[0])
+            if await first_shop_visible.is_visible():
+                break
+        except AutomationError:
+            first_shop_visible = None
+        await asyncio.sleep(0.25)
+    if first_shop_visible is None:
+        raise AutomationError("抖音平台店铺列表未加载")
+    unknown = [shop for shop in expected if shop not in KNOWN_DOUYIN_SHOPS]
+    if unknown:
+        raise AutomationError("未配置的抖音店铺：" + "、".join(unknown))
+
+    async def has_published_tag(control: Any, shop: str) -> bool:
+        container = control
+        own_text = re.sub(r"\s+", " ", (await control.inner_text()).strip())
+        if "已铺货" in own_text:
+            return True
+        for _ in range(4):
+            container = container.locator("xpath=..").first
+            text = re.sub(r"\s+", " ", (await container.inner_text()).strip())
+            shops_in_container = [name for name in KNOWN_DOUYIN_SHOPS if name in text]
+            if "已铺货" in text and shop in text and len(shops_in_container) == 1:
+                return True
+            if len(shops_in_container) > 1:
+                break
+        return False
+
+    already_published: List[str] = []
+    pending_expected: List[str] = []
+    for shop in KNOWN_DOUYIN_SHOPS:
+        control, checkbox = await checkbox_by_text(shop)
+        is_published = await checkbox.is_disabled() or await has_published_tag(control, shop)
+        logger.info("店铺状态：%s=%s", shop, "已铺货" if is_published else "可铺货")
+        if is_published:
+            if shop in expected:
+                already_published.append(shop)
+            continue
+        should_check = shop in expected
+        if should_check:
+            pending_expected.append(shop)
+        if await checkbox.is_checked() != should_check:
+            await control.scroll_into_view_if_needed()
+            await control.click()
+            if await checkbox.is_checked() != should_check:
+                raise AutomationError(f"店铺“{shop}”复选框状态切换失败")
+
+    ai_control, ai_checkbox = await checkbox_by_text("使用AI裂变规则")
+    if await ai_checkbox.is_checked():
+        await ai_control.scroll_into_view_if_needed()
+        await ai_control.click()
+        if await ai_checkbox.is_checked():
+            raise AutomationError("AI 裂变规则复选框无法关闭")
+
+    actual_list: List[str] = []
+    for shop in KNOWN_DOUYIN_SHOPS:
+        control, checkbox = await checkbox_by_text(shop)
+        if not await has_published_tag(control, shop) and await checkbox.is_checked():
+            actual_list.append(shop)
+    actual = tuple(actual_list)
+    if set(actual) != set(pending_expected):
+        raise AutomationError(
+            "待铺货店铺复核失败：期望 " + "、".join(pending_expected)
+            + "；实际 " + "、".join(actual)
+        )
+    if not pending_expected:
+        raise AutomationError("指定的抖音店铺均已铺货，无需重复提交")
+    logger.info(
+        "抖音铺货店铺已精确复核：待铺货=%s；已铺货跳过=%s",
+        "、".join(actual),
+        "、".join(already_published) or "无",
+    )
+
+    # 用户指定的真实流程：选完店铺直接确定，不进入“确认发布信息”内页。
+    final_button = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+    if await final_button.count() != 1:
+        raise AutomationError("铺货到店铺弹窗中找不到唯一的“确定”按钮")
+    submit_responses: List[Any] = []
+
+    def on_submit_response(response: Any) -> None:
+        request = response.request
+        if request.method == "POST" and any(
+            marker in response.url.casefold()
+            for marker in ("/item/base/edit.json", "publish", "distribute", "supply")
+        ):
+            submit_responses.append(response)
+
+    page.on("response", on_submit_response)
+    await final_button.click()
+    logger.info("已点击铺货弹窗最终“确定”")
+
+    continue_button = None
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        continue_button = await first_visible(
+            page.get_by_role("button", name=re.compile("继续铺货"))
+        )
+        if continue_button is not None:
+            break
+        page_errors = page.locator(".el-message--error:visible")
+        if await visible(page_errors.first):
+            raise AutomationError("铺货提交失败：" + (await page_errors.first.inner_text()).strip())
+        await asyncio.sleep(0.25)
+    if continue_button is None:
+        raise AutomationError("点击“确定”后未出现“继续铺货”确认弹窗")
+    await continue_button.click()
+    logger.info("已点击确认弹窗“继续铺货”")
+
+    success_pattern = re.compile("铺货成功|提交成功|已提交铺货|任务已创建")
+    success = page.locator(".el-message--success:visible").filter(has_text=success_pattern)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        for response in submit_responses:
+            try:
+                payload = await response.json()
+            except Exception:
+                continue
+            if "result" in payload and int(payload.get("result", 0) or 0) != 1:
+                raise AutomationError(
+                    "铺货接口返回失败："
+                    + str(payload.get("message") or payload.get("errmsg") or payload)
+                )
+        if await visible(success.first):
+            return {
+                "result": 1,
+                "confirmed_by": "toast",
+                "shops": list(expected),
+                "submitted_shops": list(actual),
+                "already_published": already_published,
+                "responses": [response.url for response in submit_responses],
+            }
+        if not await dialog.is_visible() and not await continue_button.is_visible():
+            await asyncio.sleep(1)
+            return {
+                "result": 1,
+                "confirmed_by": "dialog_closed",
+                "shops": list(expected),
+                "submitted_shops": list(actual),
+                "already_published": already_published,
+                "responses": [response.url for response in submit_responses],
+            }
+        page_errors = page.locator(".el-message--error:visible")
+        if await visible(page_errors.first):
+            raise AutomationError("铺货提交失败：" + (await page_errors.first.inner_text()).strip())
+        await asyncio.sleep(0.25)
+    raise AutomationError("点击最终“确定”后，铺货弹窗未关闭且没有成功提示")
+
+
 async def run_browser_automation(args: argparse.Namespace, product: ProductData, artifact_dir: Path, logger: logging.Logger) -> None:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
         raise AutomationError("缺少 Playwright，请先运行：python3 -m pip install -r requirements.txt") from exc
 
-    recommendations = recognize_product_recommendations(product, artifact_dir)
+    douyin_requested = args.platform in {"all", "douyin"}
+    if args.platform == "douyin" and product.douyin_fields is None:
+        raise AutomationError("已选择抖音流程，但 Excel/产品目录中没有抖音资料")
+    recommendations = (
+        recognize_product_recommendations(product, artifact_dir)
+        if douyin_requested and product.douyin_fields is not None
+        else ()
+    )
     if recommendations:
         logger.info("本地尺码识别完成：%s", " / ".join(item.size for item in recommendations))
 
@@ -1339,7 +1699,7 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
             if base_errors:
                 raise AutomationError("基础资料存在页面校验错误：" + "；".join(base_errors))
 
-            publish_mode = product.douyin_fields is not None
+            publish_mode = douyin_requested and product.douyin_fields is not None
             if publish_mode:
                 assert product.douyin_fields is not None
                 assert product.douyin_assets is not None
@@ -1398,7 +1758,8 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 )
                 return
 
-            action_text = "保存并铺货到平台" if publish_mode else "保存"
+            should_publish = publish_mode and not args.save_only
+            action_text = "保存并铺货到平台" if should_publish else "保存"
             result = await click_save_and_confirm(
                 page,
                 drawer,
@@ -1407,11 +1768,52 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 logger,
                 button_text=action_text,
             )
-            result_name = "publish-result.json" if publish_mode else "save-result.json"
+            if should_publish:
+                publish_result = await publish_to_selected_douyin_shops(
+                    page,
+                    args.publish_shop,
+                    args.timeout,
+                    logger,
+                )
+                result["shop_publish"] = publish_result
+            if publish_mode and args.save_only:
+                logger.info("保存成功，正在重新打开商品复核抖音资料持久化结果")
+                await page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=args.timeout * 1000,
+                )
+                persisted_drawer = await open_product_editor(
+                    page,
+                    product.style_code,
+                    logger,
+                    timeout_seconds=args.timeout,
+                )
+                persisted_douyin = DouyinListing(
+                    page,
+                    persisted_drawer,
+                    logger,
+                    artifact_dir,
+                )
+                await persisted_douyin.open()
+                persisted_report = await persisted_douyin.verify_persisted_values(
+                    category_fields["category"],
+                    category_fields["short_title"],
+                    category_fields["attributes"],
+                    product.douyin_fields.price,
+                    product.douyin_fields.spot_stock,
+                    product.douyin_fields.presale_stock,
+                )
+                (artifact_dir / "douyin-after-save-validation.json").write_text(
+                    json.dumps(persisted_report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info("保存后重开复核通过：抖音字段与 %s 行 SKU 均已持久化", sku_rows)
+
+            result_name = "publish-result.json" if should_publish else "save-result.json"
             (artifact_dir / result_name).write_text(
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            screenshot_name = "after-publish.png" if publish_mode else "after-save.png"
+            screenshot_name = "after-publish.png" if should_publish else "after-save.png"
             await safe_screenshot(page, artifact_dir / screenshot_name)
             logger.info("%s成功（确认来源：%s）", action_text, result.get("confirmed_by"))
         except Exception:
@@ -1428,6 +1830,12 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="从 Excel 和产品素材自动填写快麦基础/抖音资料")
     parser.add_argument("--excel-url", default=DEFAULT_EXCEL_URL, help="产品信息.xlsx 的 smb:// 或本地路径")
+    parser.add_argument(
+        "--platform",
+        choices=("all", "base", "douyin"),
+        default="all",
+        help="运行范围：all=全部已实现平台，base=仅基础资料，douyin=基础资料+抖音",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只读取并校验 Excel/图片，不打开浏览器")
     parser.add_argument(
         "--save",
@@ -1442,27 +1850,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="填写并校验基础/抖音资料，但不保存也不铺货",
     )
+    parser.add_argument(
+        "--save-only",
+        action="store_true",
+        help="抖音资料只点击“保存”，不打开铺货弹窗；保存后自动重开复核",
+    )
     parser.add_argument("--sync-erp", action="store_true", help="出现 ERP 同步确认框时选择同步；默认跳过同步")
     parser.add_argument("--headless", action="store_true", help="无头模式（仅适用于专用 Chrome 配置已登录）")
     parser.add_argument("--cdp-url", help="连接已开启远程调试的 Chrome，例如 http://127.0.0.1:9222")
     parser.add_argument(
         "--user-data-dir",
-        default=str(Path(__file__).resolve().parent / "output/kuaimai/chrome-profile"),
+        default=str(DEFAULT_PROFILE_DIR),
         help="自动化专用 Chrome 用户数据目录",
     )
     parser.add_argument(
         "--auth-state",
-        default=str(Path(__file__).resolve().parent / "output/kuaimai/auth-state.json"),
+        default=str(DEFAULT_AUTH_STATE),
         help="会话登录状态保存文件",
     )
     parser.add_argument("--login-timeout", type=int, default=1200, help="首次手工登录等待秒数（默认 1200）")
     parser.add_argument("--timeout", type=int, default=300, help="页面操作/保存超时秒数（默认 300）")
     parser.add_argument("--upload-timeout", type=int, default=600, help="每组图片上传超时秒数（默认 600）")
+    parser.add_argument(
+        "--publish-shop",
+        action="append",
+        default=None,
+        help="要铺货的抖音店铺，可重复传入；不传时使用已配置的 6 个店铺",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.save_only and not args.save:
+        raise SystemExit("--save-only 与 --no-save 不能同时使用")
+    if args.publish_shop is None:
+        args.publish_shop = list(DEFAULT_DOUYIN_PUBLISH_SHOPS)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     artifact_dir = Path(__file__).resolve().parent / "output/kuaimai/runs" / timestamp
     logger = setup_logging(artifact_dir)
