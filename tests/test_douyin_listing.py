@@ -161,6 +161,7 @@ DOUYIN_FIXTURE = r"""
 <script>
 let selectSequence = 0;
 window.sizeWriteCount = 0;
+window.predictionRefreshCount = 0;
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     document.querySelectorAll('.el-select-dropdown').forEach(item => item.style.display = 'none');
@@ -358,6 +359,24 @@ function applyCategory(button) {
   renderAttributes();
 }
 
+function refreshPredictions() {
+  window.predictionRefreshCount += 1;
+  document.querySelector('.prediction-item .path').textContent = '服装>男装>休闲裤';
+}
+
+function generatePredictions(button) {
+  window.predictionRefreshCount += 1;
+  document.querySelector('.platform-category-input').insertAdjacentHTML(
+    'beforeend',
+    '<div class="prediction-item"><span>推荐</span><span class="path">服装>男装>休闲裤</span><button onclick="applyCategory(this)">点击使用</button></div>'
+  );
+  document.querySelector('[placeholder="请输入商品标题"]').value = '8/28';
+  button.remove();
+  const notice = document.createElement('div');
+  notice.textContent = '抖音资料已由AI自动生成';
+  document.querySelector('[role="tabpanel"]').prepend(notice);
+}
+
 function openDouyin() {
   document.querySelector('[role=tab][aria-selected=true]').setAttribute('aria-selected', 'false');
   document.querySelector('#douyin-tab').setAttribute('aria-selected', 'true');
@@ -369,6 +388,12 @@ function openDouyin() {
           <div class="prediction-item"><span>推荐</span><span class="path">服装>男装>休闲裤</span><button onclick="applyCategory(this)">点击使用</button></div>
         </div></div>
       </div>
+      <div class="el-form-item">
+        <label class="el-form-item__label">商品标题</label>
+        <div class="el-form-item__content"><input placeholder="请输入商品标题"></div>
+      </div>
+      <button type="button" onclick="generatePredictions(this)">立即生成</button>
+      <button type="button" onclick="refreshPredictions()">刷新预测结果</button>
       <div class="el-form-item">
         <label class="el-form-item__label">货号</label>
         <div class="el-form-item__content"><input placeholder="请输入货号"></div>
@@ -447,6 +472,37 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ".attr-item:has(.el-form-item__label:text-is('里料材质')) .el-tag"
         )
         self.assertEqual(await tags.count(), 1)
+
+    async def test_product_title_refreshes_dynamic_category_before_applying_it(self):
+        await self.listing.open()
+        await self.page.locator(".prediction-item").evaluate(
+            "element => element.remove()"
+        )
+
+        prepared = await self.listing.prepare_product_title_and_predictions(
+            "[绿巨人] 复古水洗工装裤",
+            force_refresh=True,
+        )
+
+        self.assertEqual(prepared["product_title"], "[绿巨人] 复古水洗工装裤")
+        self.assertTrue(prepared["prediction_refreshed"])
+        self.assertEqual(
+            prepared["prediction_actions"],
+            ["立即生成"],
+        )
+        self.assertEqual(await self.page.evaluate("window.predictionRefreshCount"), 1)
+        self.assertEqual(
+            await self.listing.apply_first_recommended_category(),
+            "服装 > 男装 > 休闲裤",
+        )
+
+        repeated = await self.listing.prepare_product_title_and_predictions(
+            "[绿巨人] 复古水洗工装裤",
+            force_refresh=False,
+        )
+        self.assertFalse(repeated["product_title_changed"])
+        self.assertFalse(repeated["prediction_refreshed"])
+        self.assertEqual(await self.page.evaluate("window.predictionRefreshCount"), 1)
 
     async def test_material_rows_selection_percentages_and_upload_adapter(self):
         await self.listing.open()
@@ -563,6 +619,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delivery_mode_and_every_sku_row_are_verified(self):
         await self.listing.open()
+        await self.page.locator(".sku-table tbody tr").first.locator("input").nth(2).fill("")
 
         self.assertEqual(
             await self.listing.apply_delivery_mode(),
@@ -649,6 +706,11 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_goods_code_and_sku_values_survive_read_only_recheck(self):
         await self.listing.open()
+        goods_code_input = self.page.locator(
+            ".el-form-item:has(.el-form-item__label:text-is('货号')) input"
+        )
+        await goods_code_input.fill("NGBL-10588")
+        await goods_code_input.evaluate("element => element.readOnly = true")
         fields = SimpleNamespace(
             short_title="复古工装裤",
             attributes={
@@ -658,9 +720,11 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         applied = await self.listing.apply_category_and_fields(fields)
+        await self.listing.fill_text_field("商品标题", "复古水洗工装裤")
         await self.listing.fill_sku_price_inventory("586", 0, 100)
         persisted = await self.listing.verify_persisted_values(
             applied["category"],
+            "复古水洗工装裤",
             applied["short_title"],
             applied["attributes"],
             "586",

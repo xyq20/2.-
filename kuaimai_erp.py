@@ -1287,6 +1287,7 @@ async def click_save_and_confirm(
     deadline = time.monotonic() + timeout_seconds
     sync_dialog_handled = False
     unbound_dialog_handled = False
+    distribution_relation_dialog_handled = False
     publish_dialog_handled = False
 
     while time.monotonic() < deadline:
@@ -1342,6 +1343,26 @@ async def click_save_and_confirm(
             await unbound_dialog.first.get_by_role("button", name="我知道了").click()
             unbound_dialog_handled = True
             logger.warning("页面提示 SKU 未关联 ERP，已按页面流程继续保存")
+
+        distribution_relation_dialog = page.locator(".el-message-box:visible").filter(
+            has_text=re.compile(
+                r"商品已加入分销小店[\s\S]*"
+                r"规格明细已变更[\s\S]*"
+                r"是否确认保存商品资料"
+            )
+        )
+        if (
+            not distribution_relation_dialog_handled
+            and await visible(distribution_relation_dialog.first)
+        ):
+            confirm = distribution_relation_dialog.first.get_by_role(
+                "button", name=re.compile(r"^\s*(?:确定|确\s*定)\s*$")
+            )
+            if await confirm.count() != 1:
+                raise AutomationError("分销关系变更确认框中找不到唯一的“确定”按钮")
+            await confirm.click()
+            distribution_relation_dialog_handled = True
+            logger.info("已确认分销关系变更，继续保存商品资料")
 
         if button_text == "保存并铺货到平台" and not publish_dialog_handled:
             # 这里只处理保存后的简短确认框；“铺货到店铺”大弹窗必须在选择并
@@ -1700,12 +1721,70 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 raise AutomationError("基础资料存在页面校验错误：" + "；".join(base_errors))
 
             publish_mode = douyin_requested and product.douyin_fields is not None
+            base_save_result = None
+            if publish_mode and args.save:
+                logger.info("基础资料复核通过，先保存基础资料再生成平台预测")
+                base_save_result = await click_save_and_confirm(
+                    page,
+                    drawer,
+                    args.sync_erp,
+                    args.timeout,
+                    logger,
+                    button_text="保存",
+                )
+                (artifact_dir / "base-save-result.json").write_text(
+                    json.dumps(base_save_result, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                # 重新载入后，抖音预测读取的是已持久化的当前款式资料，
+                # 不会再取到编辑前的旧标题或旧图片。
+                await page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=args.timeout * 1000,
+                )
+                drawer = await open_product_editor(
+                    page,
+                    product.style_code,
+                    logger,
+                    timeout_seconds=args.timeout,
+                )
+                persisted_style_item = await form_item(
+                    drawer, "款式编码", timeout_seconds=args.timeout
+                )
+                persisted_style = (
+                    await persisted_style_item.locator("input").first.input_value()
+                ).strip()
+                if persisted_style != product.style_code:
+                    raise AutomationError(
+                        f"基础资料保存后款式编码不一致：{persisted_style!r}"
+                    )
+                persisted_title_item = await form_item(
+                    drawer, "商品名称", timeout_seconds=args.timeout
+                )
+                persisted_title = (
+                    await persisted_title_item.locator("input").first.input_value()
+                ).strip()
+                if persisted_title != product.title:
+                    raise AutomationError(
+                        "基础资料保存后商品名称不一致："
+                        f"期望 {product.title!r}，页面为 {persisted_title!r}"
+                    )
+                logger.info("基础资料已保存并重开复核通过")
+
             if publish_mode:
                 assert product.douyin_fields is not None
                 assert product.douyin_assets is not None
                 douyin = DouyinListing(page, drawer, logger, artifact_dir)
                 await douyin.open()
-                category_fields = await douyin.apply_category_and_fields(product.douyin_fields)
+                title_prediction = await douyin.prepare_product_title_and_predictions(
+                    product.title,
+                    force_refresh=False,
+                )
+                category_fields = dict(
+                    await douyin.apply_category_and_fields(product.douyin_fields)
+                )
+                category_fields.update(title_prediction)
                 materials = await douyin.apply_materials(
                     product.douyin_fields.materials,
                     product.douyin_assets.wash_label_images,
@@ -1768,6 +1847,8 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 logger,
                 button_text=action_text,
             )
+            if base_save_result is not None:
+                result["base_save"] = base_save_result
             if should_publish:
                 publish_result = await publish_to_selected_douyin_shops(
                     page,
@@ -1797,6 +1878,7 @@ async def run_browser_automation(args: argparse.Namespace, product: ProductData,
                 await persisted_douyin.open()
                 persisted_report = await persisted_douyin.verify_persisted_values(
                     category_fields["category"],
+                    category_fields["product_title"],
                     category_fields["short_title"],
                     category_fields["attributes"],
                     product.douyin_fields.price,

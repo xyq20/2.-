@@ -478,9 +478,122 @@ class DouyinListing:
             raise DouyinListingError("抖音资料表单未渲染") from exc
         self.panel = panel
         await self._wait_for_loading_masks()
+        await self._wait_for_field("商品标题")
         await self._wait_for_field("导购短标题")
         await self._drain_property_response_tasks()
         return self
+
+    async def refresh_prediction_results(
+        self,
+        action_labels: Sequence[str] = ("立即生成", "刷新预测结果"),
+    ) -> str:
+        """让平台按当前资料生成预测，并等待异步结果稳定。"""
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+
+        action_control = None
+        action_text = ""
+        # 新款未生成过抖音资料时显示“立即生成”；已有预测
+        # 的商品可能显示“刷新预测结果”。两者都不是固定必现元素。
+        for label in action_labels:
+            candidates = self.panel.get_by_text(label, exact=True)
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if await candidate.is_visible():
+                    action_control = candidate
+                    action_text = label
+                    break
+            if action_control is not None:
+                break
+        if action_control is None:
+            raise DouyinListingError(
+                "基础资料或抖音商品标题已更新，但页面找不到"
+                "“立即生成”或“刷新预测结果”，"
+                "为避免使用旧类目已停止"
+            )
+
+        await action_control.scroll_into_view_if_needed()
+        await action_control.click()
+        if self.logger is not None:
+            self.logger.info("基础资料已变更，已点击抖音“%s”", action_text)
+
+        if action_text != "立即生成":
+            # 刷新控件没有稳定的完成文案，留出请求发起和 DOM
+            # 替换时间，再以遮罩消失和推荐列表稳定作为完成信号。
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.25)
+        await self._wait_for_loading_masks()
+
+        buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
+        try:
+            await buttons.first.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise DouyinListingError("刷新后抖音页面没有可用的预测类目") from exc
+
+        # 预测结果可能分批替换 DOM；连续两次读取一致后再继续。
+        previous = None
+        stable_reads = 0
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
+            current_values = []
+            for index in range(await buttons.count()):
+                button = buttons.nth(index)
+                if not await button.is_visible():
+                    continue
+                current_values.append(
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        (await button.locator("xpath=..").inner_text()).strip(),
+                    )
+                )
+            current = tuple(current_values)
+            if current and current == previous:
+                stable_reads += 1
+                if stable_reads >= 2:
+                    return action_text
+            else:
+                previous = current
+                stable_reads = 0
+            await asyncio.sleep(0.25)
+        raise DouyinListingError("刷新后抖音预测类目未稳定")
+
+    async def prepare_product_title_and_predictions(
+        self,
+        product_title: str,
+        *,
+        force_refresh: bool = False,
+    ) -> Mapping[str, Any]:
+        """同步抖音商品标题，必要时刷新动态预测。"""
+        before = (await self.read_field_values("商品标题"))[0]
+        title = await self.fill_text_field("商品标题", product_title)
+        title_changed = before != title
+        prediction_actions = []
+        if force_refresh or title_changed:
+            recommendations = self.panel.get_by_role(
+                "button", name="点击使用", exact=True
+            )
+            has_recommendation = False
+            for index in range(await recommendations.count()):
+                if await recommendations.nth(index).is_visible():
+                    has_recommendation = True
+                    break
+            if not has_recommendation:
+                first_action = await self.refresh_prediction_results(("立即生成",))
+                prediction_actions.append(first_action)
+                # 自动生成可能同时改写标题，Excel 仍是最终权威值。
+                title = await self.fill_text_field("商品标题", product_title)
+            elif self.logger is not None:
+                self.logger.info("页面已有当前商品的预测类目，跳过重复生成")
+        elif self.logger is not None:
+            self.logger.info("基础资料与抖音商品标题均未变更，跳过重复预测")
+        return {
+            "product_title": title,
+            "product_title_changed": title_changed,
+            "prediction_refreshed": bool(prediction_actions),
+            "prediction_actions": prediction_actions,
+        }
 
     async def _category_text(self) -> str:
         item = await self._wait_for_field("商品分类")
@@ -577,28 +690,83 @@ class DouyinListing:
             )
         return actual
 
+    async def _plain_text_field_controls(self, label: str) -> List[Tuple[Any, Any]]:
+        """返回指定标签下的直接文本输入控件，排除 AI 摘要中的同名标签。"""
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+        wanted = _normalize_label(label)
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            controls: List[Tuple[Any, Any]] = []
+            items = self.panel.locator(".el-form-item")
+            for index in range(await items.count()):
+                item = items.nth(index)
+                if not await item.is_visible():
+                    continue
+                labels = item.locator(
+                    ":scope > .el-form-item__label, :scope > label.el-form-item__label"
+                )
+                if not await labels.count():
+                    continue
+                if _normalize_label(await labels.first.inner_text()) != wanted:
+                    continue
+                inputs = item.locator(
+                    ":scope > .el-form-item__content > input, "
+                    ":scope > .el-form-item__content > .el-input input"
+                )
+                for input_index in range(await inputs.count()):
+                    input_box = inputs.nth(input_index)
+                    if await input_box.is_visible() and not await input_box.evaluate(
+                        "element => Boolean(element.closest('.el-select'))"
+                    ):
+                        controls.append((item, input_box))
+            if controls:
+                return controls
+            await asyncio.sleep(0.05)
+        raise DouyinListingError(f"抖音字段“{label}”找不到可见文本输入控件")
+
+    async def read_plain_text_field(self, label: str) -> str:
+        controls = await self._plain_text_field_controls(label)
+        values = [(await input_box.input_value()).strip() for _item, input_box in controls]
+        nonempty = [value for value in values if value]
+        if len(set(nonempty)) == 1:
+            return nonempty[0]
+        if len(controls) == 1:
+            return values[0]
+        raise DouyinListingError(
+            f"抖音字段“{label}”文本输入控件无法唯一确定：{values!r}"
+        )
+
     async def fill_text_field(self, label: str, value: object) -> str:
         """填写抖音页中不属于动态类目属性区的普通文本字段。"""
-        item = await self._wait_for_field(label)
-        inputs = item.locator(
-            ":scope > .el-form-item__content input:not([readonly]):not([disabled])"
-        )
-        visible_inputs = []
-        for index in range(await inputs.count()):
-            candidate = inputs.nth(index)
-            if await candidate.is_visible():
-                visible_inputs.append(candidate)
-        if len(visible_inputs) != 1:
-            raise DouyinListingError(
-                f"抖音字段“{label}”可写输入框匹配数为 {len(visible_inputs)}"
-            )
-        input_box = visible_inputs[0]
         expected = str(value)
-        current = (await input_box.input_value()).strip()
-        if current == expected:
+        controls = await self._plain_text_field_controls(label)
+        matching = []
+        writable = []
+        for item, input_box in controls:
+            current = (await input_box.input_value()).strip()
+            if current == expected:
+                matching.append((item, input_box, current))
+            if not await input_box.is_disabled() and await input_box.get_attribute("readonly") is None:
+                writable.append((item, input_box, current))
+        if matching:
             if self.logger is not None:
                 self.logger.info("抖音字段“%s”已匹配，跳过填写", label)
-            return current
+            return matching[0][2]
+        if len(writable) == 1:
+            item, input_box, current = writable[0]
+        elif len(controls) == 1:
+            item, input_box = controls[0]
+            current = (await input_box.input_value()).strip()
+        else:
+            raise DouyinListingError(
+                f"抖音字段“{label}”可写文本控件无法唯一确定"
+            )
+        if await input_box.is_disabled() or await input_box.get_attribute("readonly") is not None:
+            raise DouyinListingError(
+                f"抖音字段“{label}”当前为只读，且页面值 {current!r} "
+                f"与 Excel {expected!r} 不一致"
+            )
         await item.scroll_into_view_if_needed()
         await input_box.fill(expected)
         await input_box.press("Tab")
@@ -1132,6 +1300,16 @@ class DouyinListing:
             ):
                 visible_inputs.append(candidate)
 
+        # 货号等字段可能在平台自动生成后变为只读，仍要可回读校验。
+        if not visible_inputs:
+            readonly_inputs = item.locator(":scope > .el-form-item__content input")
+            for index in range(await readonly_inputs.count()):
+                candidate = readonly_inputs.nth(index)
+                if await candidate.is_visible() and not await candidate.evaluate(
+                    "element => Boolean(element.closest('.el-select'))"
+                ):
+                    visible_inputs.append(candidate)
+
         # 克重的数值和单位嵌套在 measure-wrap 的内层表单中，不是外层
         # el-form-item__content 的直属子节点。
         if not visible_inputs:
@@ -1172,6 +1350,7 @@ class DouyinListing:
     async def verify_persisted_values(
         self,
         category: object,
+        product_title: object,
         short_title: object,
         attributes: Mapping[str, Sequence[object]],
         price: object,
@@ -1187,6 +1366,12 @@ class DouyinListing:
                 f"保存后商品分类不一致：期望 {expected_category!r}，页面为 {actual_category!r}"
             )
 
+        actual_product_title = (await self.read_field_values("商品标题"))[0]
+        if actual_product_title != str(product_title):
+            raise DouyinListingError(
+                f"保存后商品标题不一致：期望 {product_title!r}，页面为 {actual_product_title!r}"
+            )
+
         actual_short_title = (await self.read_field_values("导购短标题"))[0]
         if actual_short_title != str(short_title):
             raise DouyinListingError(
@@ -1196,7 +1381,10 @@ class DouyinListing:
         actual_attributes: Dict[str, Tuple[str, ...]] = {}
         for label, expected_values in attributes.items():
             expected = tuple(str(value) for value in expected_values)
-            actual = await self.read_field_values(str(label))
+            if _normalize_label(str(label)) == _normalize_label("货号"):
+                actual = (await self.read_plain_text_field(str(label)),)
+            else:
+                actual = await self.read_field_values(str(label))
             if Counter(normalize_option(value) for value in actual) != Counter(
                 normalize_option(value) for value in expected
             ):
@@ -1229,6 +1417,7 @@ class DouyinListing:
 
         return {
             "category": actual_category,
+            "product_title": actual_product_title,
             "short_title": actual_short_title,
             "attributes": actual_attributes,
             "sku": actual_sku,
@@ -1892,10 +2081,16 @@ class DouyinListing:
         for row_index, row_controls in enumerate(controls, start=1):
             for label, input_box in row_controls.items():
                 value = format(expected[label], "f")
-                current = _decimal(
-                    await input_box.input_value(),
-                    f"第 {row_index} 个 SKU {label}",
-                )
+                raw_current = (await input_box.input_value()).strip()
+                try:
+                    current = _decimal(
+                        raw_current,
+                        f"第 {row_index} 个 SKU {label}",
+                    )
+                except DouyinListingError:
+                    # 新生成的库存格可能初始为空；只要控件可写，
+                    # 应用 Excel 值后再做严格回读，不在填写前误报。
+                    current = None
                 if current != expected[label]:
                     await input_box.fill(value)
                     await input_box.press("Tab")
