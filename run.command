@@ -22,9 +22,10 @@ if (( $# == 0 )); then
   print "  6) 微信小店（视频号，填写、保存、铺货）"
   print "  7) 小红书（填写、保存、铺货）"
   print "  8) 有赞（填写、保存、铺货）"
-  print "  9) 一键新增链接（按视频固定填法，仅创建快麦商品）"
+  print "  9) 京东（填写、保存）"
+  print " 10) 一键新增链接（按视频固定填法，仅创建快麦商品）"
   while true; do
-    read "platform_choice?平台编号 [0-9]: "
+    read "platform_choice?平台编号 [0-10]: "
     case "$platform_choice" in
       0) selected_platform="all"; break ;;
       1) selected_platform="base"; break ;;
@@ -35,8 +36,9 @@ if (( $# == 0 )); then
       6) selected_platform="wxsph"; break ;;
       7) selected_platform="xhs"; break ;;
       8) selected_platform="youzan"; break ;;
-      9) selected_platform="create"; break ;;
-      *) print "请输入 0-9 的编号。" ;;
+      9) selected_platform="jd"; break ;;
+      10) selected_platform="create"; break ;;
+      *) print "请输入 0-10 的编号。" ;;
     esac
   done
 
@@ -108,6 +110,15 @@ if (( $# == 0 )); then
       ;;
     youzan:publish)
       PYTHON_ARGS=(--platform youzan --save)
+      ;;
+    jd:preview)
+      PYTHON_ARGS=(--platform jd --no-save)
+      ;;
+    jd:save_only)
+      PYTHON_ARGS=(--platform jd --save-only)
+      ;;
+    jd:publish)
+      PYTHON_ARGS=(--platform jd --save-only)
       ;;
     pdd:preview)
       PYTHON_ARGS=(--platform pdd --no-save)
