@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from douyin_data import MaterialComponent
 from douyin_listing import (
@@ -12,6 +12,7 @@ from douyin_listing import (
     DouyinListingError,
     choose_unique_option,
     normalize_option,
+    value_candidates,
 )
 from size_image_recognition import SkuRecommendation
 
@@ -36,6 +37,10 @@ class OptionMatchingTests(unittest.TestCase):
         options = ({"name": "棉", "id": "1"}, {"name": "亚麻", "id": "2"})
         with self.assertRaisesRegex(DouyinListingError, r"匹配数为 0.*棉.*亚麻"):
             choose_unique_option("羊毛", options)
+
+    def test_confirmed_elasticity_alias_keeps_excel_value_first(self):
+        self.assertEqual(value_candidates("弹力", "无弹"), ("无弹", "无弹力"))
+        self.assertEqual(value_candidates("厚度", "常规款"), ("常规款",))
 
 
 class _EventPage:
@@ -504,6 +509,40 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(repeated["prediction_refreshed"])
         self.assertEqual(await self.page.evaluate("window.predictionRefreshCount"), 1)
 
+    async def test_existing_category_without_prediction_is_reused_immediately(self):
+        await self.listing.open()
+        self.assertEqual(
+            await self.listing.apply_first_recommended_category(),
+            "服装 > 男装 > 休闲裤",
+        )
+        await self.page.locator(".prediction-item").evaluate(
+            "element => element.remove()"
+        )
+
+        self.assertEqual(
+            await asyncio.wait_for(
+                self.listing.apply_first_recommended_category(), timeout=1
+            ),
+            "服装 > 男装 > 休闲裤",
+        )
+
+    async def test_text_field_locator_survives_form_item_index_shift(self):
+        await self.listing.open()
+        controls = await self.listing._plain_text_field_controls("货号")
+        self.assertEqual(len(controls), 1)
+
+        await self.page.locator('[role="tabpanel"]').evaluate(
+            """panel => panel.insertAdjacentHTML(
+                'afterbegin',
+                '<div class="el-form-item"><label class="el-form-item__label">'
+                + '异步新增字段</label><div class="el-form-item__content">'
+                + '<input value="dummy"></div></div>'
+            )"""
+        )
+
+        await controls[0][1].fill("NGBL-10588")
+        self.assertEqual(await controls[0][1].input_value(), "NGBL-10588")
+
     async def test_material_rows_selection_percentages_and_upload_adapter(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()
@@ -530,6 +569,31 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.fill_attribute("里料材质", "不存在/亚麻")
 
         self.assertEqual(actual, ("亚麻",))
+
+    async def test_or_value_merges_partial_api_and_dom_before_matching(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing._api_property = AsyncMock(
+            return_value={"options": [{"name": "接口第二值", "value": "api-2"}]}
+        )
+        self.listing._select_values = AsyncMock(return_value=("常规款",))
+
+        actual = await self.listing.fill_attribute("厚度", "常规款/接口第二值")
+
+        self.assertEqual(actual, ("常规款",))
+        self.listing._select_values.assert_awaited_once()
+        self.assertEqual(self.listing._select_values.await_args.args[1], ("常规款",))
+
+    async def test_or_value_without_platform_match_tries_excel_first_value(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing._api_property = AsyncMock(return_value=None)
+        self.listing._select_values = AsyncMock(return_value=("第一顺位",))
+
+        actual = await self.listing.fill_attribute("厚度", "第一顺位/第二顺位")
+
+        self.assertEqual(actual, ("第一顺位",))
+        self.assertEqual(self.listing._select_values.await_args.args[1], ("第一顺位",))
 
     @staticmethod
     def recommendations():
@@ -674,6 +738,48 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             {"钊叔 NEIGBORL 制", "夏一制", "啊亮穿搭"},
         )
         self.assertTrue(all("新疆" in value for value in actual["applied"].values()))
+        self.assertEqual(actual["preserved"], {})
+
+    async def test_matching_freight_values_skip_unnecessary_read_only_api(self):
+        await self.listing.open()
+        desired = "新疆，西藏，不包邮-T恤，裤子，装饰品"
+        await self.page.locator(".set-ship .el-select input").evaluate_all(
+            "(inputs, value) => inputs.forEach(input => { input.value = value; })",
+            desired,
+        )
+
+        async def unexpected_fetch():
+            raise AssertionError("当前值已正确时不应请求运费 API")
+
+        self.listing._fetch_freight_payloads = unexpected_fetch
+        actual = await self.listing.apply_freight_templates((desired,))
+
+        self.assertEqual(set(actual["applied"]), {
+            "钊叔 NEIGBORL 制",
+            "夏一制",
+            "啊亮穿搭",
+        })
+        self.assertEqual(actual["preserved"], {})
+
+    async def test_freight_api_timeout_falls_back_to_exact_store_dropdown(self):
+        await self.listing.open()
+        desired = "新疆，西藏，不包邮-T恤，裤子，装饰品"
+        await self.page.locator(".set-ship .el-select input").evaluate_all(
+            "inputs => inputs.forEach(input => { input.value = '包邮'; })"
+        )
+
+        async def failed_fetch():
+            raise DouyinListingError("运费只读接口请求异常：/shop/info.json")
+
+        self.listing._fetch_freight_payloads = failed_fetch
+        actual = await self.listing.apply_freight_templates((desired,))
+
+        self.assertEqual(set(actual["applied"]), {
+            "钊叔 NEIGBORL 制",
+            "夏一制",
+            "啊亮穿搭",
+        })
+        self.assertTrue(all(value == desired for value in actual["applied"].values()))
         self.assertEqual(actual["preserved"], {})
 
     async def test_store_missing_initial_api_option_uses_dom_fallback(self):

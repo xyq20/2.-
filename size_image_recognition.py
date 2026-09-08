@@ -63,6 +63,12 @@ class SkuRecommendation:
 
 
 @dataclass(frozen=True)
+class SizeLength:
+    size: str
+    length: Number
+
+
+@dataclass(frozen=True)
 class _Toolchain:
     swiftc: Path
     version: str
@@ -365,6 +371,11 @@ _MEASUREMENT_NAMES = {
     "foot_opening": "脚围",
 }
 
+_TAOBAO_LENGTH_ALIASES = {
+    "pants": ("裤长", "LENGTH", "PANTSLENGTH", "TROUSERLENGTH"),
+    "clothing": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
+}
+
 
 def _center_x(token: OCRToken) -> float:
     return token.x + token.width / 2.0
@@ -441,6 +452,127 @@ def _measurement_kind(text: str) -> Optional[str]:
         if is_alias_composition(aliases)
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _matches_alias_composition(text: str, aliases: Sequence[str]) -> bool:
+    compact = re.sub(r"[^A-Z\u4e00-\u9fff]", "", text.upper())
+    if not compact or len(compact) > 32:
+        return False
+    reachable = {0}
+    for start in range(len(compact)):
+        if start not in reachable:
+            continue
+        for alias in aliases:
+            if compact.startswith(alias, start):
+                reachable.add(start + len(alias))
+    return len(compact) in reachable
+
+
+def parse_size_lengths(
+    tokens: Tuple[OCRToken, ...],
+    expected_sizes: Sequence[str],
+    garment_kind: str,
+    *,
+    source: str = "尺码信息表",
+) -> Tuple[SizeLength, ...]:
+    """从尺码信息表中只读取淘宝尺码表需要的衣长或裤长一行。"""
+    expected_map = _expected_size_map(expected_sizes, source)
+    aliases = _TAOBAO_LENGTH_ALIASES.get(garment_kind)
+    if aliases is None:
+        raise RecognitionError(f"不支持的淘宝尺码类型：{garment_kind!r}")
+    display_name = "裤长" if garment_kind == "pants" else "衣长"
+    label_tokens = [
+        token for token in tokens if _matches_alias_composition(token.text, aliases)
+    ]
+    if len(label_tokens) != 1:
+        raise RecognitionError(
+            f"{source}：{display_name}行标题匹配数为 {len(label_tokens)}"
+        )
+    label = label_tokens[0]
+    label_y = _center_y(label)
+    label_right = label.x + label.width
+
+    header_candidates = [
+        (size, token)
+        for token in tokens
+        for size in [_normalize_size(token.text)]
+        if size in expected_map
+        and _center_y(token) < label_y
+        and _center_x(token) > label_right
+    ]
+    headers: Dict[str, OCRToken] = {}
+    for size, token in header_candidates:
+        if size in headers:
+            raise RecognitionError(f"{source}：尺码列标题重复：{size}")
+        headers[size] = token
+    _require_size_set(tuple(headers), tuple(expected_map), source)
+
+    columns = sorted(headers.items(), key=lambda item: _center_x(item[1]))
+    column_bounds = _cell_bounds([_center_x(token) for _size, token in columns])
+    first_column_x = min(_center_x(token) for _size, token in columns)
+    header_bottom = max(token.y + token.height for _size, token in columns)
+    row_labels = sorted(
+        (
+            token
+            for token in tokens
+            if _number(token.text) is None
+            and _normalize_size(token.text) is None
+            and _center_x(token) < first_column_x
+            and _center_y(token) > header_bottom
+        ),
+        key=_center_y,
+    )
+    label_index = min(
+        range(len(row_labels)),
+        key=lambda index: abs(_center_y(row_labels[index]) - label_y),
+    )
+    if row_labels[label_index] is not label:
+        raise RecognitionError(f"{source}：无法唯一定位{display_name}数据行")
+    previous_y = _center_y(row_labels[label_index - 1]) if label_index else None
+    next_y = (
+        _center_y(row_labels[label_index + 1])
+        if label_index + 1 < len(row_labels)
+        else None
+    )
+    top = (previous_y + label_y) / 2 if previous_y is not None else label_y - 0.08
+    bottom = (label_y + next_y) / 2 if next_y is not None else label_y + 0.08
+
+    numeric_tokens = [
+        (token, value)
+        for token in tokens
+        for value in [_number(token.text)]
+        if value is not None and top <= _center_y(token) < bottom
+    ]
+    values: Dict[str, Number] = {}
+    for (size, _header), (left, right) in zip(columns, column_bounds):
+        matches = [
+            value
+            for token, value in numeric_tokens
+            if left <= _center_x(token) < right
+        ]
+        if len(matches) != 1:
+            raise RecognitionError(
+                f"{source}：{size} {display_name}单元格匹配数为 {len(matches)}"
+            )
+        value = matches[0]
+        if value <= 0:
+            raise RecognitionError(f"{source}：{size} {display_name}必须是正数")
+        values[size] = value
+    return tuple(SizeLength(expected_map[size], values[size]) for size in expected_map)
+
+
+def recognize_size_lengths(
+    size_chart_path: Path,
+    expected_sizes: Sequence[str],
+    garment_kind: str,
+) -> Tuple[SizeLength, ...]:
+    size_chart_path = Path(size_chart_path)
+    return parse_size_lengths(
+        vision_ocr(size_chart_path),
+        expected_sizes,
+        garment_kind,
+        source=str(size_chart_path),
+    )
 
 
 def _cell_bounds(centers: Sequence[float]) -> Tuple[Tuple[float, float], ...]:
@@ -763,8 +895,12 @@ def parse_height_weight_chart(
     x_spacing = float(np.median(np.diff([_center_x(token) for token, _value in weight_axis])))
     y_spacing = float(np.median(np.diff([_center_y(token) for token, _value in height_axis])))
 
-    height_min = min(value for _token, value in height_axis)
-    weight_min = min(value for _token, value in weight_axis)
+    # 这类推荐图的尺码色块是按顺序首尾相接的阶梯：
+    # S 从坐标轴最小值开始，后一码的起点是前一码的终点。
+    # 原逻辑只识别了每个色块的右/下边界，却把全局最小值
+    # 重复用作每个尺码的下限，导致 M 以后都从 155/50 开始。
+    next_height_min = min(value for _token, value in height_axis)
+    next_weight_min = min(value for _token, value in weight_axis)
     result = {}
     right_boundaries = []
     lower_boundaries = []
@@ -804,7 +940,14 @@ def parse_height_weight_chart(
             height_axis,
             horizontal=False,
         )
-        result[size] = (height_min, height_max, weight_min, weight_max)
+        result[size] = (
+            next_height_min,
+            height_max,
+            next_weight_min,
+            weight_max,
+        )
+        next_height_min = height_max
+        next_weight_min = weight_max
     if not _strictly_increasing(right_boundaries):
         raise RecognitionError(f"{source}：尺码色块右边界不唯一或未严格递增")
     if not _strictly_increasing(lower_boundaries):

@@ -21,6 +21,7 @@ from size_image_recognition import (
     RecognitionError,
     SkuRecommendation,
     parse_measurement_table,
+    parse_size_lengths,
     recognize_recommendations,
     vision_ocr,
 )
@@ -132,6 +133,46 @@ class VisionOCRUnitTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RecognitionError, "未知字段：extra"):
             vision_ocr(self.image_path)
+
+    def test_taobao_pants_reads_only_pants_length_row(self):
+        actual = parse_size_lengths(
+            _measurement_tokens(),
+            ("S", "M"),
+            "pants",
+            source="裤子/尺码信息表.jpg",
+        )
+
+        self.assertEqual(
+            [(item.size, item.length) for item in actual],
+            [("S", 104), ("M", 106)],
+        )
+
+    def test_taobao_clothing_reads_garment_length_row(self):
+        tokens = (
+            _token("S", 0.40, 0.10),
+            _token("M", 0.60, 0.10),
+            _token("肩宽", 0.05, 0.30, width=0.20),
+            _token("衣长/LENGTH", 0.05, 0.50, width=0.20),
+            _token("胸围", 0.05, 0.70, width=0.20),
+            _token("46", 0.40, 0.30),
+            _token("48", 0.60, 0.30),
+            _token("62.5", 0.40, 0.50),
+            _token("64.5", 0.60, 0.50),
+            _token("106", 0.40, 0.70),
+            _token("110", 0.60, 0.70),
+        )
+
+        actual = parse_size_lengths(
+            tokens,
+            ("S", "M"),
+            "clothing",
+            source="衣服/尺码信息表.jpg",
+        )
+
+        self.assertEqual(
+            [(item.size, item.length) for item in actual],
+            [("S", 62.5), ("M", 64.5)],
+        )
 
     @patch("size_image_recognition.subprocess.run")
     def test_rejects_other_malformed_token_schema(self, run):
@@ -396,10 +437,10 @@ class SizeRecommendationParserTests(unittest.TestCase):
             result,
             (
                 SkuRecommendation("S", 155, 160, 50, 60, 80, 106, 104),
-                SkuRecommendation("M", 155, 170, 50, 70, 84, 110, 106),
-                SkuRecommendation("L", 155, 180, 50, 80, 88, 114, 108),
-                SkuRecommendation("XL", 155, 190, 50, 90, 92, 118, 110),
-                SkuRecommendation("2XL", 155, 200, 50, 100, 96, 122, 112),
+                SkuRecommendation("M", 160, 170, 60, 70, 84, 110, 106),
+                SkuRecommendation("L", 170, 180, 70, 80, 88, 114, 108),
+                SkuRecommendation("XL", 180, 190, 80, 90, 92, 118, 110),
+                SkuRecommendation("2XL", 190, 200, 90, 100, 96, 122, 112),
             ),
         )
 

@@ -345,6 +345,8 @@ class ProductDataReadIntegrationTests(unittest.TestCase):
             self.assertEqual(product.base_price, "586")
             self.assertIsNone(product.douyin_fields)
             self.assertIsNone(product.douyin_assets)
+            self.assertIsNotNone(product.wxsph_fields)
+            self.assertEqual(product.wxsph_fields.fields["吊牌价/价格/基本售价"], "586")
 
     def test_read_product_data_rejects_partial_douyin_signals(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -354,6 +356,24 @@ class ProductDataReadIntegrationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(DouyinDataError, "面料材质"):
                 kuaimai_erp.read_product_data(excel_path)
+
+    def test_non_douyin_platform_can_skip_partial_douyin_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            excel_path = self._write_excel(
+                product_dir,
+                self._base_fields() + [("导购短标题", "只给其他平台使用")],
+            )
+
+            product = kuaimai_erp.read_product_data(
+                excel_path,
+                include_douyin=False,
+            )
+
+        self.assertIsNone(product.douyin_fields)
+        self.assertIsNone(product.douyin_assets)
+        self.assertIsNotNone(product.tmall_fields)
 
     def test_read_product_data_loads_complete_legacy_and_douyin_inputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

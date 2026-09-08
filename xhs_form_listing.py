@@ -1,0 +1,1128 @@
+"""DOM writer for FastMai's Xiaohongshu product-information tab.
+
+The adapter stops after filling and validating the form.  It intentionally has
+no save or publish method; the common runner owns the final write gate.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from taobao_listing import (
+    TaobaoListing,
+    TaobaoListingError,
+    excel_aliases,
+    normalize_label,
+    normalize_option,
+    parse_taobao_fabrics,
+    parse_taobao_materials,
+    selection_value_groups,
+)
+from xhs_data import XhsFields
+
+
+class XhsFormListingError(RuntimeError):
+    """A Xiaohongshu form problem that can be shown directly to the operator."""
+
+
+XHS_INHERITED_FIELDS = frozenset(
+    normalize_label(value)
+    for value in ("商品分类", "商品标题", "商品名称", "商品英文名", "品牌", "货号")
+)
+XHS_FIELD_ALIASES: Mapping[str, Tuple[str, ...]] = {
+    normalize_label("服装版型"): (
+        normalize_label("服饰版型"),
+        normalize_label("版型"),
+    ),
+    normalize_label("服饰版型"): (
+        normalize_label("服装版型"),
+        normalize_label("版型"),
+    ),
+    normalize_label("厚薄"): (normalize_label("厚度"),),
+    normalize_label("面料"): (
+        normalize_label("面料材质"),
+        normalize_label("面料俗称"),
+    ),
+    normalize_label("材质成分"): (normalize_label("材质"),),
+    normalize_label("上市年份季节"): (normalize_label("上市时节"),),
+}
+XHS_BATCH_ORDER = ("售价", "市场价", "库存")
+XHS_ATTRIBUTE_END_HEADINGS = re.compile(r"^\s*价格库存\s*[：:]?\s*$")
+XHS_CATEGORY_QUERY_PATH = "/category/base/queryCategoryList.json"
+XHS_CATEGORY_RESULT_SELECTOR = (
+    "[data-xhs-category]:visible, "
+    ".el-popover.el-popper:visible .categoryList-wrap > .text.item:visible, "
+    ".el-autocomplete-suggestion:visible li:visible, "
+    ".el-autocomplete-suggestion:visible [role=option]:visible, "
+    ".el-autocomplete-suggestion:visible .el-autocomplete-suggestion__item:visible"
+)
+
+
+def _numeric_equal(actual: str, expected: str) -> bool:
+    try:
+        return Decimal(actual.replace(",", "")) == Decimal(expected.replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _is_nonnegative_decimal(value: str) -> bool:
+    try:
+        return Decimal(value) >= 0
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _required_excel_value(
+    fields: Mapping[str, str], aliases: Sequence[str], label: str
+) -> str:
+    wanted = {normalize_label(alias) for alias in aliases}
+    matches = [
+        (str(key), str(value).strip())
+        for key, value in fields.items()
+        if wanted.intersection(excel_aliases(key)) and str(value).strip()
+    ]
+    if not matches:
+        raise XhsFormListingError(
+            "Excel 中缺少小红书{0}字段（可识别：{1}）".format(
+                label, "/".join(aliases)
+            )
+        )
+    distinct = {value for _key, value in matches}
+    if len(distinct) != 1:
+        raise XhsFormListingError(
+            "小红书{0}匹配到多个 Excel 字段：{1}".format(
+                label, "、".join(key for key, _value in matches)
+            )
+        )
+    return matches[0][1]
+
+
+def title_without_neigborl(value: object) -> str:
+    """Remove only the brand token forbidden by Xiaohongshu's title rule."""
+    title = str(value or "").strip()
+    cleaned = re.sub(r"neigborl", "", title, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"([【\[（(])\s+", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([】\]）)])", r"\1", cleaned)
+    cleaned = re.sub(r"([】\]）)])\s+", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _category_normalized(value: object) -> str:
+    return re.sub(r"[\s>＞/／,，、;；]+", "", str(value or "")).casefold()
+
+
+def _category_parts(value: object) -> Tuple[str, ...]:
+    """Return the visible platform path as exact, ordered route segments."""
+    return tuple(
+        normalize_label(part)
+        for part in re.split(r"[>＞/／]", str(value or ""))
+        if normalize_label(part)
+    )
+
+
+def _contains_ordered_parts(
+    candidate_parts: Sequence[str], expected_parts: Sequence[str]
+) -> bool:
+    """Exact segment matching only; never infer a category from a substring."""
+    cursor = 0
+    for expected in expected_parts:
+        while cursor < len(candidate_parts) and candidate_parts[cursor] != expected:
+            cursor += 1
+        if cursor == len(candidate_parts):
+            return False
+        cursor += 1
+    return True
+
+
+class XhsFormListing(TaobaoListing):
+    """Fill Xiaohongshu category data, presale, batch fields and 3:4 main art."""
+
+    # XHS remote selects render an exact server-search result as an Element
+    # ``created`` option even though the control is not free-form.  It is safe
+    # to click only because the inherited matcher still requires one exact,
+    # visible and enabled DOM option, followed by value readback.
+    allow_created_exact_dom_option = True
+
+    async def _wait_for_loading_masks(self, timeout_seconds: float = 45) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                if await self.drawer.locator(".el-loading-mask:visible").count() == 0:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        raise XhsFormListingError("小红书资料加载遮罩在 45 秒内未消失")
+
+    async def open(self) -> "XhsFormListing":
+        tab = self.drawer.get_by_role("tab", name="小红书资料", exact=True)
+        try:
+            await tab.wait_for(state="visible", timeout=30_000)
+            if (await tab.get_attribute("aria-selected") or "").casefold() != "true":
+                await tab.click(timeout=30_000)
+            panel = self.drawer.get_by_role("tabpanel", name="小红书资料", exact=True)
+            await panel.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise XhsFormListingError("找不到可切换的“小红书资料”页签") from exc
+        self.panel = panel
+        await self._wait_for_loading_masks()
+        if self.logger is not None:
+            self.logger.info("小红书资料页签已打开")
+        return self
+
+    async def _category_dialog(self) -> Any:
+        visible_dialogs = self.page.locator(".el-dialog:visible")
+        matches = []
+        for index in range(await visible_dialogs.count()):
+            dialog = visible_dialogs.nth(index)
+            if normalize_label(await dialog.inner_text()).startswith(normalize_label("修改类目")):
+                matches.append(dialog)
+        if len(matches) == 1:
+            return matches[0]
+
+        role_dialogs = self.page.get_by_role("dialog", name="修改类目", exact=True)
+        visible_roles = []
+        for index in range(await role_dialogs.count()):
+            dialog = role_dialogs.nth(index)
+            if await dialog.is_visible():
+                visible_roles.append(dialog)
+        if len(visible_roles) == 1:
+            return visible_roles[0]
+        raise XhsFormListingError("小红书修改类目弹窗不是唯一项：{0}".format(len(matches)))
+
+    async def _category_search_input(self, dialog: Any) -> Any:
+        inputs = dialog.locator('input:not([type="hidden"]):visible')
+        if await inputs.count() != 1:
+            raise XhsFormListingError(
+                "小红书修改类目弹窗搜索框不是唯一项：{0}".format(await inputs.count())
+            )
+        return inputs.first
+
+    async def _category_result_nodes(self) -> List[Tuple[Any, str]]:
+        """Read category search rows from the page-level Element portal.
+
+        Element mounts the result list next to ``body`` rather than beneath the
+        ``修改类目`` dialog.  Looking only inside the dialog made a visible
+        result list appear empty to the automation.  Keep this list narrow to
+        real option rows, rather than searching arbitrary dialog text.
+        """
+        nodes = self.page.locator(XHS_CATEGORY_RESULT_SELECTOR)
+        found: List[Tuple[Any, str]] = []
+        seen = set()
+        for index in range(await nodes.count()):
+            node = nodes.nth(index)
+            text = " ".join((await node.inner_text()).split())
+            key = _category_normalized(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            found.append((node, text))
+        return found
+
+    @staticmethod
+    def _choose_category_text(
+        result_texts: Sequence[str], category_path: Sequence[str]
+    ) -> Tuple[str, str]:
+        """Select a single exact platform route from the Excel category path.
+
+        A page may return a ready-made platform path such as
+        ``男装 > 休闲裤 > 工装休闲裤``.  Prefer a complete ordered match.  Some
+        source workbooks include an internal middle category that Xiaohongshu
+        does not expose; in that case an exact first segment plus an exact,
+        unique final leaf is still deterministic and is explicitly recorded in
+        the report.  Any duplicate or incomplete result remains an error.
+        """
+        expected = tuple(normalize_label(part) for part in category_path)
+        complete = [
+            text
+            for text in result_texts
+            if _contains_ordered_parts(_category_parts(text), expected)
+        ]
+        if len(complete) == 1:
+            return complete[0], "full_ordered_path"
+        if len(complete) > 1:
+            raise XhsFormListingError(
+                "小红书类目完整路径不是唯一精确项：{0}".format(len(complete))
+            )
+
+        # Platform taxonomies can omit a supplier-internal middle layer.  This
+        # fallback still requires both Excel endpoints to be exact and unique;
+        # it never selects merely because a string contains a category word.
+        if len(expected) >= 2:
+            root_leaf = [
+                text
+                for text in result_texts
+                if expected[0] in _category_parts(text)
+                and _category_parts(text)
+                and _category_parts(text)[-1] == expected[-1]
+            ]
+            if len(root_leaf) == 1:
+                return root_leaf[0], "first_and_leaf_exact"
+            if len(root_leaf) > 1:
+                raise XhsFormListingError(
+                    "小红书类目首段和末级叶子不是唯一精确项：{0}".format(
+                        len(root_leaf)
+                    )
+                )
+        raise XhsFormListingError("小红书类目搜索结果中没有 Excel 的完整或唯一首末级路径")
+
+    @staticmethod
+    def _category_paths_from_json(payload: Any) -> Tuple[str, ...]:
+        """Extract only display paths from FastMai's read-only category JSON."""
+        if not isinstance(payload, Mapping):
+            return ()
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return ()
+        records = data.get("records")
+        if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+            return ()
+        paths: List[str] = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            raw_parts = record.get("categoryNameList")
+            if not isinstance(raw_parts, Sequence) or isinstance(
+                raw_parts, (str, bytes)
+            ):
+                continue
+            parts = tuple(str(part).strip() for part in raw_parts if str(part).strip())
+            if parts:
+                rendered = " > ".join(parts)
+                if rendered not in paths:
+                    paths.append(rendered)
+        return tuple(paths)
+
+    async def _wait_for_category_result(
+        self, category_path: Sequence[str], json_paths: Sequence[str]
+    ) -> Tuple[Any, str, str]:
+        deadline = asyncio.get_running_loop().time() + 45
+        last_results: List[Tuple[Any, str]] = []
+        while asyncio.get_running_loop().time() < deadline:
+            last_results = await self._category_result_nodes()
+            if json_paths and last_results:
+                try:
+                    target_text, strategy = self._choose_category_text(
+                        json_paths, category_path
+                    )
+                except XhsFormListingError as exc:
+                    # JSON ambiguity is already complete evidence: do not
+                    # wait for a DOM race to choose an arbitrary row.
+                    if "不是唯一" in str(exc):
+                        raise
+                    await asyncio.sleep(0.15)
+                    continue
+                matches = [
+                    (node, text)
+                    for node, text in last_results
+                    if _category_normalized(text) == _category_normalized(target_text)
+                ]
+                if len(matches) == 1:
+                    node, text = matches[0]
+                    return node, text, strategy
+                if len(matches) > 1:
+                    raise XhsFormListingError(
+                        "小红书类目 JSON 对应的 DOM 行不是唯一项：{0}".format(
+                            len(matches)
+                        )
+                    )
+            await asyncio.sleep(0.15)
+        if not json_paths:
+            raise XhsFormListingError("小红书类目搜索 JSON 在 45 秒内未返回候选")
+        rendered = "；".join(text for _node, text in last_results[:12])
+        raise XhsFormListingError(
+            "小红书类目 JSON 已定位，但对应 DOM 行未出现：{0}".format(
+                rendered or "页面未返回候选"
+            )
+        )
+
+    async def _click_category_segment(self, segment: str) -> None:
+        """Fallback for a true cascader: click one exact visible child label."""
+        deadline = asyncio.get_running_loop().time() + 45
+        wanted = normalize_label(segment)
+        while asyncio.get_running_loop().time() < deadline:
+            results = await self._category_result_nodes()
+            matches = [
+                node
+                for node, text in results
+                if normalize_label(text) == wanted
+            ]
+            if len(matches) == 1:
+                await matches[0].scroll_into_view_if_needed()
+                await matches[0].click(timeout=10_000)
+                await self._wait_for_loading_masks()
+                return
+            if len(matches) > 1:
+                raise XhsFormListingError(
+                    "小红书类目层级“{0}”不是唯一精确项：{1}".format(
+                        segment, len(matches)
+                    )
+                )
+            await asyncio.sleep(0.15)
+        raise XhsFormListingError(
+            "小红书类目搜索/下级菜单未出现精确项：{0}".format(segment)
+        )
+
+    @staticmethod
+    def _selected_category_text(dialog_text: str) -> str:
+        for line in reversed(dialog_text.splitlines()):
+            match = re.match(r"^\s*已选\s*[：:]\s*(.*?)\s*$", line)
+            if match:
+                return match.group(1)
+        return ""
+
+    async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
+        """Search the first Excel segment, then verify the complete route."""
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        path = tuple(str(item).strip() for item in category_path if str(item).strip())
+        if not path:
+            raise XhsFormListingError("Excel 小红书商品分类没有可选择的层级")
+        modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+        if await modify.count() != 1:
+            raise XhsFormListingError("小红书页面找不到唯一的“修改类目”按钮")
+        started = asyncio.get_running_loop().time()
+        await modify.click(timeout=30_000)
+        dialog = await self._category_dialog()
+        search = await self._category_search_input(dialog)
+        json_paths: List[str] = []
+        response_tasks: List[asyncio.Task[Any]] = []
+
+        async def capture_category_response(response: Any) -> None:
+            try:
+                if XHS_CATEGORY_QUERY_PATH not in response.url:
+                    return
+                headers = await response.all_headers()
+                content_type = str(headers.get("content-type") or "").casefold()
+                if "json" not in content_type:
+                    return
+                for rendered in self._category_paths_from_json(await response.json()):
+                    if rendered not in json_paths:
+                        json_paths.append(rendered)
+            except Exception:
+                # A response can be aborted while the keyword is being typed;
+                # the completed category response remains the only evidence we
+                # use for a DOM click.
+                return
+
+        def on_category_response(response: Any) -> None:
+            response_tasks.append(asyncio.create_task(capture_category_response(response)))
+
+        self.page.on("response", on_category_response)
+        try:
+            # Only the actual search-result portal is scanned.  The page also
+            # keeps a large cascader tree in the DOM; enumerating that tree was
+            # the source of a 25+ second delay and is not valid click evidence.
+            search_term = path[0]
+            await search.fill(search_term, timeout=10_000)
+            search_filled_at = asyncio.get_running_loop().time()
+            target, target_text, strategy = await self._wait_for_category_result(
+                path, json_paths
+            )
+            result_ready_at = asyncio.get_running_loop().time()
+            await target.scroll_into_view_if_needed()
+            await target.click(timeout=10_000)
+            clicked = tuple(path)
+        finally:
+            self.page.remove_listener("response", on_category_response)
+            if response_tasks:
+                await asyncio.gather(*response_tasks, return_exceptions=True)
+
+        selected = ""
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            selected = self._selected_category_text(await dialog.inner_text())
+            if selected:
+                break
+            await asyncio.sleep(0.1)
+        selected_parts = _category_parts(selected)
+        expected_parts = tuple(normalize_label(segment) for segment in path)
+        selected_ok = _contains_ordered_parts(selected_parts, expected_parts)
+        if strategy == "first_and_leaf_exact":
+            selected_ok = (
+                expected_parts[0] in selected_parts
+                and bool(selected_parts)
+                and selected_parts[-1] == expected_parts[-1]
+            )
+        if not selected_ok:
+            raise XhsFormListingError(
+                "小红书类目确认前路径不匹配：目标 {0}，页面为 {1!r}".format(
+                    " / ".join(path), selected
+                )
+            )
+
+        confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+        if await confirm.count() != 1:
+            raise XhsFormListingError("小红书修改类目弹窗找不到唯一“确定”按钮")
+        await confirm.click(timeout=10_000)
+        await dialog.wait_for(state="hidden", timeout=30_000)
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        if self.logger is not None:
+            self.logger.info(
+                "已按 Excel 层级选择小红书类目：%s；页面路径：%s；规则：%s；"
+                "耗时：弹窗/输入 %.2fs，JSON+DOM %.2fs，总计 %.2fs",
+                " / ".join(path),
+                selected,
+                strategy,
+                search_filled_at - started,
+                result_ready_at - search_filled_at,
+                asyncio.get_running_loop().time() - started,
+            )
+        return {
+            "path": path,
+            "clicked_segments": tuple(clicked),
+            "selected": selected,
+            "matched_result": target_text,
+            "search_term": search_term,
+            "strategy": strategy,
+            "json_candidate_count": len(json_paths),
+        }
+
+    async def _heading_vertical_bounds(self) -> Tuple[Optional[float], Optional[float]]:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        start: Optional[float] = None
+        end: Optional[float] = None
+        headings = self.panel.get_by_text(
+            re.compile(r"^\s*(?:商品属性|价格库存)\s*[：:]?\s*$")
+        )
+        for index in range(await headings.count()):
+            heading = headings.nth(index)
+            if not await heading.is_visible():
+                continue
+            text = re.sub(r"\s*[：:]\s*$", "", (await heading.inner_text()).strip())
+            box = await heading.bounding_box()
+            if box is None:
+                continue
+            if text == "商品属性":
+                start = box["y"]
+            elif XHS_ATTRIBUTE_END_HEADINGS.fullmatch(text):
+                if start is not None and box["y"] > start:
+                    end = box["y"] if end is None else min(end, box["y"])
+        return start, end
+
+    async def _attribute_items(self) -> Dict[str, Tuple[str, Any]]:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        top, end = await self._heading_vertical_bounds()
+        items = self.panel.locator(".el-form-item:visible")
+        result: Dict[str, Tuple[str, Any]] = {}
+        counts: Dict[str, int] = {}
+        for index in range(await items.count()):
+            item = items.nth(index)
+            label_node = item.locator(":scope > .el-form-item__label").first
+            if not await label_node.count():
+                label_node = item.locator(".el-form-item__label").first
+            if not await label_node.count() or not await label_node.is_visible():
+                continue
+            box = await item.bounding_box()
+            if box is not None:
+                if top is not None and box["y"] <= top:
+                    continue
+                if end is not None and box["y"] >= end:
+                    continue
+            label = re.sub(r"^\s*\*\s*", "", (await label_node.inner_text()).strip())
+            normalized = normalize_label(label)
+            if not normalized or normalized in XHS_INHERITED_FIELDS:
+                continue
+            counts[normalized] = counts.get(normalized, 0) + 1
+            key = normalized if counts[normalized] == 1 else "{0}#{1}".format(
+                normalized, counts[normalized]
+            )
+            result[key] = (label, item)
+        if not result:
+            raise XhsFormListingError("小红书商品属性区域为空或未渲染")
+        return result
+
+    @staticmethod
+    async def _attribute_is_required(item: Any) -> bool:
+        """Read Element's required marker without relying on CSS pseudo text."""
+        classes = set((await item.get_attribute("class") or "").split())
+        if "is-required" in classes:
+            return True
+        label = item.locator(":scope > .el-form-item__label").first
+        if not await label.count():
+            label = item.locator(".el-form-item__label").first
+        return bool(
+            await label.count()
+            and re.match(r"^\s*\*", (await label.inner_text()).strip())
+        )
+
+    async def _attribute_assignments(
+        self,
+        fields: Mapping[str, str],
+        page_items: Mapping[str, Tuple[str, Any]],
+    ) -> Dict[str, Tuple[str, str]]:
+        # An explicitly named Excel column wins over an alias.  For example,
+        # a source sheet can contain both ``厚度=常规款`` and ``厚薄=常规``;
+        # Xiaohongshu's field is ``厚薄`` and must use the latter rather than
+        # treating the two source concepts as conflicting values.
+        direct_sources: Dict[str, List[Tuple[str, str]]] = {}
+        alias_sources: Dict[str, List[Tuple[str, str]]] = {}
+        for excel_key, raw_value in fields.items():
+            aliases = set(excel_aliases(excel_key))
+            for normalized_page, (page_label, _item) in page_items.items():
+                base = normalized_page.split("#", 1)[0]
+                if base in aliases:
+                    direct_sources.setdefault(normalized_page, []).append(
+                        (str(excel_key), str(raw_value).strip())
+                    )
+                elif aliases.intersection(XHS_FIELD_ALIASES.get(base, ())):
+                    alias_sources.setdefault(normalized_page, []).append(
+                        (str(excel_key), str(raw_value).strip())
+                    )
+        assignments: Dict[str, Tuple[str, str]] = {}
+        for normalized_page, (page_label, _item) in page_items.items():
+            matches = direct_sources.get(normalized_page) or alias_sources.get(
+                normalized_page, ()
+            )
+            if not matches:
+                continue
+            values = {value for _key, value in matches}
+            if len(values) != 1:
+                raise XhsFormListingError(
+                    "小红书属性“{0}”匹配到多个 Excel 字段：{1}".format(
+                        page_label, "、".join(key for key, _value in matches)
+                    )
+                )
+            assignments[normalized_page] = (page_label, matches[0][1])
+        return assignments
+
+    @staticmethod
+    def _special_attribute_values(
+        fields: Mapping[str, str], page_label: str, expected: str
+    ) -> Optional[Tuple[str, ...]]:
+        normalized = normalize_label(page_label)
+        if normalized in {normalize_label("面料"), normalize_label("材质成分")}:
+            try:
+                materials = (
+                    parse_taobao_fabrics(fields)
+                    if normalized == normalize_label("面料")
+                    else parse_taobao_materials(fields)
+                )
+            except TaobaoListingError as exc:
+                raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
+            values = tuple(component.name for component in materials)
+            return values or None
+        if normalized == normalize_label("是否加绒"):
+            mapped = {"是": "加绒", "否": "不加绒"}.get(str(expected).strip())
+            return (mapped,) if mapped else None
+        return None
+
+    async def _fill_attribute(
+        self,
+        page_label: str,
+        item: Any,
+        expected: str,
+        *,
+        exact_values: Optional[Sequence[str]] = None,
+        required: bool = True,
+    ) -> Optional[Tuple[str, ...]]:
+        await item.scroll_into_view_if_needed()
+        selects = item.locator(".el-select:visible")
+        if await selects.count() != 1:
+            raise XhsFormListingError(
+                "小红书属性“{0}”下拉框不是唯一项：{1}".format(
+                    page_label, await selects.count()
+                )
+            )
+        select = selects.first
+        multi = await select.locator(".el-select__tags").count() > 0
+        groups = (
+            tuple((str(value),) for value in exact_values)
+            if exact_values is not None
+            else selection_value_groups(page_label, expected)
+        )
+        if not groups:
+            raise XhsFormListingError("小红书属性“{0}”期望值为空".format(page_label))
+        if not multi and len(groups) != 1:
+            raise XhsFormListingError(
+                "小红书属性“{0}”是单选，Excel 却提供多个逗号分组".format(page_label)
+            )
+        try:
+            actual = await self._select_values(select, groups, label=page_label, multi=multi)
+        except TaobaoListingError as exc:
+            raise XhsFormListingError(
+                "小红书属性“{0}”选择失败：{1}".format(
+                    page_label, str(exc).replace("淘宝", "小红书")
+                )
+            ) from exc
+        if actual is None and len(groups) == 1:
+            # Xiaohongshu's remote selects can expose an exact, clickable DOM
+            # option as ``created`` even when Element's caninputcustom flag is
+            # false.  The shared Taobao helper correctly refuses that shape;
+            # for XHS we may still click it when the visible text is uniquely
+            # exact, then require a successful control readback.
+            actual = await self._select_unique_exact_dom_option(
+                select,
+                groups[0],
+                page_label=page_label,
+                multi=multi,
+            )
+        if actual is None:
+            candidates = " / ".join("/".join(group) for group in groups)
+            if not required:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "小红书可选属性“%s”没有 Excel 值的精确候选，已跳过：%s",
+                        page_label,
+                        candidates,
+                    )
+                return None
+            raise XhsFormListingError(
+                "小红书属性“{0}”没有 Excel 值的精确候选：{1}".format(
+                    page_label, candidates
+                )
+            )
+        return actual
+
+    async def _select_unique_exact_dom_option(
+        self,
+        select: Any,
+        candidates: Sequence[str],
+        *,
+        page_label: str,
+        multi: bool,
+    ) -> Optional[Tuple[str, ...]]:
+        try:
+            await self._open_select(select, multi=multi)
+            dropdown, options = await self._visible_dom_options(
+                select, timeout_seconds=2
+            )
+        except TaobaoListingError:
+            return None
+        matches = [
+            (candidate, option)
+            for candidate in candidates
+            for option in options
+            if normalize_option(option.get("name", ""))
+            == normalize_option(candidate)
+        ]
+        if len(matches) != 1:
+            await self._dismiss_select_dropdown(select)
+            return None
+        candidate, option = matches[0]
+        clicked = await dropdown.evaluate(
+            """(element, index) => {
+              const option = element.querySelectorAll(
+                '.el-select-dropdown__item'
+              )[index];
+              if (!option || option.classList.contains('is-disabled')) return false;
+              option.scrollIntoView({block: 'nearest'});
+              option.click();
+              return true;
+            }""",
+            int(option["index"]),
+        )
+        if not clicked:
+            return None
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            actual = await self._read_select_values(select, multi=multi)
+            if any(
+                normalize_option(value) == normalize_option(candidate)
+                for value in actual
+            ):
+                await self._dismiss_select_dropdown(select)
+                if self.logger is not None:
+                    self.logger.info(
+                        "小红书属性“%s”已通过唯一精确 DOM 候选填写：%s",
+                        page_label,
+                        candidate,
+                    )
+                return actual
+            await asyncio.sleep(0.05)
+        await self._dismiss_select_dropdown(select)
+        return None
+
+    async def fill_category_attributes(self, fields: XhsFields) -> Mapping[str, Any]:
+        page_items = await self._attribute_items()
+        assignments = await self._attribute_assignments(fields.fields, page_items)
+        applied: Dict[str, Tuple[str, ...]] = {}
+        skipped: Dict[str, str] = {}
+        for normalized_page, (page_label, item) in page_items.items():
+            assignment = assignments.get(normalized_page)
+            if assignment is None:
+                continue
+            _source_label, expected = assignment
+            actual = await self._fill_attribute(
+                page_label,
+                item,
+                expected,
+                exact_values=self._special_attribute_values(fields.fields, page_label, expected),
+                required=await self._attribute_is_required(item),
+            )
+            if actual is None:
+                skipped[page_label] = expected
+            else:
+                applied[page_label] = actual
+        if self.logger is not None:
+            self.logger.info("小红书类目属性填写完成：已填 %s 项", len(applied))
+        return {
+            "attributes": applied,
+            "skipped_no_exact_candidate": skipped,
+            "unmatched_page_fields": tuple(
+                page_label
+                for normalized_page, (page_label, _item) in page_items.items()
+                if normalized_page not in assignments
+            ),
+        }
+
+    async def _find_named_input(self, label: str) -> Any:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        direct = self.panel.locator('[data-xhs-field="{0}"] input:visible'.format(label))
+        if await direct.count() == 1:
+            return direct.first
+        label_nodes = self.panel.get_by_text(
+            re.compile(r"^\s*\*?\s*{0}\s*[：:]?\s*$".format(re.escape(label)))
+        )
+        matches = []
+        for index in range(await label_nodes.count()):
+            node = label_nodes.nth(index)
+            if not await node.is_visible():
+                continue
+            root = node
+            for _depth in range(5):
+                inputs = root.locator('input:not([type="hidden"]):visible')
+                if await inputs.count() == 1:
+                    matches.append(inputs.first)
+                    break
+                root = root.locator("xpath=..")
+        if len(matches) != 1:
+            raise XhsFormListingError(
+                "小红书字段“{0}”输入框不是唯一项：{1}".format(label, len(matches))
+            )
+        return matches[0]
+
+    async def fill_identity(self, title: str, style_code: str) -> Mapping[str, str]:
+        expected_title = title_without_neigborl(title)
+        if not expected_title:
+            raise XhsFormListingError("移除 NEIGBORL 后小红书商品标题为空")
+        if re.search(r"neigborl", expected_title, re.IGNORECASE):
+            raise XhsFormListingError("小红书商品标题仍包含 NEIGBORL")
+        if len(expected_title) > 60:
+            raise XhsFormListingError(
+                "移除 NEIGBORL 后小红书商品标题仍超过 60 字：{0}".format(len(expected_title))
+            )
+        expected = {"商品标题": expected_title, "货号": str(style_code).strip()}
+        actual: Dict[str, str] = {}
+        for label, value in expected.items():
+            if not value:
+                raise XhsFormListingError("小红书{0}不能为空".format(label))
+            control = await self._find_named_input(label)
+            if (await control.input_value()).strip() != value:
+                await control.fill(value)
+                await control.press("Tab")
+            current = (await control.input_value()).strip()
+            if current != value:
+                raise XhsFormListingError(
+                    "小红书{0}回读失败：期望 {1!r}，页面为 {2!r}".format(
+                        label, value, current
+                    )
+                )
+            actual[label] = current
+        if re.search(r"neigborl", actual["商品标题"], re.IGNORECASE):
+            raise XhsFormListingError("小红书商品标题回读仍包含 NEIGBORL")
+        return actual
+
+    async def _ensure_radio(self, option_text: str) -> str:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        options = self.panel.locator("label.el-radio:visible")
+        matches = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if normalize_label(await option.inner_text()) == normalize_label(option_text):
+                matches.append(option)
+        if len(matches) != 1:
+            raise XhsFormListingError(
+                "小红书单选项“{0}”不是唯一项：{1}".format(option_text, len(matches))
+            )
+        option = matches[0]
+        radio = option.locator('input[type="radio"]').first
+        if not await radio.is_checked():
+            await option.click()
+        if not await radio.is_checked():
+            raise XhsFormListingError("小红书单选项未生效：{0}".format(option_text))
+        return option_text
+
+    async def _presale_day_control(self) -> Tuple[Any, bool]:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        direct = self.panel.locator('[data-xhs-presale-days]:visible')
+        if await direct.count() == 1:
+            select = direct.first.locator(".el-select:visible")
+            return (select.first if await select.count() == 1 else direct.first, await select.count() == 1)
+        matches: List[Tuple[Any, bool]] = []
+        labels = self.panel.get_by_text(re.compile(r"^\s*(?:\*?\s*)?(?:预售发货时间|付款后)\s*[：:]?\s*$"))
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if not await label.is_visible():
+                continue
+            root = label
+            for _depth in range(5):
+                selects = root.locator(".el-select:visible")
+                inputs = root.locator('input:not([type="hidden"]):visible')
+                if await selects.count() == 1:
+                    matches.append((selects.first, True))
+                    break
+                if await inputs.count() == 1:
+                    matches.append((inputs.first, False))
+                    break
+                root = root.locator("xpath=..")
+        if len(matches) != 1:
+            raise XhsFormListingError(
+                "小红书预售发货天数控件不是唯一项：{0}".format(len(matches))
+            )
+        return matches[0]
+
+    async def apply_full_payment_presale(self) -> Mapping[str, str]:
+        full_mode = await self._ensure_radio("全款预售模式")
+        await self._wait_for_loading_masks()
+        timed_mode = await self._ensure_radio("时段预售")
+        control, is_select = await self._presale_day_control()
+        if is_select:
+            try:
+                actual_values = await self._select_values(
+                    control, (("15", "15天"),), label="预售发货时间", multi=False
+                )
+            except TaobaoListingError as exc:
+                raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
+            if actual_values is None:
+                raise XhsFormListingError("小红书预售发货时间没有“15天”精确候选")
+            days = actual_values[0]
+        else:
+            current = (await control.input_value()).strip()
+            if not _numeric_equal(current, "15"):
+                await control.fill("15")
+                await control.press("Tab")
+            days = (await control.input_value()).strip()
+            if not _numeric_equal(days, "15"):
+                raise XhsFormListingError(
+                    "小红书预售发货时间回读失败：期望 15，页面为 {0!r}".format(days)
+                )
+        return {"发货模式": full_mode, "预售类型": timed_mode, "付款后": days}
+
+    async def _batch_input(self, label: str) -> Any:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        direct = self.panel.locator('[data-xhs-batch-field="{0}"] input:visible'.format(label))
+        if await direct.count() == 1:
+            return direct.first
+        button = self.panel.get_by_role("button", name="批量设置", exact=True)
+        if await button.count() != 1:
+            raise XhsFormListingError("小红书“批量设置”按钮不是唯一项：{0}".format(await button.count()))
+        root = button.first
+        for _depth in range(1, 8):
+            root = root.locator("xpath=..")
+            if await root.locator(".el-table, table").count():
+                continue
+            inputs = root.locator('input:not([type="hidden"]):not([readonly]):visible')
+            count = await inputs.count()
+            if len(XHS_BATCH_ORDER) <= count <= 5:
+                return inputs.nth(XHS_BATCH_ORDER.index(label))
+        raise XhsFormListingError("小红书批量字段“{0}”输入框未找到".format(label))
+
+    async def _fill_batch_number(self, label: str, expected: str) -> str:
+        if not _is_nonnegative_decimal(expected):
+            raise XhsFormListingError("Excel 小红书{0}不是非负数字：{1!r}".format(label, expected))
+        control = await self._batch_input(label)
+        current = (await control.input_value()).strip()
+        if not _numeric_equal(current, expected):
+            await control.fill(expected)
+            await control.press("Tab")
+        actual = (await control.input_value()).strip()
+        if not _numeric_equal(actual, expected):
+            raise XhsFormListingError(
+                "小红书批量字段“{0}”回读失败：期望 {1!r}，页面为 {2!r}".format(
+                    label, expected, actual
+                )
+            )
+        return actual
+
+    async def _sku_table_snapshot(self) -> Mapping[str, Any]:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        tables = self.panel.locator(".el-table:visible")
+        if await tables.count() == 0:
+            tables = self.panel.locator("table:visible")
+        matches = []
+        for index in range(await tables.count()):
+            table = tables.nth(index)
+            snapshot = await table.evaluate(
+                """root => {
+                  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                  const headers = Array.from(root.querySelectorAll(
+                    '.el-table__header-wrapper th, thead th'
+                  )).map(node => clean(node.innerText));
+                  const rows = Array.from(root.querySelectorAll(
+                    '.el-table__body-wrapper tbody tr, tbody tr'
+                  )).map(row => Array.from(row.querySelectorAll(':scope > td')).map(cell => {
+                    const inputs = Array.from(cell.querySelectorAll('input'))
+                      .filter(input => input.type !== 'checkbox' && input.type !== 'radio')
+                      .map(input => clean(input.value));
+                    return inputs.length ? inputs.join('|') : clean(cell.innerText);
+                  }));
+                  return {headers, rows};
+                }"""
+            )
+            normalized = tuple(normalize_label(value) for value in snapshot.get("headers", ()))
+            if all(
+                any(header == normalize_label(label) or header.startswith(normalize_label(label)) for header in normalized)
+                for label in ("售价", "库存")
+            ):
+                matches.append(snapshot)
+        if len(matches) != 1:
+            raise XhsFormListingError("小红书 SKU 表格不是唯一项：{0}".format(len(matches)))
+        return matches[0]
+
+    @staticmethod
+    def _sku_column_index(headers: Sequence[str], label: str) -> int:
+        expected = normalize_label(label)
+        indexes = [
+            index for index, value in enumerate(headers)
+            if normalize_label(value) == expected or normalize_label(value).startswith(expected)
+        ]
+        if len(indexes) != 1:
+            raise XhsFormListingError(
+                "小红书 SKU 表格列“{0}”不是唯一项：{1}".format(label, indexes)
+            )
+        return indexes[0]
+
+    def _validate_sku_snapshot(
+        self, snapshot: Mapping[str, Any], expected: Mapping[str, str]
+    ) -> Tuple[Mapping[str, str], ...]:
+        headers = tuple(str(value) for value in snapshot.get("headers", ()))
+        rows = tuple(snapshot.get("rows", ()))
+        if not rows:
+            raise XhsFormListingError("小红书 SKU 表格没有可校验的明细行")
+        indexes = {label: self._sku_column_index(headers, label) for label in expected}
+        result = []
+        errors = []
+        for number, raw_row in enumerate(rows, 1):
+            actual = {
+                label: str(raw_row[index]) if index < len(raw_row) else ""
+                for label, index in indexes.items()
+            }
+            for label, expected_value in expected.items():
+                if not _numeric_equal(actual[label], expected_value):
+                    errors.append("第{0}行{1}={2!r}".format(number, label, actual[label]))
+            result.append(actual)
+        if errors:
+            raise XhsFormListingError("小红书批量设置后校验失败：" + "；".join(errors[:12]))
+        return tuple(result)
+
+    async def fill_price_inventory_batch(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
+        expected = {
+            "售价": _required_excel_value(fields, ("售价", "售卖价", "价格", "基本售价"), "售价"),
+            "库存": _required_excel_value(fields, ("数量", "库存"), "库存"),
+        }
+        inventory = Decimal(expected["库存"])
+        if not inventory.is_finite() or inventory < 0 or inventory % 1:
+            raise XhsFormListingError("Excel 小红书库存必须是非负整数：{0!r}".format(expected["库存"]))
+        for label, value in expected.items():
+            await self._fill_batch_number(label, value)
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        button = self.panel.get_by_role("button", name="批量设置", exact=True)
+        if await button.count() != 1:
+            raise XhsFormListingError("小红书“批量设置”按钮不是唯一项：{0}".format(await button.count()))
+        await button.click()
+        deadline = asyncio.get_running_loop().time() + 15
+        last_error: Optional[Exception] = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                rows = self._validate_sku_snapshot(await self._sku_table_snapshot(), expected)
+                return {
+                    "batch_clicked": True,
+                    "row_count": len(rows),
+                    "values": expected,
+                    "rows": rows,
+                }
+            except XhsFormListingError as exc:
+                last_error = exc
+                await asyncio.sleep(0.15)
+        raise XhsFormListingError(str(last_error or "小红书批量设置超时"))
+
+    async def _main_image_item(self) -> Any:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        direct = self.panel.locator('[data-xhs-image-group="main"]:visible')
+        if await direct.count() == 1:
+            return direct.first
+        labels = self.panel.get_by_text(re.compile(r"^\s*\*?\s*主图\s*[：:]?\s*$"))
+        matches = []
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if not await label.is_visible():
+                continue
+            root = label
+            for _depth in range(8):
+                if await root.locator('input[type="file"]').count():
+                    matches.append(root)
+                    break
+                root = root.locator("xpath=..")
+        if len(matches) != 1:
+            raise XhsFormListingError("小红书主图上传区域不是唯一项：{0}".format(len(matches)))
+        return matches[0]
+
+    async def sync_main_images(
+        self,
+        portrait_paths: Sequence[Any],
+        *,
+        timeout_seconds: int,
+        uploader: Any,
+    ) -> Mapping[str, Any]:
+        """Replace XHS main art with the product's 3:4 source images."""
+        paths = tuple(portrait_paths)
+        if not paths:
+            raise XhsFormListingError("小红书没有可上传的 3:4 主图")
+        item = await self._main_image_item()
+        action = await uploader(
+            self.page,
+            item,
+            paths,
+            "小红书3:4主图",
+            timeout_seconds,
+            force_replace=True,
+        )
+        return {"source": "3:4主图", "count": len(paths), "action": action}
+
+    async def apply_excel_fields(
+        self,
+        fields: XhsFields,
+        *,
+        title: str,
+        style_code: str,
+        portrait_paths: Sequence[Any],
+        timeout_seconds: int,
+        uploader: Any,
+    ) -> Mapping[str, Any]:
+        category = await self.apply_category(fields.category_path)
+        identity = await self.fill_identity(title, style_code)
+        attributes = await self.fill_category_attributes(fields)
+        presale = await self.apply_full_payment_presale()
+        batch = await self.fill_price_inventory_batch(fields.fields)
+        images = await self.sync_main_images(
+            portrait_paths, timeout_seconds=timeout_seconds, uploader=uploader
+        )
+        try:
+            errors = await self._visible_validation_errors()
+        except TaobaoListingError as exc:
+            raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
+        if errors:
+            raise XhsFormListingError("小红书页面校验错误：" + "；".join(errors))
+        return {
+            "category": category,
+            "identity": identity,
+            "attributes": attributes,
+            "presale": presale,
+            "sku_batch": batch,
+            "main_images": images,
+        }

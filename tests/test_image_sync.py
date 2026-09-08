@@ -37,12 +37,15 @@ FIXTURE = """
 """
 
 
-def fixture_html(existing_count: int, include_control: bool = True) -> str:
+def fixture_html(existing_count: int, include_control: bool = True, accept: str = "") -> str:
     images = "".join(
         '<div class="file-img"><button class="del-btn" onclick="removeImage(this)">删除</button></div>'
         for _ in range(existing_count)
     )
-    control = '<input id="upload" type="file" multiple onchange="recordFiles(this)">' if include_control else ""
+    control = (
+        '<input id="upload" type="file" multiple accept="{0}" onchange="recordFiles(this)">'.format(accept)
+        if include_control else ""
+    )
     return FIXTURE.format(images=images, control=control)
 
 
@@ -80,6 +83,83 @@ class ImageSyncBrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await page.evaluate("window.inputChangeCount"), 0)
             await page.close()
 
+    async def test_force_replace_reuploads_equal_count_in_requested_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("third.png", "second.png", "first.png")]
+            for path in paths:
+                path.write_bytes(b"image")
+            page = await self.browser.new_page()
+            await page.set_content(fixture_html(3))
+
+            result = await kuaimai_erp.sync_image_group(
+                page,
+                page.locator("#scope"),
+                paths,
+                "天猫商品图片",
+                timeout_seconds=2,
+                force_replace=True,
+            )
+
+            self.assertEqual(result, "replaced")
+            self.assertEqual(await page.evaluate("window.deleteCount"), 3)
+            self.assertEqual(await page.evaluate("window.inputChangeCount"), 1)
+            self.assertEqual(
+                await page.evaluate("window.uploadNames"), [path.name for path in paths]
+            )
+            await page.close()
+
+    async def test_equal_count_replaces_one_blank_placeholder_image(self):
+        import base64
+
+        import cv2
+        import numpy as np
+
+        blank = np.full((24, 24, 3), (252, 251, 250), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", blank)
+        self.assertTrue(ok)
+        source = "data:image/png;base64," + base64.b64encode(
+            encoded.tobytes()
+        ).decode("ascii")
+        page = await self.browser.new_page()
+        await page.set_content(
+            """
+            <div id="scope"><div class="sc-upload" id="images">
+              <div class="file-img"><img class="originImg" src="%s">
+                <button class="del-btn" onclick="this.closest('.file-img').remove()">删除</button>
+              </div>
+              <input id="upload" type="file" multiple onchange="recordFiles(this)">
+            </div></div>
+            <script>
+              window.deleteCount = 0;
+              window.inputChangeCount = 0;
+              function recordFiles(input) {
+                window.inputChangeCount++;
+                const image = document.createElement('div');
+                image.className = 'file-img';
+                document.querySelector('#images').appendChild(image);
+              }
+              document.addEventListener('click', event => {
+                if (event.target.classList.contains('del-btn')) window.deleteCount++;
+              });
+            </script>
+            """ % source
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "expected.png"
+            path.write_bytes(b"expected-image")
+            result = await kuaimai_erp.sync_image_group(
+                page,
+                page.locator("#scope"),
+                (path,),
+                "属性图片[军绿色]",
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(result, "replaced")
+        self.assertEqual(await page.evaluate("window.deleteCount"), 1)
+        self.assertEqual(await page.evaluate("window.inputChangeCount"), 1)
+        await page.close()
+
     async def test_mismatch_deletes_all_and_uploads_paths_in_order(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / name for name in ("image10.png", "image2.png", "image3.png")]
@@ -102,6 +182,28 @@ class ImageSyncBrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await page.locator(".file-img").count(), 1)
             self.assertEqual(await page.evaluate("window.deleteCount"), 0)
             self.assertEqual(await page.evaluate("window.inputChangeCount"), 1)
+            await page.close()
+
+    async def test_jfif_is_uploaded_with_tmall_accepted_jpg_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "vertical.jfif"
+            source.write_bytes(b"\xff\xd8\xfffixture")
+            page = await self.browser.new_page()
+            await page.set_content(
+                fixture_html(0, accept=".jpg,.jpeg,.png")
+            )
+
+            result = await kuaimai_erp.sync_image_group(
+                page,
+                page.locator("#scope"),
+                (source,),
+                "商品竖图",
+                timeout_seconds=2,
+            )
+
+            self.assertEqual(result, "replaced")
+            self.assertEqual(await page.evaluate("window.uploadNames"), ["upload-1.jpg"])
+            self.assertTrue(source.is_file())
             await page.close()
 
     async def test_empty_paths_are_rejected(self):

@@ -65,6 +65,31 @@ def _normalize_label(value: object) -> str:
     return re.sub(r"[\s*:：]+", "", text).casefold()
 
 
+# 只收录已经在真实平台下拉框确认过的确定性等价值。
+DOUYIN_VALUE_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
+    (_normalize_label("弹力"), normalize_option("无弹")): ("无弹力",),
+}
+
+
+def value_candidates(label: object, value: object) -> Tuple[str, ...]:
+    """按 Excel 顺序生成候选，并追加已确认的平台等价值。"""
+    text = str(value).strip()
+    alternatives = split_or_values(text)
+    source_candidates = alternatives or ((text,) if text else ())
+    candidates: List[str] = []
+    for source_candidate in source_candidates:
+        if source_candidate not in candidates:
+            candidates.append(source_candidate)
+        mapped = DOUYIN_VALUE_ALIASES.get(
+            (_normalize_label(label), normalize_option(source_candidate)),
+            (),
+        )
+        for candidate in mapped:
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return tuple(candidates)
+
+
 def _excel_aliases(value: object) -> Tuple[str, ...]:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     aliases = []
@@ -73,7 +98,11 @@ def _excel_aliases(value: object) -> Tuple[str, ...]:
         if not normalized:
             continue
         aliases.append(normalized)
-        historical_alias = {"裤门禁": "裤门襟"}.get(normalized)
+        historical_alias = {
+            "裤门禁": "裤门襟",
+            "服装版型": "服饰版型",
+            "服饰版型": "服装版型",
+        }.get(normalized)
         if historical_alias:
             aliases.append(_normalize_label(historical_alias))
     return tuple(dict.fromkeys(aliases))
@@ -438,21 +467,26 @@ class DouyinListing:
     async def _wait_for_field(self, label: str, timeout_seconds: float = 30) -> Any:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         wanted = _normalize_label(label)
+        label_pattern = re.compile(
+            rf"^\s*{re.escape(str(label).strip())}\s*[:：]?\s*$"
+        )
         while asyncio.get_running_loop().time() < deadline:
             scope = self.panel or self.drawer
             try:
-                items = scope.locator(".el-form-item")
-                for index in range(await items.count()):
-                    item = items.nth(index)
-                    labels = item.locator(
-                        ":scope > .el-form-item__label, :scope > label.el-form-item__label"
-                    )
-                    if not await labels.count():
+                # 通过标签内容构造可重新解析的 locator，不保留
+                # `.el-form-item.nth(index)`。Vue 异步插入属性时会改变索引，
+                # 旧 locator 就会改指到另一个字段并长时间等待不存在的控件。
+                labels = scope.locator(".el-form-item__label").filter(
+                    has_text=label_pattern
+                )
+                for index in range(await labels.count()):
+                    field_label = labels.nth(index)
+                    if _normalize_label(await field_label.inner_text()) != wanted:
                         continue
-                    if (
-                        _normalize_label(await labels.first.inner_text()) == wanted
-                        and await item.is_visible()
-                    ):
+                    item = field_label.locator(
+                        "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+                    )
+                    if await item.is_visible():
                         return item
             except Exception:
                 # Vue 切换类目时会短暂销毁子树，下一轮重新取 locator。
@@ -621,12 +655,35 @@ class DouyinListing:
         if self.panel is None:
             raise DouyinListingError("请先调用 open() 打开抖音资料")
         buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
-        try:
-            await buttons.first.wait_for(state="visible", timeout=30_000)
-        except Exception as exc:
-            raise DouyinListingError("抖音页面没有可用的预测类目") from exc
+        button = None
+        for index in range(await buttons.count()):
+            candidate = buttons.nth(index)
+            if await candidate.is_visible():
+                button = candidate
+                break
 
-        button = buttons.first
+        try:
+            current = await self._category_text()
+        except DouyinListingError:
+            current = ""
+        current_is_selected = bool(current) and not re.search(
+            r"^请选择.*类目$", current.strip()
+        )
+
+        # 已保存的商品在标题未变时通常不再显示“点击使用”。
+        # 此时已选类目就是最终值，不应再盲等预测按钮。
+        if button is None and current_is_selected:
+            if self.logger is not None:
+                self.logger.info("抖音页面无预测候选，沿用已选商品分类：%s", current)
+            return current
+
+        if button is None:
+            try:
+                await buttons.first.wait_for(state="visible", timeout=30_000)
+                button = buttons.first
+            except Exception as exc:
+                raise DouyinListingError("抖音页面没有可用的预测类目") from exc
+
         row = button.locator("xpath=ancestor::*[contains(@class, 'prediction-item')][1]")
         if not await row.count():
             row = button.locator("xpath=..")
@@ -635,10 +692,6 @@ class DouyinListing:
         if not expected:
             raise DouyinListingError("无法读取第一个抖音预测类目")
 
-        try:
-            current = await self._category_text()
-        except DouyinListingError:
-            current = ""
         normalize_path = lambda value: re.sub(r"[\s>]", "", value).casefold()
         if current and normalize_path(current) == normalize_path(expected):
             if self.logger is not None:
@@ -695,24 +748,26 @@ class DouyinListing:
         if self.panel is None:
             raise DouyinListingError("请先调用 open() 打开抖音资料")
         wanted = _normalize_label(label)
+        label_pattern = re.compile(
+            rf"^\s*{re.escape(str(label).strip())}\s*[:：]?\s*$"
+        )
         deadline = asyncio.get_running_loop().time() + 30
         while asyncio.get_running_loop().time() < deadline:
             controls: List[Tuple[Any, Any]] = []
-            items = self.panel.locator(".el-form-item")
-            for index in range(await items.count()):
-                item = items.nth(index)
+            labels = self.panel.locator(".el-form-item__label").filter(
+                has_text=label_pattern
+            )
+            for index in range(await labels.count()):
+                field_label = labels.nth(index)
+                if _normalize_label(await field_label.inner_text()) != wanted:
+                    continue
+                item = field_label.locator(
+                    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+                )
                 if not await item.is_visible():
                     continue
-                labels = item.locator(
-                    ":scope > .el-form-item__label, :scope > label.el-form-item__label"
-                )
-                if not await labels.count():
-                    continue
-                if _normalize_label(await labels.first.inner_text()) != wanted:
-                    continue
                 inputs = item.locator(
-                    ":scope > .el-form-item__content > input, "
-                    ":scope > .el-form-item__content > .el-input input"
+                    ":scope > .el-form-item__content input:not([type='hidden'])"
                 )
                 for input_index in range(await inputs.count()):
                     input_box = inputs.nth(input_index)
@@ -744,7 +799,12 @@ class DouyinListing:
         matching = []
         writable = []
         for item, input_box in controls:
-            current = (await input_box.input_value()).strip()
+            try:
+                current = (await input_box.input_value(timeout=5_000)).strip()
+            except Exception as exc:
+                raise DouyinListingError(
+                    f"抖音字段“{label}”输入控件在页面重绘后失效"
+                ) from exc
             if current == expected:
                 matching.append((item, input_box, current))
             if not await input_box.is_disabled() and await input_box.get_attribute("readonly") is None:
@@ -757,7 +817,7 @@ class DouyinListing:
             item, input_box, current = writable[0]
         elif len(controls) == 1:
             item, input_box = controls[0]
-            current = (await input_box.input_value()).strip()
+            current = (await input_box.input_value(timeout=5_000)).strip()
         else:
             raise DouyinListingError(
                 f"抖音字段“{label}”可写文本控件无法唯一确定"
@@ -770,7 +830,7 @@ class DouyinListing:
         await item.scroll_into_view_if_needed()
         await input_box.fill(expected)
         await input_box.press("Tab")
-        actual = (await input_box.input_value()).strip()
+        actual = (await input_box.input_value(timeout=5_000)).strip()
         if actual != expected:
             raise DouyinListingError(
                 f"抖音字段“{label}”填写后校验失败：期望 {expected!r}，页面为 {actual!r}"
@@ -1197,7 +1257,7 @@ class DouyinListing:
         if await selects.count():
             select = selects.first
             multi = await select.locator(".el-select__tags").count() > 0
-            alternatives = split_or_values(expected)
+            alternatives = value_candidates(label, expected)
             if not alternatives:
                 raise DouyinListingError(f"属性“{label}”期望值为空")
 
@@ -1214,29 +1274,36 @@ class DouyinListing:
 
             # “/”是 OR。抖音允许搜索创建值，但必须先检查所有 OR 候选
             # 中是否已有平台选项；例如 A/B 中 A 不存在、B 已存在时选 B，
-            # 不能抢先创建 A。API 缺失时再读取初始 DOM 候选。
+            # 不能抢先创建 A。API 可能只返回部分候选，所以斜杆值会再
+            # 合并页面初始 DOM 候选，然后按 Excel 从左到右取第一个真实匹配。
             existing_names = {
                 normalize_option(option.get("name", ""))
                 for option in (api_options or ())
             }
+            if len(alternatives) > 1:
+                try:
+                    await self._open_select(select, multi=multi)
+                    _dropdown, dom_options = await self._visible_dom_options(select)
+                    existing_names.update(
+                        normalize_option(option.get("name", ""))
+                        for option in dom_options
+                    )
+                except DouyinListingError as exc:
+                    if self.logger is not None:
+                        self.logger.info(
+                            "抖音属性“%s”：读取 DOM OR 候选失败，"
+                            "继续使用 API 候选：%s",
+                            label,
+                            exc,
+                        )
+                finally:
+                    await self._dismiss_select_dropdown(select)
+
             existing_alternatives = [
                 value
                 for value in alternatives
                 if normalize_option(value) in existing_names
             ]
-            if len(alternatives) > 1 and not existing_alternatives:
-                await self._open_select(select, multi=multi)
-                _dropdown, dom_options = await self._visible_dom_options(select)
-                await self._dismiss_select_dropdown(select)
-                dom_names = {
-                    normalize_option(option.get("name", ""))
-                    for option in dom_options
-                }
-                existing_alternatives = [
-                    value
-                    for value in alternatives
-                    if normalize_option(value) in dom_names
-                ]
 
             chosen_expected = (
                 existing_alternatives[0]
@@ -2193,8 +2260,6 @@ class DouyinListing:
         wanted_aliases = tuple(wanted_aliases_list)
         if not wanted_aliases:
             raise DouyinListingError("运费模板别名为空")
-        shop_payload, config_payload = await self._fetch_freight_payloads()
-        shops, templates_by_shop = _freight_api_data(shop_payload, config_payload)
 
         section = await self._section("运费模板")
         rows = section.locator(".set-ship")
@@ -2239,22 +2304,25 @@ class DouyinListing:
                     + "、".join(missing_labels)
                 )
 
-        # 所有店铺与模板先通过 API 唯一匹配，再修改页面。
-        assignments = []
+        # 先回读页面当前值。重复运行时如果所有店铺都已符合
+        # 配置，就不再请求运费只读接口；该接口偶发超时不应
+        # 阻断已经正确的全平台流程。
+        pending = []
+        applied: Dict[str, str] = {}
         preserved: Dict[str, str] = {}
         for store_name, row, select in visible_rows:
+            current = await self._read_select_values(select, multi=False)
             if target_names is not None and normalize_option(store_name) not in target_names:
                 if default_untargeted_template:
-                    assignments.append(
-                        (
-                            store_name,
-                            select,
-                            {"id": "", "name": default_untargeted_template},
-                            (),
-                        )
-                    )
+                    if matches_any(
+                        current,
+                        (default_untargeted_template,),
+                        normalize_option,
+                    ):
+                        applied[store_name] = current[0]
+                    else:
+                        pending.append((store_name, select, False))
                 else:
-                    current = await self._read_select_values(select, multi=False)
                     preserved[store_name] = current[0] if current else ""
                     if self.logger is not None:
                         self.logger.info(
@@ -2262,6 +2330,52 @@ class DouyinListing:
                             store_name,
                             preserved[store_name] or "<空>",
                         )
+                continue
+            if matches_any(current, wanted_aliases, normalize_option):
+                applied[store_name] = current[0]
+                continue
+            pending.append((store_name, select, True))
+
+        if not pending:
+            if self.logger is not None:
+                self.logger.info("所有店铺运费模板已匹配，跳过只读接口请求")
+            return {"applied": applied, "preserved": preserved}
+
+        shops: Tuple[Mapping[str, Any], ...] = ()
+        templates_by_shop: Mapping[str, Tuple[Mapping[str, str], ...]] = {}
+        api_available = False
+        if any(use_excel_template for _name, _select, use_excel_template in pending):
+            try:
+                shop_payload, config_payload = await self._fetch_freight_payloads()
+                shops, templates_by_shop = _freight_api_data(
+                    shop_payload,
+                    config_payload,
+                )
+                api_available = True
+            except DouyinListingError as exc:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "运费只读接口暂时不可用，改用当前店铺下拉框"
+                        "精确匹配：%s",
+                        exc,
+                    )
+
+        # 对当前值不符合的店铺，API 可用时先做店铺/模板唯一
+        # 匹配；API 超时时则仅在对应店铺的 DOM 下拉中精确选择。
+        assignments = []
+        for store_name, select, use_excel_template in pending:
+            if not use_excel_template:
+                assignments.append(
+                    (
+                        store_name,
+                        select,
+                        {"id": "", "name": str(default_untargeted_template)},
+                        (),
+                    )
+                )
+                continue
+            if not api_available:
+                assignments.append((store_name, select, None, ()))
                 continue
             store_matches = [
                 shop
@@ -2312,10 +2426,6 @@ class DouyinListing:
             _shop_id, chosen, options = qualified[0]
             assignments.append((store_name, select, chosen, options))
 
-        if not assignments:
-            raise DouyinListingError("所有可见店铺都没有 Excel 指定的运费模板")
-
-        applied: Dict[str, str] = {}
         for store_name, select, chosen, options in assignments:
             current = await self._read_select_values(select, multi=False)
             if chosen is not None:
