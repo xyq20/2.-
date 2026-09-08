@@ -172,11 +172,11 @@ class JdFormListing(YouzanFormListing):
             panel = self.drawer.get_by_role("tabpanel", name="京东资料", exact=True)
             await panel.wait_for(state="visible", timeout=30_000)
         except Exception as exc:
-            raise JdFormListingError("找不到可切换的“京东资料”页签") from exc
+            raise JdFormListingError("找不到可切换的京东资料页签") from exc
         self.panel = panel
         await self._raise_as_jd(super()._wait_for_loading_masks())
         if self.logger is not None:
-            self.logger.info("京东资料页签已打开")
+            self.logger.info('京东资料页签已打开')
         return self
 
     async def _category_text(self) -> str:
@@ -264,7 +264,7 @@ class JdFormListing(YouzanFormListing):
             raise JdFormListingError("请先打开京东资料")
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
         if await modify.count() != 1:
-            raise JdFormListingError("京东“修改类目”按钮不是唯一项")
+            raise JdFormListingError("京东修改类目按钮不是唯一项")
         await modify.click()
         dialog = self.page.get_by_role("dialog", name="修改类目", exact=True)
         try:
@@ -335,7 +335,7 @@ class JdFormListing(YouzanFormListing):
                 )
             )
         if self.logger is not None:
-            self.logger.info("京东类目 JSON 节点：%s", api_candidates)
+            self.logger.info('京东类目 JSON 节点：%s', api_candidates)
         # 快麦页面右下角助手浮层会间歇性遮住类目候选。
         # JSON 接口已确认该候选存在，因此直接触发这个唯一 DOM
         # 节点，避免 Playwright 因非业务浮层持续等待。
@@ -362,7 +362,7 @@ class JdFormListing(YouzanFormListing):
                   return result;
                 }"""
             )
-            self.logger.info("京东目标类目 DOM 结构：%s", structure)
+            self.logger.info('京东目标类目 DOM 结构：%s', structure)
         async def selection_state() -> Mapping[str, bool]:
             return await dialog.evaluate(
                 """(root, expected) => {
@@ -452,13 +452,13 @@ class JdFormListing(YouzanFormListing):
             if selected:
                 break
             if self.logger is not None:
-                self.logger.warning("京东类目第 %s 次点击未选中，继续重试", attempt + 1)
+                self.logger.warning('京东类目第 %s 次点击未选中，继续重试', attempt + 1)
             await asyncio.sleep(0.5)
         if not selected:
             raise JdFormListingError("京东类目 DOM 点击后未同时出现勾选与已选路径")
         confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
         if await confirm.count() != 1:
-            raise JdFormListingError("京东修改类目弹窗“确定”按钮不是唯一项")
+            raise JdFormListingError("京东修改类目弹窗确定按钮不是唯一项")
         await confirm.click()
         await dialog.wait_for(state="hidden", timeout=20_000)
         await self._raise_as_jd(super()._wait_for_loading_masks())
@@ -498,13 +498,13 @@ class JdFormListing(YouzanFormListing):
         if occurrence is not None:
             if occurrence < 1 or occurrence > len(matches):
                 raise JdFormListingError(
-                    "京东字段“{0}”第 {1} 个表单项不存在（共 {2} 个）".format(
+                    "京东字段{0}第 {1} 个表单项不存在（共 {2} 个）".format(
                         label, occurrence, len(matches)
                     )
                 )
             return matches[occurrence - 1]
         if len(matches) != 1:
-            raise JdFormListingError("京东字段“{0}”表单项不是唯一项：{1}".format(label, len(matches)))
+            raise JdFormListingError("京东字段{0}表单项不是唯一项：{1}".format(label, len(matches)))
         return matches[0]
 
     @staticmethod
@@ -532,7 +532,7 @@ class JdFormListing(YouzanFormListing):
         item = await self._form_item_exact(label)
         inputs = await self._editable_inputs(item)
         if len(inputs) != 1:
-            raise JdFormListingError("京东字段“{0}”输入框不是唯一项：{1}".format(label, len(inputs)))
+            raise JdFormListingError("京东字段{0}输入框不是唯一项：{1}".format(label, len(inputs)))
         input_box = inputs[0]
         before = (await input_box.input_value()).strip()
         matches = _numeric_equal(before, expected) if numeric else before == expected
@@ -541,7 +541,7 @@ class JdFormListing(YouzanFormListing):
         actual = (await input_box.input_value()).strip()
         matches = _numeric_equal(actual, expected) if numeric else actual == expected
         if not matches:
-            raise JdFormListingError("京东字段“{0}”回读失败：{1!r}".format(label, actual))
+            raise JdFormListingError("京东字段{0}回读失败：{1!r}".format(label, actual))
         return actual
 
     async def fill_identity_and_parameters(
@@ -580,7 +580,7 @@ class JdFormListing(YouzanFormListing):
             select = brand_item.locator(".el-select").first
             if await select.count():
                 if self.logger is not None:
-                    self.logger.info("京东品牌使用下拉框选择：%s", JD_BRAND)
+                    self.logger.info('京东品牌使用下拉框选择：%s', JD_BRAND)
                 try:
                     actual = await self._raise_as_jd(
                         self._select_values(
@@ -595,14 +595,14 @@ class JdFormListing(YouzanFormListing):
                         brand_values = actual
                 except Exception as e:
                     if self.logger is not None:
-                        self.logger.warning("京东品牌下拉选择失败：%s", e)
+                        self.logger.warning('京东品牌下拉选择失败：%s', e)
 
             # 如果下拉选择失败，尝试手动填写
             if not brand:
                 inputs = await self._editable_inputs(brand_item)
                 if len(inputs) >= 1:
                     if self.logger is not None:
-                        self.logger.info("京东品牌下拉失败，尝试手动填写：%s", JD_BRAND)
+                        self.logger.info('京东品牌下拉失败，尝试手动填写：%s', JD_BRAND)
                     await self._enter_as_user(inputs[0], JD_BRAND)
                     await asyncio.sleep(0.5)
                     brand, brand_values = await read_brand()
@@ -614,7 +614,7 @@ class JdFormListing(YouzanFormListing):
                 )
                 if await apply_brand.count() == 1:
                     if self.logger is not None:
-                        self.logger.info("京东品牌为空，点击一键应用品牌配置")
+                        self.logger.info('京东品牌为空，点击一键应用品牌配置')
                     await apply_brand.click(force=True, timeout=5_000)
                     deadline = asyncio.get_running_loop().time() + 15
                     while asyncio.get_running_loop().time() < deadline:
@@ -650,7 +650,7 @@ class JdFormListing(YouzanFormListing):
                 "商品毛重(公斤)", gross_weight, numeric=True
             ),
         }
-        # 京东页中“商品参数”和“商品属性”各有一个产地；
+        # 京东页中"商品参数"和"商品属性"各有一个产地；
         # 这里明确取上方商品参数项，属性项由后续映射统一填写。
         origin_item = await self._form_item_exact("产地", occurrence=1)
         actual = await self._raise_as_jd(
@@ -726,7 +726,7 @@ class JdFormListing(YouzanFormListing):
                     stable_since = now
                 elif stable_since is not None and now - stable_since >= self.attribute_stable_seconds:
                     if self.logger is not None:
-                        self.logger.info("京东商品属性已稳定渲染：%s 项", len(items))
+                        self.logger.info('京东商品属性已稳定渲染：%s 项', len(items))
                     return items
             await asyncio.sleep(0.25)
         raise JdFormListingError("京东商品属性在 30 秒内未稳定渲染")
@@ -753,7 +753,7 @@ class JdFormListing(YouzanFormListing):
             values = {value for _key, value in matches}
             if len(values) != 1:
                 raise JdFormListingError(
-                    "京东属性“{0}”匹配到多个 Excel 值：{1}".format(
+                    "京东属性{0}匹配到多个 Excel 值：{1}".format(
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
@@ -810,17 +810,17 @@ class JdFormListing(YouzanFormListing):
                 raise
             if actual is None:
                 if required:
-                    raise JdFormListingError("京东属性“{0}”没有 Excel 精确候选".format(page_label))
+                    raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
                 return None
         elif len(inputs) == 1:
             # 检查是否是只读的 cascader 输入框
-            is_readonly = await inputs[0].get_attribute(“readonly”)
+            is_readonly = await inputs[0].get_attribute("readonly")
             if is_readonly:
                 # 这是级联选择器，尝试使用下拉选择逻辑
-                cascader = item.locator(“.el-cascader”).first
+                cascader = item.locator(".el-cascader").first
                 if await cascader.count():
                     if self.logger is not None:
-                        self.logger.info(“京东属性”%s”是级联选择器，尝试选择值”, page_label)
+                        self.logger.info('京东属性%s是级联选择器，尝试选择值', page_label)
                     try:
                         actual = await self._raise_as_jd(
                             self._select_values(
@@ -832,7 +832,7 @@ class JdFormListing(YouzanFormListing):
                         )
                         if actual is None:
                             if required:
-                                raise JdFormListingError(“京东属性”{0}”没有 Excel 精确候选”.format(page_label))
+                                raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
                             return None
                     except JdFormListingError:
                         if required:
@@ -840,7 +840,7 @@ class JdFormListing(YouzanFormListing):
                         return None
                 else:
                     if required:
-                        raise JdFormListingError(“京东属性”{0}”是只读输入框但不是级联选择器”.format(page_label))
+                        raise JdFormListingError("京东属性{0}是只读输入框但不是级联选择器".format(page_label))
                     return None
             else:
                 # 普通可编辑输入框
@@ -849,11 +849,11 @@ class JdFormListing(YouzanFormListing):
                     await self._enter_as_user(inputs[0], expected_text)
                 actual = ((await inputs[0].input_value()).strip(),)
                 if actual[0] != expected_text:
-                    raise JdFormListingError(“京东属性”{0}”回读失败”.format(page_label))
+                    raise JdFormListingError("京东属性{0}回读失败".format(page_label))
         else:
             if required:
                 structure = await item.evaluate(
-                    “””node => ({
+                    """node => ({
                       html: String(node.outerHTML || '').slice(0, 5000),
                       selects: node.querySelectorAll('.el-select').length,
                       cascaders: node.querySelectorAll('.el-cascader').length,
@@ -864,17 +864,17 @@ class JdFormListing(YouzanFormListing):
                         disabled: input.disabled,
                         className: input.className
                       }))
-                    })”””
+                    })"""
                 )
                 if self.logger is not None:
-                    self.logger.info(“京东属性”%s”复合控件结构：%s”, page_label, structure)
+                    self.logger.info('京东属性%s复合控件结构：%s', page_label, structure)
                 raise JdFormListingError(
-                    “京东属性”{0}”无唯一可填控件：”
-                    “select={1}, cascader={2}, input={3}”.format(
+                    "京东属性{0}无唯一可填控件："
+                    "select={1}, cascader={2}, input={3}".format(
                         page_label,
-                        structure.get(“selects”),
-                        structure.get(“cascaders”),
-                        len(structure.get(“inputs”, ()))
+                        structure.get("selects"),
+                        structure.get("cascaders"),
+                        len(structure.get("inputs", ()))
                     )
                 )
             return None
@@ -886,7 +886,7 @@ class JdFormListing(YouzanFormListing):
                 if not _numeric_equal((await percent_input.input_value()).strip(), percentage):
                     await self._enter_as_user(percent_input, percentage)
                 if not _numeric_equal((await percent_input.input_value()).strip(), percentage):
-                    raise JdFormListingError("京东属性“{0}”百分比回读失败".format(page_label))
+                    raise JdFormListingError("京东属性{0}百分比回读失败".format(page_label))
         return actual
 
     async def fill_attributes(self, fields: JdFields) -> Mapping[str, Any]:
@@ -903,7 +903,7 @@ class JdFormListing(YouzanFormListing):
             current = current_items.get(key)
             if current is None:
                 raise JdFormListingError(
-                    "京东属性“{0}”在页面重新渲染后消失".format(page_label)
+                    "京东属性{0}在页面重新渲染后消失".format(page_label)
                 )
             page_label, item = current
             required = await self._is_required(item)
@@ -945,7 +945,7 @@ class JdFormListing(YouzanFormListing):
                     break
                 root = root.locator("xpath=..")
         if len(matches) != 1:
-            raise JdFormListingError("京东批量字段“{0}”输入框不是唯一项：{1}".format(label, len(matches)))
+            raise JdFormListingError("京东批量字段{0}输入框不是唯一项：{1}".format(label, len(matches)))
         return matches[0]
 
     @staticmethod
@@ -1000,7 +1000,7 @@ class JdFormListing(YouzanFormListing):
         wanted = normalize_label(label)
         indexes = [index for index, header in enumerate(headers) if normalize_label(header) == wanted or normalize_label(header).startswith(wanted)]
         if len(indexes) != 1:
-            raise JdFormListingError("京东 SKU 列“{0}”不是唯一项".format(label))
+            raise JdFormListingError("京东 SKU 列{0}不是唯一项".format(label))
         return indexes[0]
 
     def _validate_sku(self, snapshot: Mapping[str, Any], expected: Mapping[str, str]) -> Tuple[Mapping[str, str], ...]:
@@ -1034,7 +1034,7 @@ class JdFormListing(YouzanFormListing):
             if await button.is_visible() and not await button.locator("xpath=ancestor::th").count():
                 candidates.append(button)
         if len(candidates) != 1:
-            raise JdFormListingError("京东价格库存“批量设置”按钮不是唯一项：{0}".format(len(candidates)))
+            raise JdFormListingError("京东价格库存批量设置按钮不是唯一项：{0}".format(len(candidates)))
         await candidates[0].click()
         deadline = asyncio.get_running_loop().time() + 15
         last_error: Optional[Exception] = None
@@ -1063,7 +1063,7 @@ class JdFormListing(YouzanFormListing):
                     if await links.nth(link_index).is_visible():
                         triggers.append(links.nth(link_index))
         if len(triggers) != 1:
-            raise JdFormListingError("京东 SKU 属性“批量设置”不是唯一项：{0}".format(len(triggers)))
+            raise JdFormListingError("京东 SKU 属性批量设置不是唯一项：{0}".format(len(triggers)))
         await triggers[0].click()
         dialogs = self.page.locator(".el-dialog:visible, [role=dialog]:visible")
         matches = []
@@ -1076,16 +1076,16 @@ class JdFormListing(YouzanFormListing):
         dialog = matches[0]
         labels = dialog.get_by_text(re.compile(r"^\s*厚度\s*[：:]?\s*$"))
         if await labels.count() != 1:
-            raise JdFormListingError("京东 SKU 属性弹窗缺少“厚度”")
+            raise JdFormListingError("京东 SKU 属性弹窗缺少厚度字段")
         item = labels.first.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]")
         actual = await self._raise_as_jd(
             self._fill_attribute("厚度", item, JD_SKU_THICKNESS, required=True)
         )
         if actual is None:
-            raise JdFormListingError("京东 SKU 厚度没有“常规”精确候选")
+            raise JdFormListingError("京东 SKU 厚度没有常规精确候选")
         confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
         if await confirm.count() != 1:
-            raise JdFormListingError("京东 SKU 属性弹窗“确定”不是唯一项")
+            raise JdFormListingError("京东 SKU 属性弹窗确定不是唯一项")
         await confirm.click()
         await dialog.wait_for(state="hidden", timeout=10_000)
         return {"厚度": actual[0]}
@@ -1104,7 +1104,7 @@ class JdFormListing(YouzanFormListing):
             self._fill_attribute("发货时效", item, JD_DELIVERY_TEMPLATE, required=True)
         )
         if actual is None:
-            raise JdFormListingError("京东发货时效没有“48小时发货”精确候选")
+            raise JdFormListingError("京东发货时效没有48小时发货精确候选")
         return actual[0]
 
     async def _visible_validation_errors(self) -> Tuple[str, ...]:
