@@ -31,6 +31,8 @@ from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
 
 from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
 from douyin_listing import DouyinListing, DouyinListingError
+from jd_data import JdFields, parse_jd_fields
+from jd_form_listing import JdFormListing, JdFormListingError
 from pdd_data import PddFields, parse_pdd_fields
 from pdd_form_listing import PddFormListing, PddFormListingError
 from platform_discovery import PlatformDiscoveryError
@@ -282,6 +284,7 @@ class ProductData:
     wxsph_fields: Optional[WxsphFields] = None
     xhs_fields: Optional[XhsFields] = None
     youzan_fields: Optional[YouzanFields] = None
+    jd_fields: Optional[JdFields] = None
     category_hints: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -458,6 +461,7 @@ def read_product_data(
         wxsph_fields=parse_wxsph_fields(fields),
         xhs_fields=parse_xhs_fields(fields),
         youzan_fields=parse_youzan_fields(fields),
+        jd_fields=parse_jd_fields(fields),
         category_hints=parse_category_hints(field_containing("商品分类")),
     )
 
@@ -501,6 +505,7 @@ def product_summary(product: ProductData) -> Dict[str, Any]:
     wxsph_fields = payload.pop("wxsph_fields", None)
     xhs_fields = payload.pop("xhs_fields", None)
     youzan_fields = payload.pop("youzan_fields", None)
+    jd_fields = payload.pop("jd_fields", None)
     result = serialize(payload)
     if taobao_fields is not None and product.taobao_fields is not None:
         result["taobao_field_count"] = len(product.taobao_fields.fields)
@@ -514,6 +519,8 @@ def product_summary(product: ProductData) -> Dict[str, Any]:
         result["xhs_field_count"] = len(product.xhs_fields.fields)
     if youzan_fields is not None and product.youzan_fields is not None:
         result["youzan_field_count"] = len(product.youzan_fields.fields)
+    if jd_fields is not None and product.jd_fields is not None:
+        result["jd_field_count"] = len(product.jd_fields.fields)
     return result
 
 
@@ -3262,6 +3269,7 @@ async def run_browser_automation(
     wxsph_requested = args.platform == "wxsph"
     xhs_requested = args.platform == "xhs"
     youzan_requested = args.platform == "youzan"
+    jd_requested = args.platform == "jd"
     if args.platform == "douyin" and product.douyin_fields is None:
         raise AutomationError("已选择抖音流程，但 Excel/产品目录中没有抖音资料")
     if taobao_requested and product.taobao_fields is None:
@@ -3278,6 +3286,8 @@ async def run_browser_automation(
         raise AutomationError("已选择小红书流程，但 Excel 中缺少“商品分类”层级")
     if youzan_requested and not inspect_only and product.youzan_fields is None:
         raise AutomationError("已选择有赞流程，但 Excel 中没有可用于有赞匹配的资料")
+    if jd_requested and not inspect_only and product.jd_fields is None:
+        raise AutomationError("已选择京东流程，但 Excel 中没有可用于京东匹配的资料")
     if youzan_requested and not inspect_only and not product.youzan_fields.category_path:
         raise AutomationError("已选择有赞流程，但 Excel 中缺少“商品分类”层级")
     if (
@@ -3855,6 +3865,27 @@ async def run_browser_automation(
                     "即将保存但不铺货"
                     if args.save
                     else "有赞资料未保存、未铺货",
+                )
+            elif jd_requested:
+                assert product.jd_fields is not None
+                jd = JdFormListing(page, drawer, logger)
+                await jd.open()
+                try:
+                    jd_report = await jd.apply_excel_fields(
+                        product.jd_fields,
+                        style_code=product.style_code,
+                    )
+                except JdFormListingError:
+                    await safe_screenshot(page, artifact_dir / "jd-error.png")
+                    raise
+                (artifact_dir / "jd-before-save.json").write_text(
+                    json.dumps(jd_report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                await safe_screenshot(page, artifact_dir / "jd-before-save.png")
+                logger.info(
+                    "京东类目、品牌、Excel 属性、SKU 价格库存、厚度和发货时效填写复核完成；%s",
+                    "即将保存但不铺货" if args.save else "本阶段仅预览，未保存、未铺货",
                 )
             elif tmall_requested:
                 assert product.tmall_fields is not None
@@ -4455,6 +4486,32 @@ async def run_browser_automation(
                     "当前页" if shared_session is not None else "重开",
                 )
 
+            if jd_requested:
+                assert product.jd_fields is not None
+                if shared_session is not None:
+                    logger.info("保存成功，正在当前编辑页复核京东关键字段；不刷新网页")
+                    persisted_drawer = drawer
+                else:
+                    logger.info("保存成功，正在重新打开商品复核京东关键字段")
+                    await page.reload(wait_until="domcontentloaded", timeout=args.timeout * 1000)
+                    persisted_drawer = await open_product_editor(
+                        page, product.style_code, logger, timeout_seconds=args.timeout
+                    )
+                persisted_jd = JdFormListing(page, persisted_drawer, logger)
+                await persisted_jd.open()
+                persisted_report = await persisted_jd.verify_persisted_values(
+                    product.jd_fields,
+                    style_code=product.style_code,
+                )
+                (artifact_dir / "jd-after-save-validation.json").write_text(
+                    json.dumps(persisted_report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "保存后%s复核通过：京东类目、品牌、SKU 京东价、库存、底部价格和 48 小时发货均已持久化",
+                    "当前页" if shared_session is not None else "重开",
+                )
+
             result_name = "publish-result.json" if should_publish else "save-result.json"
             (artifact_dir / result_name).write_text(
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -4505,7 +4562,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "运行范围：all=全部已实现平台，base=仅基础资料，"
             "douyin=抖音，taobao=淘宝，tmall=天猫，"
-            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞"
+            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞，jd=京东"
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="只读取并校验 Excel/图片，不打开浏览器")

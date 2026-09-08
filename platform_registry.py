@@ -115,6 +115,18 @@ PLATFORM_SPECS: Tuple[PlatformSpec, ...] = (
         publish_allowed=True,
         discovery_adapter=None,
     ),
+    PlatformSpec(
+        cli_name="jd",
+        platform_id="jd",
+        display_name="京东资料",
+        tab_label="京东资料",
+        lifecycle="implemented",
+        enabled_in_all=False,
+        supports_inspect=False,
+        save_policy="allowed",
+        publish_allowed=False,
+        discovery_adapter=None,
+    ),
 )
 
 
