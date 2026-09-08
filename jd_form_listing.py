@@ -815,34 +815,31 @@ class JdFormListing(YouzanFormListing):
         elif len(inputs) == 1:
             # 检查是否是只读的 cascader 输入框
             is_readonly = await inputs[0].get_attribute("readonly")
-            if is_readonly:
+            cascader = item.locator(".el-cascader").first
+            has_cascader = await cascader.count() > 0
+
+            if is_readonly and has_cascader:
                 # 这是级联选择器，尝试使用下拉选择逻辑
-                cascader = item.locator(".el-cascader").first
-                if await cascader.count():
-                    if self.logger is not None:
-                        self.logger.info('京东属性%s是级联选择器，尝试选择值', page_label)
-                    try:
-                        actual = await self._raise_as_jd(
-                            self._select_values(
-                                cascader,
-                                selection_value_groups(page_label, desired),
-                                label=page_label,
-                                multi=False,
-                            )
+                if self.logger is not None:
+                    self.logger.info('京东属性%s是级联选择器，尝试选择值', page_label)
+                try:
+                    actual = await self._raise_as_jd(
+                        self._select_values(
+                            cascader,
+                            selection_value_groups(page_label, desired),
+                            label=page_label,
+                            multi=False,
                         )
-                        if actual is None:
-                            if required:
-                                raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
-                            return None
-                    except JdFormListingError:
+                    )
+                    if actual is None:
                         if required:
-                            raise
+                            raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
                         return None
-                else:
+                except JdFormListingError:
                     if required:
-                        raise JdFormListingError("京东属性{0}是只读输入框但不是级联选择器".format(page_label))
+                        raise
                     return None
-            else:
+            elif not is_readonly:
                 # 普通可编辑输入框
                 expected_text = str(desired).strip()
                 if (await inputs[0].input_value()).strip() != expected_text:
@@ -850,6 +847,10 @@ class JdFormListing(YouzanFormListing):
                 actual = ((await inputs[0].input_value()).strip(),)
                 if actual[0] != expected_text:
                     raise JdFormListingError("京东属性{0}回读失败".format(page_label))
+            else:
+                if required:
+                    raise JdFormListingError("京东属性{0}是只读输入框但不是级联选择器".format(page_label))
+                return None
         else:
             if required:
                 structure = await item.evaluate(
