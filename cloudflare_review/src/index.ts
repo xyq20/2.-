@@ -21,7 +21,8 @@ import {
   readAsset,
   uploadAsset,
 } from "./assets";
-import { HttpError, json, requireValue, text } from "./http";
+import { body, HttpError, json, requireValue, text } from "./http";
+import { analyzeProduct } from "./model";
 import type { ReviewEnv } from "./types";
 export default {
   async fetch(request: Request, env: ReviewEnv): Promise<Response> {
@@ -48,6 +49,10 @@ export default {
         await requireDevice(request, env);
         if (method === "POST" && path === "/api/device/events")
           return await ingestDeviceEvent(request, env);
+        if (method === "POST" && path === "/api/device/analyze") {
+          const data = await body(request);
+          return json(await analyzeProduct(env, text(data.product_version, "product_version")));
+        }
         if (method === "GET" && path === "/api/device/resume")
           return await resumeEvents(
             env,
