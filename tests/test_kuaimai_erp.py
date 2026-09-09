@@ -9,6 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import kuaimai_erp
+from attribute_runtime import AttributeRequest, ReviewRequired
+from learning_models import RunCheckpoint
+from learning_store import LearningStore
 
 
 LOGGER = logging.getLogger("kuaimai-tests")
@@ -100,6 +103,156 @@ class _AuthContext:
 
 
 class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_learning_initialization_uploads_deduplicated_assets_and_analyzes_once(self):
+        class Client:
+            def __init__(self):
+                self.uploads = []
+                self.analyses = []
+
+            def upload_asset(self, *args):
+                self.uploads.append(args)
+                return {"asset_id": "asset-1"}
+
+            def analyze(self, product_version):
+                self.analyses.append(product_version)
+                return {"status": "ready", "cached": False}
+
+        original = kuaimai_erp.PreparedLearningAsset(
+            "original", "original-sha", "image/jpeg", b"original", None
+        )
+        thumbnail = kuaimai_erp.PreparedLearningAsset(
+            "learning_thumbnail", "thumb-sha", "image/jpeg", b"thumb", None
+        )
+        path = Path("/tmp/product.jpg")
+        product = SimpleNamespace(
+            main_images=[path],
+            main_images_34=[path],
+            detail_images=[path],
+        )
+        client = Client()
+        context = SimpleNamespace(
+            store=Mock(),
+            client=client,
+            initialized=False,
+            product_version="product-1",
+        )
+        with patch.object(
+            kuaimai_erp,
+            "prepare_learning_assets",
+            return_value=(original, thumbnail),
+        ) as prepare, patch.object(
+            kuaimai_erp,
+            "flush_outbox_async",
+            new=AsyncMock(return_value=1),
+        ):
+            await kuaimai_erp.initialize_learning_run(context, product, LOGGER)
+            await kuaimai_erp.initialize_learning_run(context, product, LOGGER)
+
+        prepare.assert_called_once_with(path)
+        self.assertEqual(len(client.uploads), 2)
+        self.assertEqual(client.analyses, ["product-1"])
+        self.assertTrue(context.initialized)
+
+    async def test_review_resumes_same_platform_without_rerunning_earlier_stages(self):
+        args = SimpleNamespace(
+            platform="all",
+            save=False,
+            save_only=False,
+            dry_run=False,
+            inspect_only=False,
+            taobao_publish_preview=False,
+            allow_taobao_save_once=False,
+            allow_taobao_publish_once=False,
+        )
+        product = SimpleNamespace(douyin_fields=None)
+        request = AttributeRequest(
+            platform_id="tmall",
+            category_leaf_id="pants",
+            field_id="pants-length",
+            field_label="裤长",
+            candidates=(),
+            excel_value="长裤",
+            evidence={},
+            custom_allowed=False,
+            schema_version="schema-1",
+        )
+        calls = []
+
+        class Client:
+            def __init__(self):
+                self.acks = []
+
+            def post_event(self, *_args):
+                return {"ok": True}
+
+            def poll_resume(self, device_id, wait_seconds):
+                self.poll = (device_id, wait_seconds)
+                return {
+                    "events": [
+                        {
+                            "event_id": "event-1",
+                            "payload": {
+                                "run_id": "run-1",
+                                "device_id": "device-1",
+                                "product_version": "product-1",
+                                "platform_id": "tmall",
+                                "review_id": "review-1",
+                                "final_value_id": "long",
+                                "snapshot_version": "snapshot-1",
+                            },
+                        }
+                    ]
+                }
+
+            def acknowledge_resume(self, event_id, *, checkpoint_id, device_id):
+                self.acks.append((event_id, checkpoint_id, device_id))
+                return {"ok": True}
+
+        client = Client()
+
+        async def runner(_args, _product, _stage_dir, _logger, **_kwargs):
+            calls.append((_args.platform, id(_kwargs["shared_session"])))
+            if _args.platform == "tmall" and sum(
+                platform == "tmall" for platform, _ in calls
+            ) == 1:
+                raise ReviewRequired(
+                    "review-1", request, "human_confirmation_required", "snapshot-1"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / "learning.sqlite3")
+            store.migrate()
+            context = kuaimai_erp.LearningRunContext(
+                store,
+                "run-1",
+                "product-1",
+                "device-1",
+                "images-1",
+                client,
+                None,
+                True,
+            )
+            with patch.object(kuaimai_erp, "run_browser_automation", side_effect=runner):
+                await kuaimai_erp.run_all_implemented_platforms(
+                    args,
+                    product,
+                    Path(directory),
+                    LOGGER,
+                    learning_context=context,
+                )
+            checkpoint = store.load_checkpoint("run-1")
+            store.close()
+
+        self.assertEqual(
+            [platform for platform, _ in calls[:4]],
+            ["taobao", "tmall", "tmall", "pdd"],
+        )
+        self.assertEqual(sum(platform == "taobao" for platform, _ in calls), 1)
+        self.assertNotEqual(calls[1][1], calls[2][1])
+        self.assertEqual(client.acks, [("event-1", "run-1", "device-1")])
+        self.assertIsInstance(checkpoint, RunCheckpoint)
+        self.assertEqual(checkpoint.status, "completed")
+
     async def test_single_platform_learning_records_verified_stage(self):
         args = SimpleNamespace(platform="pdd", save=True, save_only=True)
         product = SimpleNamespace()

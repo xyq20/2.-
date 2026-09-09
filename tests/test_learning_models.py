@@ -59,6 +59,24 @@ class LearningModelTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_product_version_does_not_depend_on_local_image_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_path = root / "first.jpg"
+            second_path = root / "moved" / "second.jpg"
+            second_path.parent.mkdir()
+            first_path.write_bytes(b"same-image")
+            second_path.write_bytes(b"same-image")
+            first = ProductFingerprint.from_inputs(
+                "NGBL-1", "标题", [first_path]
+            )
+            second = ProductFingerprint.from_inputs(
+                "NGBL-1", "标题", [second_path]
+            )
+
+        self.assertEqual(first.product_version, second.product_version)
+        self.assertEqual(first.image_version, second.image_version)
+
     def test_image_version_excludes_title_but_covers_image_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "1.jpg"

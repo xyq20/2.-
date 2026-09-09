@@ -140,7 +140,7 @@ export async function analyzeProduct(
   if (!env.MODEL_API_KEY || !env.MODEL_API_URL)
     return { status: "review_required", reason_code: "model_not_configured" };
   const rows = await env.DB.prepare(
-    "SELECT id,r2_key,content_type FROM assets WHERE product_version=? ORDER BY CASE kind WHEN 'learning_thumbnail' THEN 0 ELSE 1 END,created_at,id",
+    "SELECT id,r2_key,content_type FROM assets WHERE product_version=? AND (kind='learning_thumbnail' OR (kind='original' AND NOT EXISTS(SELECT 1 FROM assets thumbnails WHERE thumbnails.product_version=assets.product_version AND thumbnails.kind='learning_thumbnail'))) ORDER BY created_at,id",
   )
     .bind(productVersion)
     .all<AssetRow>();

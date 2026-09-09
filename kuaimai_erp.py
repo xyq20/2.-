@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -41,6 +42,10 @@ from learning_models import (
     canonical_sha256,
 )
 from learning_store import LearningStore
+from learning_assets import PreparedLearningAsset, prepare_learning_assets
+from learning_client import CloudLearningClient, flush_outbox_async
+from attribute_runtime import AttributeRuntime, ReviewRequired
+from review_resume import persist_resume_and_ack, wait_for_review
 from pdd_data import PddFields, parse_pdd_fields
 from pdd_form_listing import PddFormListing, PddFormListingError
 from platform_discovery import PlatformDiscoveryError
@@ -314,6 +319,9 @@ class LearningRunContext:
     product_version: str
     device_id: str
     image_version: str
+    client: Optional[CloudLearningClient] = None
+    attribute_runtime: Optional[AttributeRuntime] = None
+    initialized: bool = False
 
 
 def create_learning_context(
@@ -342,12 +350,86 @@ def create_learning_context(
             "category_json": {"hints": list(getattr(product, "category_hints", ()))},
         },
     )
+    run_id = uuid.uuid4().hex
+    client: Optional[CloudLearningClient] = None
+    runtime: Optional[AttributeRuntime] = None
+    if str(getattr(args, "learning_api_url", "")).strip():
+        client = CloudLearningClient(args.learning_api_url)
+        runtime = AttributeRuntime(
+            store,
+            client,
+            run_id,
+            fingerprint.product_version,
+            device_id=store.get_or_create_device_id(),
+        )
     return LearningRunContext(
         store,
-        uuid.uuid4().hex,
+        run_id,
         fingerprint.product_version,
         store.get_or_create_device_id(),
         fingerprint.image_version,
+        client,
+        runtime,
+    )
+
+
+async def initialize_learning_run(
+    context: Optional[LearningRunContext],
+    product: ProductData,
+    logger: logging.Logger,
+) -> None:
+    """Upload de-duplicated evidence and populate the one-shot vision cache."""
+    if (
+        context is None
+        or getattr(context, "client", None) is None
+        or getattr(context, "initialized", False)
+    ):
+        return
+    await flush_outbox_async(
+        context.store,
+        context.client,
+        datetime.now(timezone.utc),
+    )
+    paths = tuple(
+        dict.fromkeys(
+            str(path)
+            for path in (
+                tuple(product.main_images)
+                + tuple(product.main_images_34)
+                + tuple(product.detail_images)
+            )
+        )
+    )
+    prepared: List[PreparedLearningAsset] = []
+    for raw_path in paths:
+        original, thumbnail = await asyncio.to_thread(
+            prepare_learning_assets, Path(raw_path)
+        )
+        prepared.append(thumbnail)
+        if original.content_type in {"image/jpeg", "image/png", "image/webp"}:
+            prepared.append(original)
+    unique_assets = {
+        (asset.kind, asset.sha256): asset for asset in prepared
+    }
+    for asset in unique_assets.values():
+        await asyncio.to_thread(
+            context.client.upload_asset,
+            context.product_version,
+            asset.sha256,
+            asset.kind,
+            asset.content_type,
+            asset.body,
+        )
+    analysis = await asyncio.to_thread(
+        context.client.analyze, context.product_version
+    )
+    context.initialized = True
+    logger.info(
+        "AI 学习素材已同步：%s 个文件、%s 个去重对象；识图状态=%s%s",
+        len(paths),
+        len(unique_assets),
+        analysis.get("status", "unknown"),
+        "（命中缓存）" if analysis.get("cached") is True else "",
     )
 
 
@@ -3328,6 +3410,7 @@ async def run_browser_automation(
     logger: logging.Logger,
     redactor: Optional[SensitiveLogRedactor] = None,
     shared_session: Optional[Dict[str, Any]] = None,
+    attribute_runtime: Optional[AttributeRuntime] = None,
 ) -> None:
     try:
         from playwright.async_api import async_playwright
@@ -3667,7 +3750,13 @@ async def run_browser_automation(
             if publish_mode:
                 assert product.douyin_fields is not None
                 assert product.douyin_assets is not None
-                douyin = DouyinListing(page, drawer, logger, artifact_dir)
+                douyin = DouyinListing(
+                    page,
+                    drawer,
+                    logger,
+                    artifact_dir,
+                    attribute_runtime=attribute_runtime,
+                )
                 await douyin.open()
                 title_prediction = await douyin.prepare_product_title_and_predictions(
                     product.title,
@@ -3723,7 +3812,12 @@ async def run_browser_automation(
                 logger.info("抖音资料填写与铺货前复核完成")
             elif taobao_requested:
                 assert product.taobao_fields is not None
-                taobao = TaobaoListing(page, drawer, logger)
+                taobao = TaobaoListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await taobao.open()
                 if args.taobao_test_scope == "category-size":
                     category = await taobao.apply_category(args.taobao_category_mode)
@@ -3816,7 +3910,12 @@ async def run_browser_automation(
                     logger.info("淘宝类目、Excel 属性、尺码表与基础销售资料填写复核完成")
             elif pdd_requested:
                 assert product.pdd_fields is not None
-                pdd = PddFormListing(page, drawer, logger)
+                pdd = PddFormListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await pdd.open()
                 try:
                     pdd_report = await pdd.apply_excel_fields(product.pdd_fields)
@@ -3838,7 +3937,12 @@ async def run_browser_automation(
                 logger.info("拼多多资料填写与保存前复核完成；%s", next_action)
             elif wxsph_requested:
                 assert product.wxsph_fields is not None
-                wxsph = WxsphFormListing(page, drawer, logger)
+                wxsph = WxsphFormListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await wxsph.open()
                 try:
                     wxsph_report = await wxsph.apply_excel_fields(
@@ -3889,7 +3993,12 @@ async def run_browser_automation(
                 )
             elif xhs_requested:
                 assert product.xhs_fields is not None
-                xhs = XhsFormListing(page, drawer, logger)
+                xhs = XhsFormListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await xhs.open()
                 try:
                     xhs_report = await xhs.apply_excel_fields(
@@ -3918,7 +4027,12 @@ async def run_browser_automation(
                 )
             elif youzan_requested:
                 assert product.youzan_fields is not None
-                youzan = YouzanFormListing(page, drawer, logger)
+                youzan = YouzanFormListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await youzan.open()
                 try:
                     youzan_report = await youzan.apply_excel_fields(
@@ -3941,7 +4055,12 @@ async def run_browser_automation(
                 )
             elif jd_requested:
                 assert product.jd_fields is not None
-                jd = JdFormListing(page, drawer, logger)
+                jd = JdFormListing(
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
                 await jd.open()
                 try:
                     jd_report = await jd.apply_excel_fields(
@@ -3977,6 +4096,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     api_index=tmall_api_index,
+                    attribute_runtime=attribute_runtime,
                 )
                 tmall_report: Dict[str, Any] = {
                     "status": "in_progress",
@@ -5004,7 +5124,9 @@ def save_learning_checkpoint(
     platform_order: Tuple[str, ...],
     current_index: int,
     status: str,
-) -> None:
+    *,
+    pending_review_id: Optional[str] = None,
+) -> RunCheckpoint:
     requested = RunCheckpoint(
         context.run_id,
         context.product_version,
@@ -5012,6 +5134,7 @@ def save_learning_checkpoint(
         platform_order,
         current_index,
         status,
+        pending_review_id,
         device_id=context.device_id,
         image_version=context.image_version,
     )
@@ -5034,6 +5157,7 @@ def save_learning_checkpoint(
             "image_version": persisted.image_version,
         },
     )
+    return persisted
 
 
 def record_learning_stage(
@@ -5079,6 +5203,7 @@ async def run_single_platform_with_learning(
         )
         return
     platform_order = (args.platform,)
+    await initialize_learning_run(learning_context, product, logger)
     save_learning_checkpoint(
         learning_context, args, platform_order, 0, "running"
     )
@@ -5088,6 +5213,9 @@ async def run_single_platform_with_learning(
             product,
             artifact_dir,
             logger,
+            attribute_runtime=getattr(
+                learning_context, "attribute_runtime", None
+            ),
             **browser_kwargs,
         )
     except Exception:
@@ -5129,6 +5257,7 @@ async def run_all_implemented_platforms(
     shared_session: Dict[str, Any] = {}
 
     if learning_context is not None:
+        await initialize_learning_run(learning_context, product, logger)
         save_learning_checkpoint(
             learning_context,
             args,
@@ -5138,7 +5267,9 @@ async def run_all_implemented_platforms(
         )
 
     try:
-        for stage_index, platform_name in enumerate(stages):
+        stage_index = 0
+        while stage_index < len(stages):
+            platform_name = stages[stage_index]
             stage_dir = artifact_dir / platform_name
             stage_dir.mkdir(parents=True, exist_ok=True)
             stage_args = argparse.Namespace(**vars(args))
@@ -5175,7 +5306,76 @@ async def run_all_implemented_platforms(
                     stage_dir,
                     logger,
                     shared_session=shared_session,
+                    attribute_runtime=(
+                        getattr(learning_context, "attribute_runtime", None)
+                        if learning_context is not None
+                        else None
+                    ),
                 )
+            except ReviewRequired as exc:
+                if learning_context is None or learning_context.client is None:
+                    raise
+                checkpoint = save_learning_checkpoint(
+                    learning_context,
+                    args,
+                    stages,
+                    stage_index,
+                    "waiting_review",
+                    pending_review_id=exc.review_id,
+                )
+                stage_results.append(
+                    {
+                        "platform": platform_name,
+                        "status": "waiting_review",
+                        "review_id": exc.review_id,
+                        "field": exc.request.field_label,
+                    }
+                )
+                (artifact_dir / "all-platform-result.json").write_text(
+                    json.dumps(stage_results, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "平台 %s 等待人工审核：%s；关闭当前浏览器会话",
+                    platform_name,
+                    exc.request.field_label,
+                )
+                await close_shared_browser_session(shared_session)
+                shared_session = {}
+                decision = await wait_for_review(
+                    learning_context.store,
+                    learning_context.client,
+                    checkpoint,
+                    current_product_version=learning_context.product_version,
+                    current_image_version=learning_context.image_version,
+                    execution_mode=learning_execution_mode(args),
+                )
+                await persist_resume_and_ack(
+                    learning_context.store,
+                    learning_context.client,
+                    checkpoint,
+                    decision,
+                )
+                save_learning_checkpoint(
+                    learning_context,
+                    args,
+                    stages,
+                    stage_index,
+                    "resume_pending",
+                    pending_review_id=exc.review_id,
+                )
+                save_learning_checkpoint(
+                    learning_context,
+                    args,
+                    stages,
+                    stage_index,
+                    "running",
+                )
+                logger.info(
+                    "审核已确认，重新打开 %s 并重新获取候选；此前平台不重跑",
+                    platform_name,
+                )
+                continue
             except Exception as exc:
                 stage_results.append(
                     {"platform": platform_name, "status": "failed", "error": str(exc)}
@@ -5216,6 +5416,7 @@ async def run_all_implemented_platforms(
                     "completed" if stage_index + 1 == len(stages) else "running",
                 )
             logger.info("全平台流程完成：%s；当前编辑页保留给下一平台", platform_name)
+            stage_index += 1
     finally:
         await close_shared_browser_session(shared_session)
 

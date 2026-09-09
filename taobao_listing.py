@@ -205,10 +205,18 @@ def parse_taobao_fabrics(fields: Mapping[str, str]) -> Tuple[MaterialComponent, 
 class TaobaoListing:
     """处理淘宝推荐类目、类目属性和基础销售资料。"""
 
-    def __init__(self, page: Any, drawer: Any, logger: Any) -> None:
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        *,
+        attribute_runtime: Optional[Any] = None,
+    ) -> None:
         self.page = page
         self.drawer = drawer
         self.logger = logger
+        self.attribute_runtime = attribute_runtime
         self.panel: Optional[Any] = None
         self.category_clicked = False
         self.material_validation: Mapping[str, Any] = {}

@@ -1,5 +1,7 @@
+import json
 import unittest
 
+from attribute_runtime import ResolvedAttribute
 from wxsph_data import parse_wxsph_fields
 from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
 
@@ -32,16 +34,26 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def _listing(self):
+    async def _listing(self, attribute_runtime=None):
+        response_body = json.dumps(
+            {
+                "attr": [
+                    {"id": "fabric", "name": "面料材质", "inputType": "select", "values": [{"id": "cotton", "name": "棉"}, {"id": "polyester", "name": "聚酯纤维"}]},
+                    {"id": "fabric-percent", "name": "面料材质成分含量"},
+                    {"id": "lining", "name": "里料材质", "inputType": "select", "values": [{"id": "cotton", "name": "棉"}]},
+                    {"id": "lining-percent", "name": "里料材质成分含量"},
+                    {"id": "content-band", "name": "材质成分含量", "inputType": "select", "values": [{"id": "51-70", "name": "51%-70%"}, {"id": "95-plus", "name": "95%及以上"}]},
+                    {"id": "material-content", "name": "材质成分"},
+                    {"id": "scene", "name": "适用场景", "inputType": "select", "values": [{"id": "daily", "name": "日常"}, {"id": "outdoor", "name": "户外"}]},
+                ]
+            },
+            ensure_ascii=False,
+        )
         await self.page.route(
-            "**/wxsph/getCategoryProperties.json",
+            "**/wxsph/getCategoryProperties.json*",
             lambda route: route.fulfill(
                 content_type="application/json",
-                body='{"attr":['
-                '{"name":"面料材质"},{"name":"面料材质成分含量"},'
-                '{"name":"里料材质"},{"name":"里料材质成分含量"},'
-                '{"name":"材质成分含量"},{"name":"材质成分"},'
-                '{"name":"适用场景"}]}'
+                body=response_body,
             ),
         )
         await self.page.set_content(
@@ -118,7 +130,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
               function openTab(tab) {{
                 tab.setAttribute('aria-selected', 'true');
                 document.querySelector('[role=tabpanel]').style.display='block';
-                fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json');
+                fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json?categoryId=545735');
               }}
               function openSelect(input) {{
                 document.querySelectorAll('.el-select-dropdown').forEach(node => node.style.display='none');
@@ -179,7 +191,12 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
                 unit=select_markup(["%"]),
             )
         )
-        listing = WxsphFormListing(self.page, self.page.locator("body"), None)
+        listing = WxsphFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=attribute_runtime,
+        )
         await listing.open()
         return listing
 
@@ -297,6 +314,57 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["delivery"]["days"], "15")
         self.assertEqual(persisted["weight"], "1")
         self.assertEqual(await self.page.locator("#batch").get_attribute("data-clicks"), "1")
+
+    async def test_learning_uses_api_candidate_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                match = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    match.value_id,
+                    match.label,
+                    "explicit_text",
+                    "snapshot-1",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        fields = parse_wxsph_fields(
+            {
+                "面料材质/水洗标/吊牌图/面料/面料俗称": "棉（100%）",
+                "里料材质/里料": "棉",
+                "里料材质成分含量/材质成分含量/面料材质成分含量": "95%及以上",
+                "材质成分/材质": "棉（100%）",
+                "适用场景": "日常",
+                "吊牌价/价格/基本售价/商品价格": "586",
+                "价格/京东价/市场价/售卖价/售价": "586",
+                "数量": "100",
+            }
+        )
+
+        await listing.apply_excel_fields(fields)
+
+        self.assertEqual(
+            [request.field_id for request in runtime.requests],
+            ["fabric", "lining", "content-band", "scene"],
+        )
+        self.assertTrue(
+            all(request.category_leaf_id == "545735" for request in runtime.requests)
+        )
+        self.assertEqual(
+            tuple(
+                (candidate.value_id, candidate.label)
+                for candidate in runtime.requests[0].candidates
+            ),
+            (("cotton", "棉"), ("polyester", "聚酯纤维")),
+        )
 
     async def test_post_save_readback_rejects_lost_sku_value_without_rewriting(self):
         listing = await self._listing()

@@ -11,7 +11,16 @@ import json
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from attribute_runtime import AttributeRequest
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from wxsph_listing import parse_wxsph_attribute_fields
 
 from taobao_listing import (
     TaobaoListingError,
@@ -229,15 +238,132 @@ class WxsphFormListing(YouzanFormListing):
             "http_status": int(response.status),
             "body": "unavailable",
             "attribute_labels": (),
+            "attribute_fields": (),
+            "category_id": "",
         }
         try:
             payload = await response.json()
             observation["body"] = "json"
             observation["attribute_labels"] = self._api_attribute_labels(payload)
+            if path == "/wxsph/getCategoryProperties.json":
+                observation["attribute_fields"] = parse_wxsph_attribute_fields(
+                    payload
+                )
+                query = parse_qs(urlsplit(response.url).query)
+                category_ids = tuple(query.get("categoryId", ()))
+                if len(category_ids) == 1:
+                    observation["category_id"] = str(category_ids[0])
         except Exception:
             # 只记录脱敏后的结构摘要；响应正文和查询参数均不落盘。
             pass
         self._api_observations[path] = observation
+
+    async def _captured_api_field(self, page_label: str) -> Tuple[Any, str]:
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        wanted = normalize_label(page_label)
+        matches = []
+        category_ids = []
+        for observation in getattr(self, "_api_observations", {}).values():
+            category_id = str(observation.get("category_id") or "").strip()
+            if category_id and category_id not in category_ids:
+                category_ids.append(category_id)
+            for field in observation.get("attribute_fields", ()):
+                if normalize_label(field.label) == wanted:
+                    matches.append(field)
+        unique = {
+            (field.source_id, field.schema_key): field
+            for field in matches
+        }
+        if len(unique) != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”缺少唯一的接口 JSON 字段定义".format(
+                    page_label
+                )
+            )
+        if len(category_ids) != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”缺少唯一的接口类目 ID".format(page_label)
+            )
+        return next(iter(unique.values())), category_ids[0]
+
+    async def _resolve_learning_select_value(
+        self,
+        page_label: str,
+        item: Any,
+        excel_value: str,
+    ) -> str:
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return excel_value
+        field, category_id = await self._captured_api_field(page_label)
+        if not field.source_id:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”的接口字段 ID 为空".format(page_label)
+            )
+        selects = item.locator(
+            ":scope > .el-form-item__content .el-select:visible"
+        )
+        if await selects.count() != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”下拉框不唯一".format(page_label)
+            )
+        select = selects.first
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        dom_values = tuple(
+            DomCandidate(
+                str(option.get("value") or ""),
+                str(option.get("name") or ""),
+                not bool(option.get("disabled")),
+            )
+            for option in options
+        )
+        try:
+            candidates = reconcile_candidates(field.option_values, dom_values)
+        except CandidateSourceError as exc:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label, exc.reason_code
+                )
+            ) from exc
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "wxsph",
+                "category_leaf_id": category_id,
+                "field_id": str(field.source_id),
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="wxsph",
+                category_leaf_id=category_id,
+                field_id=str(field.source_id),
+                field_label=page_label,
+                candidates=tuple(
+                    CandidateValue(value.value_id, value.label)
+                    for value in candidates
+                ),
+                excel_value=str(excel_value).strip(),
+                evidence={"excel": bool(str(excel_value).strip())},
+                custom_allowed=bool(field.custom_allowed),
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        return resolved.label
 
     async def _api_dom_validation(
         self, dom_labels: Sequence[str]
@@ -610,6 +736,12 @@ class WxsphFormListing(YouzanFormListing):
                     skipped_optional[page_label] = "Excel 未提供该材质的百分比"
                 continue
             if is_select:
+                value = await self._resolve_learning_select_value(
+                    page_label,
+                    item,
+                    value,
+                )
+                exact_values = (value,)
                 actual = await self._raise_as_wxsph(
                     self._fill_attribute(
                         page_label,

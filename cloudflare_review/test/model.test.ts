@@ -65,6 +65,29 @@ it("returns review without caching malformed model output", async () => {
   expect(await testEnv.DB.prepare("SELECT count(*) n FROM visual_facts").first("n")).toBe(0);
 });
 
+it("sends thumbnails instead of duplicate originals to the vision model", async () => {
+  await seedAsset();
+  await testEnv.ASSETS.put("products/pv1/original/original", new Uint8Array([9, 9, 9]));
+  await testEnv.DB.prepare(
+    "INSERT INTO assets(id,product_version,r2_key,sha256,kind,content_type,byte_size,created_at) VALUES('original1','pv1','products/pv1/original/original','original','original','image/jpeg',3,?)",
+  )
+    .bind(new Date().toISOString())
+    .run();
+  const upstream = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+    new Response(JSON.stringify({ output_text: JSON.stringify(facts) }), { status: 200 }),
+  );
+
+  await analyzeProduct(
+    { ...testEnv, MODEL_API_KEY: "x", MODEL_API_URL: "https://model.test" },
+    "pv1",
+    upstream,
+  );
+
+  const requestBody = String(upstream.mock.calls[0]![1]!.body);
+  expect(requestBody).toContain("asset_id=asset1");
+  expect(requestBody).not.toContain("asset_id=original1");
+});
+
 it("rejects unknown asset ids, unsupported enums, and unsupported keys", () => {
   const assets = new Set(["asset1"]);
   expect(() => validateVisualFacts({ ...facts, evidence_asset_ids: ["other"] }, assets)).toThrow();

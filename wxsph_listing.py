@@ -242,6 +242,53 @@ def _fields(
     return tuple(result)
 
 
+def unwrap_wxsph_payload(payload: Any) -> Any:
+    """Return the business payload from FastMai's common JSON envelopes."""
+    current = payload
+    for _attempt in range(4):
+        if isinstance(current, str):
+            text = current.strip()
+            if not text.startswith(("{", "[")):
+                break
+            try:
+                import json
+
+                current = json.loads(text)
+                continue
+            except (TypeError, ValueError):
+                break
+        if not isinstance(current, Mapping):
+            break
+        if "result" in current and "data" in current:
+            if current.get("result") is True or str(current.get("result")) == "1":
+                current = current.get("data")
+                continue
+            return {}
+        if isinstance(current.get("success"), bool) and "data" in current:
+            if current.get("success"):
+                current = current.get("data")
+                continue
+            return {}
+        if "code" in current and "data" in current:
+            if str(current.get("code")).upper() in {"0", "1", "200", "OK", "SUCCESS"}:
+                current = current.get("data")
+                continue
+            return {}
+        break
+    return current
+
+
+def parse_wxsph_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
+    """Parse authoritative category-attribute candidates from captured JSON."""
+    body = _mapping(unwrap_wxsph_payload(payload))
+    return _fields(
+        _items(body.get("attr")),
+        section="attributes",
+        prefix="wxsph:attribute",
+        path=_PROPERTIES.path,
+    )
+
+
 async def _activate(panel: Any, candidate: CategoryCandidate) -> None:
     if panel is None:
         raise PlatformDiscoveryError("category panel is unavailable")
@@ -617,12 +664,7 @@ class WxsphListing:
             },
         )
         payload = _mapping(payload)
-        attributes = _fields(
-            _items(payload.get("attr")),
-            section="attributes",
-            prefix="wxsph:attribute",
-            path=_PROPERTIES.path,
-        )
+        attributes = parse_wxsph_attribute_fields(payload)
         services = _fields(
             _items(payload.get("extraServiceList")),
             section="services",
@@ -676,4 +718,8 @@ class WxsphListing:
         )
 
 
-__all__ = ["WxsphListing"]
+__all__ = [
+    "WxsphListing",
+    "parse_wxsph_attribute_fields",
+    "unwrap_wxsph_payload",
+]

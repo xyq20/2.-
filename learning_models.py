@@ -57,7 +57,10 @@ class ProductFingerprint:
         payload = {
             "style_code": style_code,
             "title": title,
-            "assets": [asdict(asset) for asset in assets],
+            "assets": [
+                {"role": asset.role, "sha256": asset.sha256, "size": asset.size}
+                for asset in assets
+            ],
         }
         return cls(style_code, title, assets, canonical_sha256(payload))
 

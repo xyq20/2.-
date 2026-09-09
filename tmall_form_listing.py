@@ -170,8 +170,15 @@ class TmallFormListing(TaobaoListing):
         drawer: Any,
         logger: Any,
         api_index: Optional[TmallApiJsonIndex] = None,
+        *,
+        attribute_runtime: Optional[Any] = None,
     ) -> None:
-        super().__init__(page, drawer, logger)
+        super().__init__(
+            page,
+            drawer,
+            logger,
+            attribute_runtime=attribute_runtime,
+        )
         self.api_index = api_index
 
     async def _api_resolved_groups(

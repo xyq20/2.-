@@ -203,11 +203,20 @@ async def _size_header_label(header: Any) -> str:
 class DouyinListing:
     """抖音资料页的类目、属性和面料填写适配器。"""
 
-    def __init__(self, page: Any, drawer: Any, logger: Any, artifact_dir: Path) -> None:
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        artifact_dir: Path,
+        *,
+        attribute_runtime: Optional[Any] = None,
+    ) -> None:
         self.page = page
         self.drawer = drawer
         self.logger = logger
         self.artifact_dir = Path(artifact_dir)
+        self.attribute_runtime = attribute_runtime
         self.panel: Optional[Any] = None
         self._category_properties: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
         self._property_response_tasks: set[asyncio.Task[Any]] = set()
