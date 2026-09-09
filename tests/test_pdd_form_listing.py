@@ -1,7 +1,10 @@
+import json
 import unittest
 
+from attribute_runtime import ResolvedAttribute
 from pdd_data import PddFields
 from pdd_form_listing import PddFormListing
+from pdd_listing import parse_pdd_attribute_fields
 
 
 class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
@@ -18,12 +21,40 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def _listing(self):
+    async def _listing(self, attribute_runtime=None):
+        await self.page.route(
+            "**/pdd/getCategoryProperties.json*",
+            lambda route: route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "data": {
+                            "goodsPropertiesRule": {
+                                "properties": [
+                                    {
+                                        "refPid": "fit",
+                                        "name": "版型",
+                                        "required": True,
+                                        "propertyValueType": "select",
+                                        "values": [
+                                            {"vid": "slim", "value": "修身"},
+                                            {"vid": "loose", "value": "宽松"},
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
         await self.page.set_content(
             """
             <button role="tab" aria-selected="false" onclick="
               this.setAttribute('aria-selected', 'true');
-              document.querySelector('[role=tabpanel]').style.display='block';">
+              document.querySelector('[role=tabpanel]').style.display='block';
+              fetch('https://scm.superboss.cc/pdd/getCategoryProperties.json?leafCategoryId=7307');">
               拼多多资料
             </button>
             <div role="tabpanel" aria-label="拼多多资料" style="display:none">
@@ -96,9 +127,79 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             </script>
             """
         )
-        listing = PddFormListing(self.page, self.page.locator("body"), None)
+        listing = PddFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=attribute_runtime,
+        )
         await listing.open()
         return listing
+
+    async def test_parser_keeps_strict_pdd_field_and_option_ids(self):
+        fields = parse_pdd_attribute_fields(
+            {
+                "result": True,
+                "data": json.dumps(
+                    {
+                        "goodsPropertiesRule": {
+                            "properties": [
+                                {
+                                    "refPid": "fit",
+                                    "name": "版型",
+                                    "values": [
+                                        {"vid": "loose", "value": "宽松"}
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].source_id, "fit")
+        self.assertEqual(fields[0].option_values[0].value_id, "loose")
+        self.assertEqual(fields[0].option_values[0].label, "宽松")
+
+    async def test_learning_uses_pdd_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-pdd-1",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+
+        report = await listing.fill_category_attributes(
+            PddFields(fields={"版型": "宽松"})
+        )
+
+        self.assertEqual(report["attributes"]["版型"], ("宽松",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "pdd")
+        self.assertEqual(request.category_leaf_id, "7307")
+        self.assertEqual(request.field_id, "fit")
+        self.assertEqual(
+            tuple((value.value_id, value.label) for value in request.candidates),
+            (("slim", "修身"), ("loose", "宽松")),
+        )
 
     async def test_fills_excel_attributes_skips_only_crotch_and_applies_batch_presale(self):
         listing = await self._listing()

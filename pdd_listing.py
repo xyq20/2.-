@@ -203,6 +203,44 @@ def _property_fields(
     return tuple(result)
 
 
+def parse_pdd_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
+    """Parse authoritative PDD category-property candidates from raw JSON."""
+    matches = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    visit(json.loads(text))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            return
+        if isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, Mapping):
+            return
+        if "goodsPropertiesRule" in value:
+            fields = _property_fields(
+                _nested_rule_items(
+                    value.get("goodsPropertiesRule"),
+                    ("properties",),
+                ),
+                section="category_properties",
+                prefix="pdd:property",
+                api_path=_PROPERTIES.path,
+            )
+            for field in fields:
+                matches[(str(field.source_id or ""), field.schema_key)] = field
+        for child in value.values():
+            visit(child)
+
+    visit(payload)
+    return tuple(matches.values())
+
+
 def _descriptor_fields(values: Iterable[Any]) -> Tuple[FieldSchema, ...]:
     return _property_fields(
         values,
@@ -957,4 +995,4 @@ class PddListing:
         )
 
 
-__all__ = ["PddListing"]
+__all__ = ["PddListing", "parse_pdd_attribute_fields"]

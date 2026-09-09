@@ -10,8 +10,18 @@ import asyncio
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlsplit
 
+from attribute_runtime import AttributeRequest
 from pdd_data import PddFields
+from learning_models import CandidateValue, canonical_sha256
+from pdd_listing import parse_pdd_attribute_fields
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldSchema
 from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
@@ -53,6 +63,7 @@ PDD_INHERITED_FIELDS = frozenset(
     normalize_label(value) for value in ("商品分类", "商品标题", "商品描述", "品牌")
 )
 PDD_BATCH_ORDER = ("拼单价", "单买价", "库存")
+PDD_PROPERTIES_ENDPOINT = "/pdd/getCategoryProperties.json"
 PDD_CATEGORY_MARKERS = frozenset(
     normalize_label(value)
     for value in (
@@ -134,6 +145,165 @@ def _special_category_values(
 class PddFormListing(TaobaoListing):
     """Fill PDD category data, its price/inventory batch row and presale."""
 
+    def _start_api_capture(self) -> None:
+        previous_handler = getattr(self, "_api_response_handler", None)
+        if previous_handler is not None:
+            try:
+                self.page.remove_listener("response", previous_handler)
+            except Exception:
+                pass
+        self._api_observations: List[Mapping[str, Any]] = []
+        self._api_capture_tasks: List[asyncio.Task[Any]] = []
+
+        def handle_response(response: Any) -> None:
+            try:
+                path = urlsplit(response.url).path
+            except Exception:
+                return
+            if path != PDD_PROPERTIES_ENDPOINT:
+                return
+            task = asyncio.create_task(self._capture_api_response(response))
+            self._api_capture_tasks.append(task)
+
+        self._api_response_handler = handle_response
+        self.page.on("response", handle_response)
+
+    async def _capture_api_response(self, response: Any) -> None:
+        observation: Dict[str, Any] = {
+            "path": PDD_PROPERTIES_ENDPOINT,
+            "http_status": int(response.status),
+            "body": "unavailable",
+            "attribute_fields": (),
+            "category_id": "",
+        }
+        try:
+            payload = await response.json()
+            observation["body"] = "json"
+            observation["attribute_fields"] = parse_pdd_attribute_fields(payload)
+            query = parse_qs(urlsplit(response.url).query)
+            for key in ("leafCategoryId", "categoryId", "cid"):
+                values = tuple(query.get(key, ()))
+                if len(values) == 1 and str(values[0]).strip():
+                    observation["category_id"] = str(values[0]).strip()
+                    break
+        except Exception:
+            pass
+        self._api_observations.append(observation)
+
+    async def _captured_api_field(self, page_label: str) -> Tuple[FieldSchema, str]:
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        wanted = normalize_label(page_label)
+        # A category change can produce more than one response in one drawer.
+        # The newest response containing this field is the active category;
+        # ambiguity within that single response still fails closed.
+        for observation in reversed(getattr(self, "_api_observations", ())):
+            category_id = str(observation.get("category_id") or "").strip()
+            fields = {
+                (str(field.source_id or ""), field.schema_key): field
+                for field in observation.get("attribute_fields", ())
+                if normalize_label(field.label) == wanted
+            }
+            if not fields:
+                continue
+            if len(fields) != 1:
+                raise PddFormListingError(
+                    "拼多多属性“{0}”接口字段定义不唯一".format(page_label)
+                )
+            if not category_id:
+                raise PddFormListingError(
+                    "拼多多属性“{0}”缺少接口类目 ID".format(page_label)
+                )
+            return next(iter(fields.values())), category_id
+        raise PddFormListingError(
+            "拼多多属性“{0}”缺少接口 JSON 字段定义".format(page_label)
+        )
+
+    async def _resolve_learning_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Tuple[Tuple[str, ...], ...]:
+        runtime = getattr(self, "attribute_runtime", None)
+        normalized_groups = tuple(tuple(str(value) for value in group) for group in groups)
+        if runtime is None:
+            return normalized_groups
+        field, category_id = await self._captured_api_field(page_label)
+        if not field.source_id:
+            raise PddFormListingError(
+                "拼多多属性“{0}”的接口字段 ID 为空".format(page_label)
+            )
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        try:
+            candidates = reconcile_candidates(
+                field.option_values,
+                tuple(
+                    DomCandidate(
+                        str(option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in options
+                ),
+            )
+        except CandidateSourceError as exc:
+            raise PddFormListingError(
+                "拼多多属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label, exc.reason_code
+                )
+            ) from exc
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "pdd",
+                "category_leaf_id": category_id,
+                "field_id": str(field.source_id),
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_groups = []
+        for group in normalized_groups:
+            exact = tuple(
+                value.label
+                for value in candidates
+                if any(
+                    normalize_option(value.label) == normalize_option(alias)
+                    for alias in group
+                )
+            )
+            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="pdd",
+                    category_leaf_id=category_id,
+                    field_id=str(field.source_id),
+                    field_label=page_label,
+                    candidates=tuple(
+                        CandidateValue(value.value_id, value.label)
+                        for value in candidates
+                    ),
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value)},
+                    custom_allowed=bool(field.custom_allowed),
+                    schema_version=schema_version,
+                    control_type="select",
+                )
+            )
+            resolved_groups.append((resolved.label,))
+        return tuple(resolved_groups)
+
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
@@ -146,6 +316,7 @@ class PddFormListing(TaobaoListing):
         raise PddFormListingError("拼多多资料加载遮罩在 30 秒内未消失")
 
     async def open(self) -> "PddFormListing":
+        self._start_api_capture()
         tab = self.drawer.get_by_role("tab", name="拼多多资料", exact=True)
         try:
             await tab.wait_for(state="visible", timeout=30_000)
@@ -357,6 +528,7 @@ class PddFormListing(TaobaoListing):
                 raise PddFormListingError(
                     "拼多多属性“{0}”是单选，Excel 却提供多个逗号分组".format(page_label)
                 )
+            groups = await self._resolve_learning_groups(page_label, select, groups)
             return await self._select_values(select, groups, label=page_label, multi=multi)
         if len(visible_inputs) != 1:
             raise PddFormListingError(
