@@ -92,6 +92,7 @@ export const snapshot = {
   field_label: "裤长",
   schema_version: "schema1",
   custom_allowed: false,
+  canonical_field: "pants_length",
   options: [
     { value_id: "long", label: "长裤", position: 0 },
     { value_id: "short", label: "短裤", position: 1 },

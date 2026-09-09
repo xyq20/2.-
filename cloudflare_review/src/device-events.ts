@@ -13,6 +13,12 @@ import type {
   Json,
   ReviewEnv,
 } from "./types";
+import {
+  stableJson,
+  validateCheckpoint,
+  validateStage,
+  type StateGuard,
+} from "./event-state";
 const fields: Record<
   DeviceEventType,
   { required: string[]; optional: string[] }
@@ -59,8 +65,9 @@ const fields: Record<
       "current_index",
       "status",
       "pending_review_id",
+      "version",
     ],
-    optional: ["version", "image_version"],
+    optional: ["image_version"],
   },
   "stage.completed": {
     required: [
@@ -78,11 +85,13 @@ const fields: Record<
       "run_id",
       "product_version",
       "platform_id",
+      "category_leaf_id",
       "field_id",
+      "snapshot_version",
       "verified",
       "payload_json",
     ],
-    optional: ["snapshot_version", "actual_value_id", "actual_label"],
+    optional: ["actual_value_id", "actual_label"],
   },
   "text_facts.created": {
     required: ["product_version", "source", "payload_json"],
@@ -126,11 +135,12 @@ export function validateDeviceEvent(
   safeObject(data.payload);
   const p = data.payload as Record<string, Json>;
   const spec = fields[type as DeviceEventType];
+  for (const required of spec.required)
+    requireValue(Object.hasOwn(p, required), 400, "missing_" + required);
   requireValue(
-    spec.required.every((k) => Object.hasOwn(p, k)) &&
-      Object.keys(p).every((k) =>
-        [...spec.required, ...spec.optional].includes(k),
-      ),
+    Object.keys(p).every((k) =>
+      [...spec.required, ...spec.optional].includes(k),
+    ),
     400,
     "invalid_payload_keys",
   );
@@ -144,6 +154,13 @@ export function validateDeviceEvent(
     "platform_order",
   ]);
   for (const [key, value] of Object.entries(p)) {
+    if (
+      (type === "readback.recorded" && key === "actual_value_id") ||
+      (type === "review.created" &&
+        key === "suggested_value_id" &&
+        value === "")
+    )
+      continue;
     if (structured.has(key)) {
       requireValue(
         value !== null && typeof value === "object",
@@ -238,14 +255,24 @@ export async function ingestDeviceEvent(
   env: ReviewEnv,
 ): Promise<Response> {
   const event = validateDeviceEvent(await body(request));
-  const p = event.payload;
+  const p = { ...event.payload };
+  let stateGuard: StateGuard | undefined;
   let eventProduct = p.product_version ?? null;
   const existing = await env.DB.prepare(
-    "SELECT id FROM device_events WHERE idempotency_key=?",
+    "SELECT id,event_type,payload_json FROM device_events WHERE idempotency_key=?",
   )
     .bind(event.idempotency_key)
-    .first<{ id: string }>();
-  if (existing) return json({ event_id: existing.id }, 409);
+    .first<{ id: string; event_type: string; payload_json: string }>();
+  if (existing) {
+    requireValue(
+      existing.event_type === event.event_type &&
+        stableJson(JSON.parse(existing.payload_json)) ===
+          stableJson(event.payload),
+      409,
+      "idempotency_payload_conflict",
+    );
+    return json({ event_id: existing.id }, 409);
+  }
   if (p.product_version) {
     const prod = await env.DB.prepare(
       "SELECT deleting FROM products WHERE product_version=?",
@@ -254,13 +281,72 @@ export async function ingestDeviceEvent(
       .first<{ deleting: number }>();
     requireValue(!prod?.deleting, 409, "product_deleting");
   }
-  if (event.event_type === "review.created") {
+  if (
+    event.event_type === "review.created" ||
+    event.event_type === "readback.recorded"
+  ) {
     const snapshot = await env.DB.prepare(
-      "SELECT snapshot_version FROM option_snapshots WHERE snapshot_version=? AND platform_id=? AND category_leaf_id=? AND field_id=?",
+      "SELECT * FROM option_snapshots WHERE snapshot_version=? AND platform_id=? AND category_leaf_id=? AND field_id=?",
     )
       .bind(p.snapshot_version, p.platform_id, p.category_leaf_id, p.field_id)
-      .first();
+      .first<{
+        field_label: string;
+        schema_version: string;
+        options_json: string;
+        custom_allowed: number;
+      }>();
     requireValue(snapshot, 422, "snapshot_mismatch");
+    const options = JSON.parse(snapshot.options_json) as { value_id: string }[];
+    if (event.event_type === "review.created") {
+      requireValue(
+        p.field_label === snapshot.field_label,
+        422,
+        "snapshot_label_mismatch",
+      );
+      const mapping = await env.DB.prepare(
+        "SELECT canonical_field FROM platform_fields WHERE platform_id=? AND category_leaf_id=? AND source_field_id=? AND schema_version=?",
+      )
+        .bind(
+          p.platform_id,
+          p.category_leaf_id,
+          p.field_id,
+          snapshot.schema_version,
+        )
+        .first<{ canonical_field: string | null }>();
+      const canonical = mapping?.canonical_field ?? null;
+      requireValue(
+        p.canonical_field === undefined ||
+          p.canonical_field === null ||
+          p.canonical_field === canonical,
+        422,
+        "canonical_field_mismatch",
+      );
+      p.canonical_field = canonical;
+      if (canonical === null) p.reason_code = "field_mapping_required";
+      p.suggested_value_id = p.suggested_value_id || null;
+      requireValue(
+        p.suggested_value_id === null ||
+          options.filter((option) => option.value_id === p.suggested_value_id)
+            .length === 1,
+        422,
+        "suggested_candidate_not_unique",
+      );
+    } else {
+      requireValue(
+        typeof p.actual_value_id === "string" &&
+          p.actual_value_id.length > 0 &&
+          p.actual_value_id.length <= 256,
+        422,
+        "actual_value_required",
+      );
+      requireValue(
+        snapshot.custom_allowed === 1 ||
+          options.filter((option) => option.value_id === p.actual_value_id)
+            .length === 1,
+        422,
+        "actual_candidate_not_unique",
+      );
+    }
   }
   if (
     event.event_type === "readback.recorded" ||
@@ -281,6 +367,10 @@ export async function ingestDeviceEvent(
     );
     eventProduct = checkpoint.product_version;
   }
+  if (event.event_type === "checkpoint.updated")
+    stateGuard = await validateCheckpoint(env, p);
+  if (event.event_type === "stage.completed")
+    stateGuard = await validateStage(env, p);
   const id = crypto.randomUUID(),
     now = new Date().toISOString();
   const q = (sql: string, ...values: (Json | undefined)[]) =>
@@ -299,11 +389,21 @@ export async function ingestDeviceEvent(
       id,
       event.idempotency_key,
       event.event_type,
-      p,
+      event.payload,
       now,
       p.device_id,
     ),
   ];
+  // NOT NULL violation aborts the entire batch if a state changed after validation.
+  // The predicate is gated by our newly inserted event ID so an idempotent race is harmless.
+  if (stateGuard)
+    statements.push(
+      q(
+        `UPDATE device_events SET idempotency_key=NULL WHERE id=? AND (${stateGuard.sql})`,
+        id,
+        ...stateGuard.values,
+      ),
+    );
   const guard = " WHERE EXISTS(SELECT 1 FROM device_events WHERE id=?)";
   const insert = (
     table: string,
@@ -485,11 +585,11 @@ export async function ingestDeviceEvent(
           p.current_index,
           p.status,
           p.pending_review_id,
-          p.version ?? 1,
+          p.version,
           p.image_version ?? "",
           now,
         ],
-        "ON CONFLICT(run_id) DO UPDATE SET current_index=excluded.current_index,status=excluded.status,pending_review_id=excluded.pending_review_id,version=excluded.version,updated_at=excluded.updated_at WHERE excluded.version>run_checkpoints.version AND excluded.product_version=run_checkpoints.product_version AND excluded.device_id=run_checkpoints.device_id",
+        "ON CONFLICT(run_id) DO UPDATE SET current_index=excluded.current_index,status=excluded.status,pending_review_id=excluded.pending_review_id,version=excluded.version,updated_at=excluded.updated_at WHERE excluded.version>run_checkpoints.version",
       );
       break;
     case "stage.completed":
@@ -515,7 +615,7 @@ export async function ingestDeviceEvent(
           p.verified ? 1 : 0,
           now,
         ],
-        "ON CONFLICT(run_id,platform_id) DO UPDATE SET idempotency_key=excluded.idempotency_key,status=excluded.status,expected_json=excluded.expected_json,readback_json=excluded.readback_json,verified=excluded.verified,updated_at=excluded.updated_at WHERE excluded.verified>=stage_results.verified",
+        "ON CONFLICT(run_id,platform_id) DO UPDATE SET idempotency_key=excluded.idempotency_key,status=excluded.status,expected_json=excluded.expected_json,readback_json=excluded.readback_json,verified=excluded.verified,updated_at=excluded.updated_at WHERE excluded.status<>stage_results.status",
       );
       break;
     case "readback.recorded":
@@ -569,13 +669,28 @@ export async function ingestDeviceEvent(
     const results = await env.DB.batch(statements);
     if (!results[0]!.meta.changes) {
       const raced = await env.DB.prepare(
-        "SELECT id FROM device_events WHERE idempotency_key=?",
+        "SELECT id,event_type,payload_json FROM device_events WHERE idempotency_key=?",
       )
         .bind(event.idempotency_key)
-        .first<{ id: string }>();
+        .first<{ id: string; event_type: string; payload_json: string }>();
+      requireValue(
+        raced &&
+          raced.event_type === event.event_type &&
+          stableJson(JSON.parse(raced.payload_json)) ===
+            stableJson(event.payload),
+        409,
+        "idempotency_payload_conflict",
+      );
       return json({ event_id: raced!.id }, 409);
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    if (
+      stateGuard &&
+      error instanceof Error &&
+      error.message.includes("device_events.idempotency_key")
+    )
+      throw new HttpError(409, "concurrent_state_conflict");
     throw new HttpError(422, "event_dependency_or_conflict");
   }
   return json({ event_id: id }, 201);

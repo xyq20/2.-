@@ -105,6 +105,7 @@ it("admin deletion removes original, thumbnail, events and FK-related learning r
     admin,
   );
   await device("checkpoint.updated", {
+    version: 1,
     run_id: "run1",
     product_version: "pv1",
     device_id: "device1",
@@ -123,6 +124,9 @@ it("admin deletion removes original, thumbnail, events and FK-related learning r
     verified: true,
   });
   await device("readback.recorded", {
+    category_leaf_id: "pants",
+    snapshot_version: "sv1",
+    actual_value_id: "long",
     run_id: "run1",
     product_version: "pv1",
     platform_id: "pdd",

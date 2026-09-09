@@ -86,15 +86,33 @@ npm run deploy
 
 ```json
 {"event_type":"product.upsert","payload":{"product_version":"pv1","style_code":"K01","title":"休闲裤","category_json":{"leaf":"pants"}}}
-{"event_type":"snapshot.created","payload":{"snapshot_version":"sv1","platform_id":"pdd","category_leaf_id":"pants","field_id":"length","field_label":"裤长","schema_version":"schema1","custom_allowed":false,"options":[{"value_id":"long","label":"长裤","position":0}]}}
+{"event_type":"snapshot.created","payload":{"snapshot_version":"sv1","platform_id":"pdd","category_leaf_id":"pants","field_id":"length","field_label":"裤长","canonical_field":"pants_length","schema_version":"schema1","custom_allowed":false,"options":[{"value_id":"long","label":"长裤","position":0}]}}
 {"event_type":"review.created","payload":{"id":"review1","run_id":"run1","device_id":"device1","product_version":"pv1","platform_id":"pdd","category_leaf_id":"pants","field_id":"length","field_label":"裤长","canonical_field":"pants_length","snapshot_version":"sv1","suggested_value_id":"long","reason_code":"needs_review","evidence_json":{"summary":"裤脚接近脚踝"}}}
 {"event_type":"checkpoint.updated","payload":{"run_id":"run1","product_version":"pv1","device_id":"device1","execution_mode":"all","platform_order":["base","pdd"],"current_index":1,"status":"waiting_review","pending_review_id":"review1","version":1,"image_version":"images1"}}
 {"event_type":"stage.completed","payload":{"run_id":"run1","platform_id":"pdd","status":"readback_verified","expected_json":{"length":"long"},"readback_json":{"length":"long"},"verified":true}}
-{"event_type":"readback.recorded","payload":{"run_id":"run1","product_version":"pv1","platform_id":"pdd","field_id":"length","snapshot_version":"sv1","actual_value_id":"long","actual_label":"长裤","verified":true,"payload_json":{"source":"api_readback"}}}
+{"event_type":"readback.recorded","payload":{"run_id":"run1","product_version":"pv1","platform_id":"pdd","category_leaf_id":"pants","field_id":"length","snapshot_version":"sv1","actual_value_id":"long","actual_label":"长裤","verified":true,"payload_json":{"source":"api_readback"}}}
 {"event_type":"text_facts.created","payload":{"product_version":"pv1","source":"excel","payload_json":{"material":"棉"}}}
 ```
 
-实际发送要为每个例子补上 envelope 的 `idempotency_key`。union 与每类允许键定义在 `src/types.ts`、`src/device-events.ts`。未知类型/未知键、嵌套 password/token/cookie/authorization/secret/API key/Chrome profile 字段返回 400。`visual_facts` 由 Worker 内部分析写入，不开放设备伪造模型视觉输出的事件。`snapshot_version` 一经创建不可改变候选；更新候选应产生新版本。checkpoint 更新应显式传递递增 version，不能覆盖更高版本。原始 `verified=false` 回读可以入库，但只允许 `verified=true` 且经过业务门禁的样本参与学习。
+实际发送要为每个例子补上 envelope 的 `idempotency_key`。union 与每类允许键定义在 `src/types.ts`、`src/device-events.ts`。缺失必填键返回 400 `missing_<字段名>`；未知类型/未知键、嵌套 password/token/cookie/authorization/secret/API key/Chrome profile 字段也返回 400。同 key 必须重送原始内容，修改内容返回 409 `idempotency_payload_conflict`，不会作为已成功事件对账。`visual_facts` 由 Worker 内部分析写入，不开放设备伪造模型视觉输出的事件。`snapshot_version` 一经创建不可改变候选；更新候选应产生新版本。
+
+`readback.recorded` 必填 `category_leaf_id` 和 `snapshot_version`，snapshot 的平台、叶子类目、字段必须完全匹配。`actual_value_id` 不能为空；非 `custom_allowed` 的字段必须在对应候选中出现恰好一次，否则 422 且不入库。原始 `verified=false` 回读也必须满足这些来源约束；只允许 `verified=true` 且通过业务门禁的样本参与学习。
+
+`review.created` 的 `field_label` 必须与 snapshot 一致。规范字段从相同平台/叶子类目/原始字段/schema 版本的 `platform_fields` 映射派生；传入非空 `canonical_field` 时必须严格匹配。映射未知时只存 null 并强制 `reason_code=field_mapping_required`。非空建议值必须是 snapshot 内唯一合法候选。
+
+`checkpoint.updated` 的 `device_id`、正整数 `version` 必填；缺失分别返回 `missing_device_id`、`missing_version`。`image_version` 可省略并固定为 `""`，但本地应在首次提交就填写正确图片版本。创建后 `product_version/device_id/execution_mode/platform_order/image_version` 均不可修改；变化需新建 run。旧 version、同 version 不同内容、非法状态/索引回退均 409。同 version 完全相同内容允许对账。状态转换为：
+
+| 当前状态 | 允许后续状态（也允许本状态原地更新，终态只允许相同内容） |
+| --- | --- |
+| running | waiting_review、failed、completed、cancelled |
+| waiting_review | resume_pending、failed、cancelled |
+| resume_pending | running、failed、cancelled |
+| failed | running、waiting_review、cancelled |
+| completed / cancelled | 无 |
+
+首次中心 checkpoint 为 running 或 waiting_review。waiting_review/resume_pending 必须引用同一 run、商品、设备及当前平台的审核；resume_pending 的审核必须已确认。事务内再次核验记录版本，冲突时同时回滚事件和数据，不能以“收到事件”掩盖未更新检查点。
+
+`stage.completed` 只接受 started/filled/saved/failed/readback_verified，且 `verified=true` 当且仅当状态是 readback_verified。started→filled→saved 可向前推进或失败，failed 仅可升级到 readback_verified；可以直接上报最终回读成功。readback_verified 为不可降级终态；任何状态同级不同证据也返回 409，完全相同内容只对账不覆盖。previewed/saved_unverified 不作为中心完成事件接收。本地正常流程只在真实保存回读成功后发送 readback_verified；失败/中间记录不参与学习。
 
 ## 审核与续跑
 

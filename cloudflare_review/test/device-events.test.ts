@@ -13,6 +13,7 @@ setup();
 it("allows a failed stage to recover but never downgrades verified success", async () => {
   await seedReview();
   await device("checkpoint.updated", {
+    version: 1,
     run_id: "run1",
     product_version: "pv1",
     device_id: "device1",
@@ -41,7 +42,7 @@ it("allows a failed stage to recover but never downgrades verified success", asy
       })
     ).status,
   ).toBe(201);
-  expect((await device("stage.completed", stage)).status).toBe(201);
+  expect((await device("stage.completed", stage)).status).toBe(409);
   expect(
     await testEnv.DB.prepare("SELECT verified FROM stage_results").first(
       "verified",
@@ -141,6 +142,7 @@ it("rejects concurrent reuse of a snapshot version with different options", asyn
 it("rejects mismatched readback product and checkpoint provenance", async () => {
   await seedReview();
   await device("checkpoint.updated", {
+    version: 1,
     run_id: "run1",
     product_version: "pv1",
     device_id: "device1",
@@ -157,6 +159,8 @@ it("rejects mismatched readback product and checkpoint provenance", async () => 
         run_id: "run1",
         product_version: "pv2",
         platform_id: "pdd",
+        category_leaf_id: "pants",
+        snapshot_version: "sv1",
         field_id: "length",
         verified: true,
         payload_json: {},
