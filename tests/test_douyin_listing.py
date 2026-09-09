@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from attribute_runtime import ResolvedAttribute
 from douyin_data import MaterialComponent
 from douyin_listing import (
     DouyinListing,
@@ -569,6 +570,59 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.fill_attribute("里料材质", "不存在/亚麻")
 
         self.assertEqual(actual, ("亚麻",))
+
+    async def test_learning_uses_douyin_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-douyin-1",
+                )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing._category_properties_generation = 1
+        self.listing._category_properties_leaf_id = "mens-casual-pants"
+        self.listing._category_properties = {
+            normalize_option("厚度"): (
+                {
+                    "name": "厚度",
+                    "type": "select",
+                    "id": "thickness-property",
+                    "options": (
+                        {"name": "常规款", "id": "regular"},
+                        {"name": "常规款（加厚）", "id": "thick"},
+                    ),
+                },
+            )
+        }
+
+        actual = await self.listing.fill_attribute("厚度", "常 规-款")
+
+        self.assertEqual(actual, ("常规款",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "douyin")
+        self.assertEqual(request.category_leaf_id, "mens-casual-pants")
+        self.assertEqual(request.field_id, "thickness-property")
+        self.assertEqual(request.excel_value, "常规款")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("regular", "常规款"), ("thick", "常规款（加厚）")),
+        )
 
     async def test_or_value_merges_partial_api_and_dom_before_matching(self):
         await self.listing.open()

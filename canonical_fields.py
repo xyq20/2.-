@@ -54,6 +54,7 @@ ALIAS_REGISTRATIONS: Tuple[AliasRegistration, ...] = (
     (("jd", "裤长"), "pants_length"),
     (("yz", "厚薄"), "thickness"),
     (("jd", "厚度"), "thickness"),
+    (("douyin", "厚度"), "thickness"),
     (("wxsph", "面料材质成分含量"), "material_percentage"),
     (("wxsph", "材质成分"), "material_composition"),
     (("jd", "颜色"), "color"),

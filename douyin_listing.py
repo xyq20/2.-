@@ -18,6 +18,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from attribute_runtime import AttributeRequest
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldOption
 from sync_validation import matches_any, sequences_match, split_or_values
 
 
@@ -884,6 +892,114 @@ class DouyinListing:
             raise DouyinListingError(f"属性“{label}”接口定义不唯一：{names}")
         return records[0]
 
+    async def _resolve_learning_select_value(
+        self,
+        label: str,
+        select: Any,
+        alternatives: Sequence[str],
+    ) -> Tuple[str, Sequence[Mapping[str, str]]]:
+        """Resolve one select value from correlated API JSON and visible DOM."""
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise DouyinListingError("抖音属性学习运行器未启用")
+        api_property = await self._api_property(label)
+        if api_property is None:
+            raise DouyinListingError(
+                f"抖音属性“{label}”缺少唯一的接口 JSON 字段定义"
+            )
+        field_id = str(api_property.get("id") or "").strip()
+        category_id = str(self._category_properties_leaf_id or "").strip()
+        if not field_id or not category_id:
+            raise DouyinListingError(
+                f"抖音属性“{label}”缺少接口字段 ID 或类目 ID"
+            )
+        raw_options = api_property.get("options")
+        if not isinstance(raw_options, Sequence) or isinstance(raw_options, (str, bytes)):
+            raw_options = ()
+        api_options = tuple(
+            option
+            for option in raw_options
+            if isinstance(option, Mapping)
+        )
+        field_options = tuple(
+            FieldOption(
+                str(option.get("id") or ""),
+                str(option.get("name") or ""),
+                position,
+            )
+            for position, option in enumerate(api_options)
+        )
+
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        try:
+            candidates = reconcile_candidates(
+                field_options,
+                tuple(
+                    DomCandidate(
+                        str(option.get("id") or option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in dom_options
+                ),
+            )
+        except CandidateSourceError as exc:
+            raise DouyinListingError(
+                f"抖音属性“{label}”接口候选与页面候选不一致：{exc.reason_code}"
+            ) from exc
+
+        existing = {
+            normalize_option(candidate.label): candidate.label
+            for candidate in candidates
+        }
+        exact_alternatives = [
+            existing[normalize_option(value)]
+            for value in alternatives
+            if normalize_option(value) in existing
+        ]
+        excel_value = (
+            exact_alternatives[0]
+            if exact_alternatives
+            else "/".join(str(value) for value in alternatives)
+        )
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "douyin",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="douyin",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=label,
+                candidates=tuple(
+                    CandidateValue(value.value_id, value.label)
+                    for value in candidates
+                ),
+                excel_value=excel_value,
+                evidence={"excel": bool(excel_value.strip())},
+                custom_allowed=False,
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        return resolved.label, api_options
+
     async def _open_select(self, select: Any, *, multi: bool) -> None:
         if multi:
             search = select.locator(".el-select__tags input.el-select__input").first
@@ -1269,6 +1385,22 @@ class DouyinListing:
             alternatives = value_candidates(label, expected)
             if not alternatives:
                 raise DouyinListingError(f"属性“{label}”期望值为空")
+
+            if self.attribute_runtime is not None:
+                chosen_expected, api_options = (
+                    await self._resolve_learning_select_value(
+                        label,
+                        select,
+                        alternatives,
+                    )
+                )
+                return await self._select_values(
+                    select,
+                    (chosen_expected,),
+                    label=label,
+                    multi=multi,
+                    api_options=api_options,
+                )
 
             current = await self._read_select_values(select, multi=multi)
             if matches_any(current, alternatives, normalize_option):
