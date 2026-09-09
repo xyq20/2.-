@@ -19,6 +19,7 @@ import {
   validateStage,
   type StateGuard,
 } from "./event-state";
+import { recordVerifiedRuleOutcome } from "./rules";
 const fields: Record<
   DeviceEventType,
   { required: string[]; optional: string[] }
@@ -271,6 +272,8 @@ export async function ingestDeviceEvent(
       409,
       "idempotency_payload_conflict",
     );
+    if (event.event_type === "readback.recorded")
+      await recordVerifiedRuleOutcome(env.DB, event.idempotency_key);
     return json({ event_id: existing.id }, 409);
   }
   if (p.product_version) {
@@ -693,5 +696,7 @@ export async function ingestDeviceEvent(
       throw new HttpError(409, "concurrent_state_conflict");
     throw new HttpError(422, "event_dependency_or_conflict");
   }
+  if (event.event_type === "readback.recorded")
+    await recordVerifiedRuleOutcome(env.DB, event.idempotency_key);
   return json({ event_id: id }, 201);
 }
