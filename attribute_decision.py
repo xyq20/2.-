@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Protocol, Tuple
 
-from canonical_fields import EvidenceKind, FieldMappingError, policy_for
+from canonical_fields import (
+    EvidenceKind,
+    FieldMappingError,
+    map_platform_field,
+    policy_for,
+)
 
 
 class DecisionStatus(str, Enum):
@@ -38,19 +43,47 @@ class ValidatedDecision:
 
 
 class CandidateValueProtocol(Protocol):
-    value_id: str
-    label: str
+    @property
+    def value_id(self) -> str:
+        ...
+
+    @property
+    def label(self) -> str:
+        ...
 
 
 class CandidateSnapshotProtocol(Protocol):
-    platform_id: str
-    category_leaf_id: str
-    field_id: str
-    field_label: str
-    values: Tuple[CandidateValueProtocol, ...]
-    schema_version: str
-    custom_allowed: bool
-    snapshot_version: str
+    @property
+    def platform_id(self) -> str:
+        ...
+
+    @property
+    def category_leaf_id(self) -> str:
+        ...
+
+    @property
+    def field_id(self) -> str:
+        ...
+
+    @property
+    def field_label(self) -> str:
+        ...
+
+    @property
+    def values(self) -> Tuple[CandidateValueProtocol, ...]:
+        ...
+
+    @property
+    def schema_version(self) -> str:
+        ...
+
+    @property
+    def custom_allowed(self) -> bool:
+        ...
+
+    @property
+    def snapshot_version(self) -> str:
+        ...
 
 
 def _review(reason_code: str, snapshot_version: str) -> ValidatedDecision:
@@ -75,6 +108,21 @@ def validate_decision(
 ) -> ValidatedDecision:
     snapshot_version = str(snapshot.snapshot_version)
 
+    try:
+        snapshot_canonical_field = map_platform_field(
+            snapshot.platform_id, snapshot.field_label
+        )
+    except FieldMappingError:
+        return _review("field_mapping_required", snapshot_version)
+
+    if decision.canonical_field != snapshot_canonical_field:
+        return _review("canonical_field_mismatch", snapshot_version)
+
+    try:
+        policy = policy_for(snapshot_canonical_field)
+    except FieldMappingError:
+        return _review("field_mapping_required", snapshot_version)
+
     if (
         decision.expected_snapshot_version is not None
         and decision.expected_snapshot_version != snapshot_version
@@ -83,11 +131,6 @@ def validate_decision(
 
     if decision.has_conflict:
         return _review("evidence_conflict", snapshot_version)
-
-    try:
-        policy = policy_for(decision.canonical_field)
-    except FieldMappingError:
-        return _review("field_mapping_required", snapshot_version)
 
     evidence_names = set(_evidence_names(decision))
     for required in policy.required_evidence:
@@ -102,8 +145,19 @@ def validate_decision(
         return _review("candidate_empty", snapshot_version)
 
     candidate_ids = tuple(candidate.value_id for candidate in candidates)
+    if any(
+        not isinstance(candidate_id, str) or not candidate_id.strip()
+        for candidate_id in candidate_ids
+    ):
+        return _review("candidate_invalid", snapshot_version)
     if len(candidate_ids) != len(set(candidate_ids)):
         return _review("candidate_ambiguous", snapshot_version)
+
+    if (
+        not isinstance(decision.proposed_value_id, str)
+        or not decision.proposed_value_id.strip()
+    ):
+        return _review("proposed_value_invalid", snapshot_version)
 
     matches = tuple(
         candidate

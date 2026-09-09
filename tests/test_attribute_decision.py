@@ -1,7 +1,10 @@
 import dataclasses
+import inspect
 import unittest
 
 from attribute_decision import (
+    CandidateSnapshotProtocol,
+    CandidateValueProtocol,
     DecisionInput,
     DecisionStatus,
     ValidatedDecision,
@@ -57,6 +60,66 @@ def make_decision(**overrides):
     return DecisionInput(**values)
 
 
+def make_material_percentage_snapshot(**overrides):
+    return make_snapshot(
+        field_id="material-percentage",
+        field_label="面料材质成分含量",
+        values=(
+            SnapshotValue("cotton-100", "100%棉"),
+            SnapshotValue("mixed", "混纺"),
+        ),
+        snapshot_version="snapshot-material-percentage-1",
+        **overrides,
+    )
+
+
+def make_material_composition_snapshot(**overrides):
+    return make_snapshot(
+        field_id="material-composition",
+        field_label="材质成分",
+        values=(
+            SnapshotValue("cotton", "棉"),
+            SnapshotValue("polyester", "聚酯纤维"),
+        ),
+        snapshot_version="snapshot-material-composition-1",
+        **overrides,
+    )
+
+
+class ComputedSnapshot:
+    @property
+    def platform_id(self):
+        return "wxsph"
+
+    @property
+    def category_leaf_id(self):
+        return "pants"
+
+    @property
+    def field_id(self):
+        return "pants-length"
+
+    @property
+    def field_label(self):
+        return "裤长"
+
+    @property
+    def values(self):
+        return (SnapshotValue("long", "长裤"),)
+
+    @property
+    def schema_version(self):
+        return "schema-1"
+
+    @property
+    def custom_allowed(self):
+        return False
+
+    @property
+    def snapshot_version(self):
+        return "computed-snapshot-1"
+
+
 class AttributeDecisionTests(unittest.TestCase):
     def assert_review(self, result, reason_code):
         self.assertEqual(result.status, DecisionStatus.REVIEW_REQUIRED)
@@ -87,6 +150,30 @@ class AttributeDecisionTests(unittest.TestCase):
         )
 
         self.assert_review(result, "candidate_missing")
+
+    def test_empty_or_whitespace_candidate_ids_are_invalid_placeholders(self):
+        for invalid_id in ("", "   "):
+            with self.subTest(invalid_id=repr(invalid_id)):
+                snapshot = make_snapshot(
+                    values=(
+                        SnapshotValue(invalid_id, "请选择"),
+                        SnapshotValue("long", "长裤"),
+                    )
+                )
+
+                self.assert_review(
+                    validate_decision(make_decision(), snapshot),
+                    "candidate_invalid",
+                )
+
+    def test_empty_or_whitespace_proposed_value_id_is_invalid(self):
+        for invalid_id in ("", "   "):
+            with self.subTest(invalid_id=repr(invalid_id)):
+                result = validate_decision(
+                    make_decision(proposed_value_id=invalid_id), make_snapshot()
+                )
+
+                self.assert_review(result, "proposed_value_invalid")
 
     def test_duplicate_candidate_id_requires_review(self):
         duplicate = make_snapshot(
@@ -119,25 +206,46 @@ class AttributeDecisionTests(unittest.TestCase):
 
         self.assert_review(result, "evidence_conflict")
 
+    def test_unknown_snapshot_field_requires_mapping_review(self):
+        result = validate_decision(
+            make_decision(), make_snapshot(field_label="平台新增字段")
+        )
+
+        self.assert_review(result, "field_mapping_required")
+
+    def test_decision_canonical_field_cannot_bypass_snapshot_field_policy(self):
+        result = validate_decision(
+            make_decision(
+                canonical_field="pants_length",
+                proposed_value_id="cotton-100",
+                evidence_kinds=("visual",),
+            ),
+            make_material_percentage_snapshot(),
+        )
+
+        self.assert_review(result, "canonical_field_mismatch")
+
     def test_material_percentage_requires_explicit_text_evidence(self):
         visual_only = make_decision(
             canonical_field="material_percentage",
+            proposed_value_id="cotton-100",
             evidence_kinds=("visual",),
         )
 
         self.assert_review(
-            validate_decision(visual_only, make_snapshot()),
+            validate_decision(visual_only, make_material_percentage_snapshot()),
             "required_text_evidence_missing",
         )
 
     def test_material_composition_requires_explicit_text_evidence(self):
         visual_only = make_decision(
             canonical_field="material_composition",
+            proposed_value_id="cotton",
             evidence_kinds=("visual",),
         )
 
         self.assert_review(
-            validate_decision(visual_only, make_snapshot()),
+            validate_decision(visual_only, make_material_composition_snapshot()),
             "required_text_evidence_missing",
         )
 
@@ -145,9 +253,10 @@ class AttributeDecisionTests(unittest.TestCase):
         result = validate_decision(
             make_decision(
                 canonical_field="material_percentage",
+                proposed_value_id="cotton-100",
                 evidence_kinds=("text",),
             ),
-            make_snapshot(),
+            make_material_percentage_snapshot(),
         )
 
         self.assert_review(result, "rule_not_allowed")
@@ -248,11 +357,12 @@ class AttributeDecisionTests(unittest.TestCase):
         explicit_present = validate_decision(
             make_decision(
                 canonical_field="material_composition",
+                proposed_value_id="cotton",
                 source="explicit_text",
                 mature_rule=False,
                 evidence_kinds=("text",),
             ),
-            make_snapshot(),
+            make_material_composition_snapshot(),
         )
 
         self.assertEqual(human.status, DecisionStatus.AUTO_FILL_READY)
@@ -265,6 +375,34 @@ class AttributeDecisionTests(unittest.TestCase):
         )
 
         self.assert_review(result, "unknown_source")
+
+    def test_snapshot_protocol_members_are_read_only_properties(self):
+        for protocol, names in (
+            (CandidateValueProtocol, ("value_id", "label")),
+            (
+                CandidateSnapshotProtocol,
+                (
+                    "platform_id",
+                    "category_leaf_id",
+                    "field_id",
+                    "field_label",
+                    "values",
+                    "schema_version",
+                    "custom_allowed",
+                    "snapshot_version",
+                ),
+            ),
+        ):
+            for name in names:
+                with self.subTest(protocol=protocol.__name__, name=name):
+                    self.assertIsInstance(inspect.getattr_static(protocol, name), property)
+
+    def test_computed_snapshot_properties_are_supported(self):
+        result = validate_decision(make_decision(), ComputedSnapshot())
+
+        self.assertEqual(result.status, DecisionStatus.AUTO_FILL_READY)
+        self.assertEqual((result.value_id, result.value_label), ("long", "长裤"))
+        self.assertEqual(result.snapshot_version, "computed-snapshot-1")
 
 
 if __name__ == "__main__":
