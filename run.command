@@ -13,7 +13,7 @@ if (( $# == 0 )); then
   print "快麦一键铺货｜统一启动器"
   print "========================================"
   print "请选择需要运行的平台："
-  print "  0) 全平台流程（保存模式：基础资料 + 抖音 + 淘宝 + 天猫 + 拼多多 + 微信小店 + 小红书 + 有赞）"
+  print "  0) 全平台流程（基础资料 + 抖音 + 淘宝 + 天猫 + 拼多多 + 微信小店 + 小红书 + 有赞 + 京东）"
   print "  1) 基础资料"
   print "  2) 抖音"
   print "  3) 淘宝"
@@ -22,7 +22,7 @@ if (( $# == 0 )); then
   print "  6) 微信小店（视频号，填写、保存、铺货）"
   print "  7) 小红书（填写、保存、铺货）"
   print "  8) 有赞（填写、保存、铺货）"
-  print "  9) 京东（填写、保存）"
+  print "  9) 京东（填写、保存、铺货）"
   print " 10) 一键新增链接（按视频固定填法，仅创建快麦商品）"
   while true; do
     read "platform_choice?平台编号 [0-10]: "
@@ -118,7 +118,7 @@ if (( $# == 0 )); then
       PYTHON_ARGS=(--platform jd --save-only)
       ;;
     jd:publish)
-      PYTHON_ARGS=(--platform jd --save-only)
+      PYTHON_ARGS=(--platform jd --save)
       ;;
     pdd:preview)
       PYTHON_ARGS=(--platform pdd --no-save)

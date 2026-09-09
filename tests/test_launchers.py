@@ -10,13 +10,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class LauncherArgumentTests(unittest.TestCase):
     def test_new_product_menu_saves_without_publishing(self):
-        arguments, _ = self._run_launcher(input_text="9\n2\n")
+        arguments, _ = self._run_launcher(input_text="10\n2\n")
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "base", "--create-product", "--save-only"))
 
     def test_new_product_menu_rejects_publish_mode(self):
-        arguments, output = self._run_launcher(input_text="9\n3\n1\n")
+        arguments, output = self._run_launcher(input_text="10\n3\n1\n")
         self.assertIn("请选择 1 或 2", output)
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "base", "--create-product", "--no-save"))
+
+    def test_double_click_menu_allows_jd_no_save_preview(self):
+        arguments, output = self._run_launcher(input_text="9\n1\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "jd", "--no-save"))
+        self.assertIn("京东（填写、保存、铺货）", output)
+
+    def test_double_click_menu_allows_jd_save_only(self):
+        arguments, _output = self._run_launcher(input_text="9\n2\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "jd", "--save-only"))
+
+    def test_double_click_menu_allows_jd_publish_after_confirmation(self):
+        arguments, output = self._run_launcher(input_text="9\n3\nPUBLISH\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "jd", "--save"))
+        self.assertIn("向所选平台的指定店铺提交铺货", output)
 
     def test_create_cli_defaults_to_base_and_preserves_equals_platform(self):
         arguments, _ = self._run_launcher(("--create-product", "--no-save"))

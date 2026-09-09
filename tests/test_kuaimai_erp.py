@@ -193,7 +193,7 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-        self.assertEqual(runner.await_count, 8)
+        self.assertEqual(runner.await_count, 9)
         shared_sessions = [
             call.kwargs["shared_session"] for call in runner.await_args_list
         ]
@@ -207,6 +207,7 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             sixth_args,
             seventh_args,
             eighth_args,
+            ninth_args,
         ) = [call.args[0] for call in runner.await_args_list]
         self.assertEqual(first_args.platform, "base")
         self.assertFalse(first_args.allow_taobao_publish_once)
@@ -230,6 +231,9 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eighth_args.platform, "youzan")
         self.assertTrue(eighth_args.save)
         self.assertFalse(eighth_args.save_only)
+        self.assertEqual(ninth_args.platform, "jd")
+        self.assertTrue(ninth_args.save)
+        self.assertFalse(ninth_args.save_only)
         self.assertEqual(
             report,
             [
@@ -241,6 +245,7 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
                 {"platform": "wxsph", "status": "success"},
                 {"platform": "xhs", "status": "success"},
                 {"platform": "youzan", "status": "success"},
+                {"platform": "jd", "status": "success"},
             ],
         )
 
@@ -265,14 +270,14 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
                 LOGGER,
             )
 
-        self.assertEqual(runner.await_count, 7)
+        self.assertEqual(runner.await_count, 8)
         shared_sessions = [
             call.kwargs["shared_session"] for call in runner.await_args_list
         ]
         self.assertTrue(all(item is shared_sessions[0] for item in shared_sessions))
         self.assertEqual(
             [call.args[0].platform for call in runner.await_args_list],
-            ["douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan"],
+            ["douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"],
         )
 
     async def test_detached_iframe_is_ignored_during_login_detection(self):
@@ -1343,6 +1348,59 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await page.evaluate("window.finalSubmitted"))
             await browser.close()
 
+    async def test_jd_publish_preview_selects_only_target_shop_without_submitting(self):
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <meta charset="utf-8">
+                <div role="dialog" id="publish-dialog">
+                  <h2>铺货到店铺</h2>
+                  <button onclick="shops.style.display='block'">京东</button>
+                  <button>有赞</button>
+                  <div id="shops" style="display:none">
+                    <label class="el-checkbox">其他京东店铺
+                      <input type="checkbox" checked>
+                    </label>
+                    <label class="el-checkbox">NEIGBORL服饰旗舰店
+                      <input type="checkbox">
+                    </label>
+                    <label class="el-checkbox">使用AI裂变规则
+                      <input type="checkbox" checked>
+                    </label>
+                  </div>
+                  <button onclick="window.finalSubmitted=true">确定</button>
+                </div>
+                <script>window.finalSubmitted = false;</script>
+                """
+            )
+
+            dialog, report = await kuaimai_erp.prepare_taobao_publish_dialog(
+                page,
+                kuaimai_erp.DEFAULT_JD_PUBLISH_SHOPS,
+                2,
+                LOGGER,
+                platform_name="京东",
+            )
+
+            self.assertEqual(report["platform"], "京东")
+            self.assertEqual(report["selected_shops"], ["NEIGBORL服饰旗舰店"])
+            self.assertFalse(report["submitted"])
+            checked = await dialog.locator(
+                '.el-checkbox input[type="checkbox"]:checked'
+            ).evaluate_all(
+                "els => els.map(el => el.closest('.el-checkbox').innerText.trim())"
+            )
+            self.assertEqual(
+                set(checked),
+                {"NEIGBORL服饰旗舰店", "使用AI裂变规则"},
+            )
+            self.assertFalse(await page.evaluate("window.finalSubmitted"))
+            await browser.close()
+
     async def test_xhs_publish_selects_only_configured_shops_and_reads_compact_status(self):
         from playwright.async_api import async_playwright
 
@@ -1709,7 +1767,7 @@ class ExecutionModeTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(spec.cli_name for spec in selected),
-            ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan"),
+            ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
         )
 
     def test_only_base_platform_runs_base_save_stage(self):
@@ -1758,6 +1816,9 @@ class ExecutionModeTests(unittest.TestCase):
         youzan_target = kuaimai_erp.resolve_commerce_publish_target(
             self._args("--platform", "youzan")
         )
+        jd_target = kuaimai_erp.resolve_commerce_publish_target(
+            self._args("--platform", "jd")
+        )
 
         self.assertEqual(
             pdd_target,
@@ -1787,6 +1848,10 @@ class ExecutionModeTests(unittest.TestCase):
             youzan_target,
             ("有赞", ("NEIGBORL官方旗舰店",)),
         )
+        self.assertEqual(
+            jd_target,
+            ("京东", ("NEIGBORL服饰旗舰店",)),
+        )
         self.assertIsNone(
             kuaimai_erp.resolve_commerce_publish_target(
                 self._args("--platform", "pdd", "--save-only")
@@ -1806,6 +1871,29 @@ class ExecutionModeTests(unittest.TestCase):
             kuaimai_erp.resolve_commerce_publish_target(
                 self._args("--platform", "youzan", "--save-only")
             )
+        )
+        self.assertIsNone(
+            kuaimai_erp.resolve_commerce_publish_target(
+                self._args("--platform", "jd", "--save-only")
+            )
+        )
+
+    def test_jd_formal_mode_publishes_but_save_only_uses_plain_save(self):
+        publish_args = self._args("--platform", "jd")
+        self.assertEqual(
+            kuaimai_erp.resolve_platform_save_action(
+                publish_args,
+                publish_mode=False,
+            ),
+            ("保存并铺货到平台", True),
+        )
+        save_args = self._args("--platform", "jd", "--save-only")
+        self.assertEqual(
+            kuaimai_erp.resolve_platform_save_action(
+                save_args,
+                publish_mode=False,
+            ),
+            ("保存", False),
         )
 
     def test_youzan_publish_preview_requires_formal_unsubmitted_mode(self):
@@ -1840,6 +1928,23 @@ class ExecutionModeTests(unittest.TestCase):
             self._args("--platform", "wxsph", "--wxsph-publish-preview")
         )
         self.assertEqual(tuple(spec.cli_name for spec in selected), ("wxsph",))
+
+    def test_jd_publish_preview_requires_formal_unsubmitted_mode(self):
+        invalid = (
+            ("--platform", "xhs", "--jd-publish-preview"),
+            ("--platform", "jd", "--jd-publish-preview", "--no-save"),
+            ("--platform", "jd", "--jd-publish-preview", "--save-only"),
+            ("--platform", "jd", "--jd-publish-preview", "--dry-run"),
+        )
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit):
+                    kuaimai_erp.validate_execution_mode(self._args(*arguments))
+
+        selected = kuaimai_erp.validate_execution_mode(
+            self._args("--platform", "jd", "--jd-publish-preview")
+        )
+        self.assertEqual(tuple(spec.cli_name for spec in selected), ("jd",))
 
     def test_taobao_explicit_once_gate_is_preserved(self):
         with self.assertRaises(SystemExit):

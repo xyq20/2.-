@@ -37,7 +37,12 @@ from pdd_data import PddFields, parse_pdd_fields
 from pdd_form_listing import PddFormListing, PddFormListingError
 from platform_discovery import PlatformDiscoveryError
 from platform_inspection import RedactingFormatter, SensitiveLogRedactor, run_platform_inspection
-from platform_registry import PlatformSpec, expand_platform_selection, platform_cli_choices
+from platform_registry import (
+    PlatformSpec,
+    expand_platform_selection,
+    get_platform_spec,
+    platform_cli_choices,
+)
 from size_image_recognition import (
     RecognitionError,
     SizeLength,
@@ -118,6 +123,7 @@ DEFAULT_XHS_PUBLISH_SHOPS = (
     "NEIGBORL钊叔旁伦的店",
 )
 DEFAULT_YOUZAN_PUBLISH_SHOPS = ("NEIGBORL官方旗舰店",)
+DEFAULT_JD_PUBLISH_SHOPS = ("NEIGBORL服饰旗舰店",)
 COMMERCE_PUBLISH_TARGETS = {
     "taobao": ("淘宝", DEFAULT_TAOBAO_PUBLISH_SHOPS),
     "tmall": ("天猫", DEFAULT_TMALL_PUBLISH_SHOPS),
@@ -125,6 +131,7 @@ COMMERCE_PUBLISH_TARGETS = {
     "wxsph": ("微信小店（视频号）", DEFAULT_WXSPH_PUBLISH_SHOPS),
     "xhs": ("小红书", DEFAULT_XHS_PUBLISH_SHOPS),
     "youzan": ("有赞", DEFAULT_YOUZAN_PUBLISH_SHOPS),
+    "jd": ("京东", DEFAULT_JD_PUBLISH_SHOPS),
 }
 KNOWN_DOUYIN_SHOPS = (
     "钊叔 NEIGBORL 制",
@@ -3207,6 +3214,20 @@ def resolve_commerce_publish_target(
     return COMMERCE_PUBLISH_TARGETS.get(args.platform)
 
 
+def resolve_platform_save_action(
+    args: argparse.Namespace,
+    *,
+    publish_mode: bool,
+) -> Tuple[str, bool]:
+    """Resolve the exact footer action, honoring the platform publish gate."""
+    platform = get_platform_spec(args.platform)
+    commerce_target = resolve_commerce_publish_target(args)
+    should_publish = platform.publish_allowed and (
+        (publish_mode and not args.save_only) or commerce_target is not None
+    )
+    return ("保存并铺货到平台" if should_publish else "保存", should_publish)
+
+
 @asynccontextmanager
 async def playwright_for_browser_run(
     async_playwright_factory: Any,
@@ -3874,6 +3895,9 @@ async def run_browser_automation(
                     jd_report = await jd.apply_excel_fields(
                         product.jd_fields,
                         style_code=product.style_code,
+                        square_paths=product.main_images,
+                        portrait_paths=product.main_images_34,
+                        sku_paths=product.sku_images,
                     )
                 except JdFormListingError:
                     await safe_screenshot(page, artifact_dir / "jd-error.png")
@@ -3882,9 +3906,13 @@ async def run_browser_automation(
                     json.dumps(jd_report, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                await jd.scroll_label_into_view("风格")
+                await safe_screenshot(page, artifact_dir / "jd-style-before-save.png")
+                await jd.scroll_color_image_groups_into_view()
+                await safe_screenshot(page, artifact_dir / "jd-images-before-save.png")
                 await safe_screenshot(page, artifact_dir / "jd-before-save.png")
                 logger.info(
-                    "京东类目、品牌、Excel 属性、SKU 价格库存、厚度和发货时效填写复核完成；%s",
+                    "京东类目、品牌、Excel 属性、SKU 价格库存、厚度、发货时效和商品图片填写复核完成；%s",
                     "即将保存但不铺货" if args.save else "本阶段仅预览，未保存、未铺货",
                 )
             elif tmall_requested:
@@ -4241,6 +4269,9 @@ async def run_browser_automation(
                     DEFAULT_WXSPH_PUBLISH_SHOPS,
                 )
                 publish_preview_slug = "wxsph"
+            elif jd_requested and getattr(args, "jd_publish_preview", False):
+                publish_preview_target = ("京东", DEFAULT_JD_PUBLISH_SHOPS)
+                publish_preview_slug = "jd"
 
             if publish_preview_target is not None:
                 preview_platform_name, preview_shops = publish_preview_target
@@ -4278,11 +4309,10 @@ async def run_browser_automation(
                 return
 
             commerce_publish_target = resolve_commerce_publish_target(args)
-            should_publish = (
-                (publish_mode and not args.save_only)
-                or commerce_publish_target is not None
+            action_text, should_publish = resolve_platform_save_action(
+                args,
+                publish_mode=publish_mode,
             )
-            action_text = "保存并铺货到平台" if should_publish else "保存"
             result = await click_save_and_confirm(
                 page,
                 drawer,
@@ -4577,7 +4607,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help=(
-            "最后保存；抖音、淘宝、天猫、拼多多、微信小店、小红书或有赞会点击"
+            "最后保存；抖音、淘宝、天猫、拼多多、微信小店、小红书、有赞或京东会点击"
             "“保存并铺货到平台”（默认）"
         ),
     )
@@ -4592,7 +4622,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "平台资料只保存、不铺货；"
-            "全平台模式下会依次保存抖音、淘宝、天猫、拼多多、微信小店、小红书和有赞资料"
+            "全平台模式下会依次保存抖音、淘宝、天猫、拼多多、微信小店、小红书、有赞和京东资料"
         ),
     )
     parser.add_argument(
@@ -4624,6 +4654,14 @@ def build_parser() -> argparse.ArgumentParser:
             "微信小店无铺货预览：保存微信小店资料并打开‘铺货到店铺’弹窗，"
             "只勾选‘NEIGBORL钊叔制鞋服’和‘NEIGBORL钊叔制造局’，"
             "截图后关闭，不点击最终确定"
+        ),
+    )
+    parser.add_argument(
+        "--jd-publish-preview",
+        action="store_true",
+        help=(
+            "京东无铺货预览：保存京东资料并打开‘铺货到店铺’弹窗，"
+            "只勾选‘NEIGBORL服饰旗舰店’，截图后关闭，不点击最终确定"
         ),
     )
     parser.add_argument(
@@ -4744,6 +4782,17 @@ def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...
             "--wxsph-publish-preview 仅允许用于微信小店完整流程："
             "会保存资料并勾选店铺，但不点击铺货弹窗的最终确定"
         )
+    if args.jd_publish_preview and (
+        args.platform != "jd"
+        or not args.save
+        or args.save_only
+        or args.dry_run
+        or args.inspect_only
+    ):
+        raise SystemExit(
+            "--jd-publish-preview 仅允许用于京东完整流程："
+            "会保存资料并勾选店铺，但不点击铺货弹窗的最终确定"
+        )
     if args.allow_taobao_publish_once and (
         args.platform != "taobao"
         or not args.save
@@ -4819,9 +4868,9 @@ async def run_all_implemented_platforms(
 ) -> None:
     """同一编辑页内依次保存基础资料和各平台资料。"""
     commerce_stages = (
-        ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan")
+        ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
         if product.douyin_fields is not None
-        else ("taobao", "tmall", "pdd", "wxsph", "xhs", "youzan")
+        else ("taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
     )
     # 预览模式承诺不保存，因此不运行会强制保存的基础资料阶段。
     # 只有全平台的两种保存模式会把它作为第一阶段。
@@ -4838,6 +4887,7 @@ async def run_all_implemented_platforms(
             stage_args.taobao_publish_preview = False
             stage_args.youzan_publish_preview = False
             stage_args.wxsph_publish_preview = False
+            stage_args.jd_publish_preview = False
             stage_args.allow_taobao_save_once = False
             stage_args.allow_taobao_publish_once = False
             if platform_name == "taobao" and args.save:

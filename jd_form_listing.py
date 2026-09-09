@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
@@ -65,6 +66,28 @@ JD_IGNORED_ATTRIBUTE_LABELS = frozenset(
         "是否可机洗",
     )
 )
+
+# 京东风格是二级级联。Excel 写的是「休闲风/时尚都市」，二级页实际候选是
+# 「简约风 / oversize」，按运营确认把休闲风和时尚都市兼容到简约风。
+JD_CASCADER_LEAF_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
+    (normalize_label("风格"), normalize_option("休闲风")): ("简约风",),
+    (normalize_label("风格"), normalize_option("休闲")): ("简约风",),
+    (normalize_label("风格"), normalize_option("时尚都市")): ("简约风",),
+}
+
+
+def _expand_cascader_candidates(label: str, candidates: Sequence[str]) -> Tuple[str, ...]:
+    expanded: List[str] = []
+    for candidate in candidates:
+        if candidate not in expanded:
+            expanded.append(candidate)
+        for alias in JD_CASCADER_LEAF_ALIASES.get(
+            (normalize_label(label), normalize_option(candidate)),
+            (),
+        ):
+            if alias not in expanded:
+                expanded.append(alias)
+    return tuple(expanded)
 
 
 def _numeric_equal(actual: str, expected: str) -> bool:
@@ -148,6 +171,134 @@ def _category_parts(value: object) -> Tuple[str, ...]:
     )
 
 
+def _image_color_histogram(path: Path) -> Any:
+    """Return a garment-focused HSV histogram for conservative color grouping."""
+    try:
+        import cv2
+        import numpy as np
+
+        encoded = np.fromfile(str(path), dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError("decode failed")
+        height, width = image.shape[:2]
+        crop = image[
+            max(0, int(height * 0.10)) : max(1, int(height * 0.95)),
+            max(0, int(width * 0.15)) : max(1, int(width * 0.85)),
+        ]
+        crop = cv2.resize(crop, (96, 96), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        # Ignore bright, weakly saturated studio backgrounds while retaining
+        # dark neutral garments such as black and grey.
+        mask = (((saturation >= 22) & (value <= 248)) | (value <= 185)).astype("uint8") * 255
+        if int(np.count_nonzero(mask)) < 96 * 96 // 12:
+            mask = None
+        histogram = cv2.calcHist([hsv], [0, 1, 2], mask, [18, 6, 6], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(histogram, histogram, alpha=1.0, norm_type=cv2.NORM_L1)
+        return histogram
+    except Exception as exc:
+        raise JdFormListingError("京东图片颜色识别无法读取：{0}".format(path)) from exc
+
+
+def classify_image_indices_by_color(
+    square_paths: Sequence[Path],
+    portrait_paths: Sequence[Path],
+    sku_paths: Sequence[Path],
+    color_count: int,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Classify paired square/portrait images using ordered SKU color refs.
+
+    Square and portrait images are paired strictly by filename order.  Each
+    SKU reference is first anchored to a unique closest square image.  Images
+    that are not confidently color-specific (for example a label close-up)
+    are shared by every color instead of being guessed into the wrong group.
+    """
+    if color_count < 1:
+        raise JdFormListingError("京东页面没有可处理的颜色")
+    if len(square_paths) != len(portrait_paths):
+        raise JdFormListingError(
+            "京东 1:1 商品图与 3:4 长图数量不一致，无法一一对应：{0}/{1}".format(
+                len(square_paths), len(portrait_paths)
+            )
+        )
+    if not square_paths:
+        raise JdFormListingError("京东没有可追加的商品图")
+    square_order = tuple(path.stem.casefold() for path in square_paths)
+    portrait_order = tuple(path.stem.casefold() for path in portrait_paths)
+    if square_order != portrait_order:
+        raise JdFormListingError(
+            "京东 1:1 商品图与 3:4 长图文件序号不一致，无法保证顺序对应"
+        )
+    if color_count == 1:
+        if len(sku_paths) != 1:
+            raise JdFormListingError(
+                "京东 SKU 颜色参考图数量与页面颜色数不一致：{0}/1".format(len(sku_paths))
+            )
+        return (tuple(range(len(square_paths))),)
+    if len(sku_paths) != color_count:
+        raise JdFormListingError(
+            "京东 SKU 颜色参考图数量与页面颜色数不一致：{0}/{1}".format(
+                len(sku_paths), color_count
+            )
+        )
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise JdFormListingError("缺少京东图片颜色分类依赖 opencv-python-headless") from exc
+    image_histograms = tuple(_image_color_histogram(path) for path in square_paths)
+    reference_histograms = tuple(_image_color_histogram(path) for path in sku_paths)
+    distances = tuple(
+        tuple(
+            float(cv2.compareHist(image_histogram, reference, cv2.HISTCMP_BHATTACHARYYA))
+            for reference in reference_histograms
+        )
+        for image_histogram in image_histograms
+    )
+
+    # Reserve one unique, visually close anchor for every color.  Without an
+    # anchor the automation cannot prove the page/SKU reference order.
+    candidates = sorted(
+        (distances[image_index][color_index], color_index, image_index)
+        for image_index in range(len(square_paths))
+        for color_index in range(color_count)
+    )
+    anchors: Dict[int, int] = {}
+    used_images = set()
+    for distance, color_index, image_index in candidates:
+        if color_index in anchors or image_index in used_images:
+            continue
+        if distance > 0.58:
+            continue
+        anchors[color_index] = image_index
+        used_images.add(image_index)
+    if len(anchors) != color_count:
+        missing = [str(index + 1) for index in range(color_count) if index not in anchors]
+        raise JdFormListingError(
+            "京东无法从商品图中确认第 {0} 个 SKU 颜色，已停止避免错配".format("、".join(missing))
+        )
+
+    assignments: List[List[int]] = [[] for _ in range(color_count)]
+    anchored_images = {image_index: color_index for color_index, image_index in anchors.items()}
+    for image_index, row in enumerate(distances):
+        if image_index in anchored_images:
+            assignments[anchored_images[image_index]].append(image_index)
+            continue
+        ranked = sorted((distance, color_index) for color_index, distance in enumerate(row))
+        best_distance, best_color = ranked[0]
+        margin = ranked[1][0] - best_distance
+        if best_distance <= 0.58 and margin >= 0.06:
+            assignments[best_color].append(image_index)
+        else:
+            # Non-colour-specific content is useful to every variant and keeps
+            # its original source index in both paired columns.
+            for indices in assignments:
+                indices.append(image_index)
+    return tuple(tuple(indices) for indices in assignments)
+
+
 class JdFormListing(YouzanFormListing):
     """Fill and verify JD category, attributes, SKU data and delivery time."""
 
@@ -162,6 +313,142 @@ class JdFormListing(YouzanFormListing):
             raise JdFormListingError(
                 str(exc).replace("有赞", "京东").replace("淘宝", "京东")
             ) from exc
+
+    async def _open_cascader(self, cascader: Any) -> None:
+        """打开级联选择器下拉菜单"""
+        input_box = cascader.locator("input.el-input__inner").first
+        if not await input_box.count():
+            raise JdFormListingError("级联选择器中找不到可点击输入框")
+        await input_box.click(timeout=4000)
+
+    async def _visible_cascader_options(
+        self, cascader: Any, timeout_seconds: float = 5
+    ) -> List[Mapping[str, Any]]:
+        """获取当前可见的级联选择器选项"""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            menus = self.page.locator(".el-cascader-menu:visible")
+            if await menus.count() == 0:
+                await asyncio.sleep(0.05)
+                continue
+
+            # 获取最后一个可见菜单（当前活动的菜单）
+            last_menu = menus.last
+            result = await last_menu.evaluate(
+                """element => Array.from(
+                    element.querySelectorAll('.el-cascader-node')
+                  ).map((node, index) => ({
+                    name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                    index: String(index),
+                    hasChildren: !!node.querySelector('.el-icon-arrow-right'),
+                    isActive: node.classList.contains('is-active'),
+                    disabled: node.classList.contains('is-disabled')
+                  })).filter(item => item.name.trim() && !item.disabled)
+                """
+            )
+            if result:
+                return result
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("打开京东属性下拉框后未找到可见选项")
+
+    @staticmethod
+    def _match_cascader_option(
+        options: Sequence[Mapping[str, Any]], candidates: Sequence[str]
+    ) -> Optional[Mapping[str, Any]]:
+        for candidate in candidates:
+            matches = [
+                option
+                for option in options
+                if normalize_option(option["name"]) == normalize_option(candidate)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    async def _click_cascader_option(self, option: Mapping[str, Any]) -> None:
+        menus = self.page.locator(".el-cascader-menu:visible")
+        if await menus.count() == 0:
+            raise JdFormListingError("京东属性级联菜单已关闭")
+        last_menu = menus.last
+        before_menus = await menus.count()
+        nodes = last_menu.locator(".el-cascader-node")
+        await nodes.nth(int(option["index"])).click(timeout=2000)
+        if not option.get("hasChildren"):
+            return
+        deadline = asyncio.get_running_loop().time() + 3
+        while asyncio.get_running_loop().time() < deadline:
+            if await self.page.locator(".el-cascader-menu:visible").count() > before_menus:
+                return
+            await asyncio.sleep(0.05)
+
+    async def _select_cascader_values(
+        self,
+        cascader: Any,
+        expected_groups: Sequence[Sequence[str]],
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """Select a cascader path. Comma groups are levels; leftover OR values
+        from the same group are tried on the next menu so a parent like 休闲风
+        can still reach a leaf such as 时尚都市."""
+        groups = [tuple(group) for group in expected_groups if group]
+        if not groups:
+            return None
+        await cascader.scroll_into_view_if_needed()
+        await self._open_cascader(cascader)
+        chosen_values: List[str] = []
+        leftover: Tuple[str, ...] = ()
+        group_index = 0
+        while True:
+            options = await self._visible_cascader_options(cascader)
+            if group_index < len(groups):
+                raw_candidates = groups[group_index]
+            elif leftover:
+                raw_candidates = leftover
+            elif not chosen_values:
+                return None
+            else:
+                raise JdFormListingError(
+                    "京东属性{0}未选到叶子项：已选 {1}".format(
+                        label, " > ".join(chosen_values)
+                    )
+                )
+            sources = raw_candidates + (
+                (chosen_values[-1],) if chosen_values else ()
+            )
+            candidates = _expand_cascader_candidates(label, sources)
+            chosen = self._match_cascader_option(options, candidates)
+            if chosen is None:
+                if not chosen_values:
+                    return None
+                names = "、".join(
+                    option["name"].strip() for option in options
+                ) or "无"
+                raise JdFormListingError(
+                    "京东属性{0}第{1}级没有 Excel 精确候选；当前候选：{2}".format(
+                        label, len(chosen_values) + 1, names
+                    )
+                )
+            await self._click_cascader_option(chosen)
+            chosen_name = chosen["name"].strip()
+            chosen_values.append(chosen_name)
+            leftover = tuple(
+                candidate
+                for candidate in candidates
+                if normalize_option(candidate) != normalize_option(chosen_name)
+            )
+            if group_index < len(groups):
+                group_index += 1
+            if not chosen.get("hasChildren"):
+                break
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if self.logger is not None:
+            self.logger.info(
+                "京东属性%s级联已选：%s", label, " > ".join(chosen_values)
+            )
+        return tuple(chosen_values)
 
     async def open(self) -> "JdFormListing":
         tab = self.drawer.get_by_role("tab", name="京东资料", exact=True)
@@ -252,6 +539,48 @@ class JdFormListing(YouzanFormListing):
     def _json_contains_category(payload: Any, target: str) -> bool:
         return bool(JdFormListing._json_category_nodes(payload, target))
 
+    async def _category_dom_candidates(self, dialog: Any, target: str) -> List[Any]:
+        """Find the unique category leaf or the search-result breadcrumb.
+
+        On a cold render FastMai initially exposes the search result as one
+        combined breadcrumb text node (for example ``... > 男士休闲直筒裤``),
+        so an exact-text locator can temporarily return zero even though the
+        category API and the visible result already agree.
+        """
+        wanted = normalize_label(target)
+
+        async def from_root(root: Any) -> List[Any]:
+            exact = await self._innermost_visible_text(root, target)
+            if exact:
+                return exact
+            nodes = root.get_by_text(re.compile(re.escape(target)))
+            matches: List[Any] = []
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                if not await node.is_visible():
+                    continue
+                text = normalize_label(await node.inner_text())
+                if not text.endswith(wanted):
+                    continue
+                nested = node.locator(":scope *").get_by_text(
+                    re.compile(re.escape(target))
+                )
+                has_visible_child = False
+                for child_index in range(await nested.count()):
+                    if await nested.nth(child_index).is_visible():
+                        has_visible_child = True
+                        break
+                if has_visible_child:
+                    continue
+                matches.append(node)
+            return matches
+
+        # Element UI teleports the remote-search suggestion under <body>,
+        # outside the visible dialog. Prefer the dialog's category tree, then
+        # fall back to the page-level suggestion popover.
+        inside = await from_root(dialog)
+        return inside or await from_root(self.page)
+
     async def apply_category(self) -> Mapping[str, Any]:
         target = JD_CATEGORY_PATH[-1]
         try:
@@ -310,12 +639,7 @@ class JdFormListing(YouzanFormListing):
         stable_since: Optional[float] = None
         try:
             while asyncio.get_running_loop().time() < deadline:
-                nodes = dialog.get_by_text(target, exact=True)
-                candidates = [
-                    nodes.nth(index)
-                    for index in range(await nodes.count())
-                    if await nodes.nth(index).is_visible()
-                ]
+                candidates = await self._category_dom_candidates(dialog, target)
                 if api_matches and len(candidates) == 1:
                     if stable_since is None:
                         stable_since = asyncio.get_running_loop().time()
@@ -386,12 +710,7 @@ class JdFormListing(YouzanFormListing):
         for attempt in range(5):
             # 等待 DOM 稳定
             await asyncio.sleep(0.3)
-            live_nodes = dialog.get_by_text(target, exact=True)
-            live_candidates = [
-                live_nodes.nth(index)
-                for index in range(await live_nodes.count())
-                if await live_nodes.nth(index).is_visible()
-            ]
+            live_candidates = await self._category_dom_candidates(dialog, target)
             if len(live_candidates) == 0:
                 if self.logger is not None:
                     self.logger.warning(
@@ -417,6 +736,8 @@ class JdFormListing(YouzanFormListing):
             row = live_candidates[0].locator(
                 "xpath=ancestor-or-self::*[contains(concat(' ', normalize-space(@class), ' '), ' el-cascader-node ')][1]"
             )
+            if not await row.count():
+                row = live_candidates[0]
             if attempt == 0 or attempt == 1:
                 await row.click(force=True, timeout=5_000)
             elif attempt == 2:
@@ -526,6 +847,30 @@ class JdFormListing(YouzanFormListing):
         await input_box.press_sequentially(expected)
         await input_box.press("Tab")
 
+    async def _read_brand_value(
+        self,
+        brand_item: Optional[Any] = None,
+    ) -> Tuple[str, Tuple[str, ...]]:
+        """Read both first-open editable and persisted readonly brand controls."""
+        if brand_item is None:
+            brand_item = await self._form_item_exact("品牌")
+        inputs = brand_item.locator('input:not([type="hidden"]):visible')
+        collected: List[str] = []
+        for index in range(await inputs.count()):
+            value = (await inputs.nth(index).input_value()).strip()
+            if value and value not in collected:
+                collected.append(value)
+        values = tuple(collected)
+        brand = next(
+            (
+                value
+                for value in values
+                if normalize_option(value) == normalize_option(JD_BRAND)
+            ),
+            "",
+        )
+        return brand, values
+
     async def _fill_input_item(
         self, label: str, expected: str, *, numeric: bool = False
     ) -> str:
@@ -548,33 +893,7 @@ class JdFormListing(YouzanFormListing):
         self, fields: Mapping[str, str], *, style_code: str
     ) -> Mapping[str, str]:
         brand_item = await self._form_item_exact("品牌")
-        async def read_brand() -> Tuple[str, Tuple[str, ...]]:
-            # 尝试从多种可能的输入框读取品牌
-            inputs = brand_item.locator('input:not([type="hidden"]):visible')
-            collected: List[str] = []
-            for index in range(await inputs.count()):
-                value = (await inputs.nth(index).input_value()).strip()
-                if value:
-                    collected.append(value)
-
-            # 同时检查 el-select 的显示值
-            select_inputs = brand_item.locator('.el-select input:visible')
-            for index in range(await select_inputs.count()):
-                value = (await select_inputs.nth(index).input_value()).strip()
-                if value and value not in collected:
-                    collected.append(value)
-
-            values = tuple(collected)
-            value = next(
-                (
-                    item for item in values
-                    if normalize_option(item) == normalize_option(JD_BRAND)
-                ),
-                "",
-            )
-            return value, values
-
-        brand, brand_values = await read_brand()
+        brand, brand_values = await self._read_brand_value(brand_item)
         if not brand:
             # 首先尝试使用下拉框选择品牌
             select = brand_item.locator(".el-select").first
@@ -605,7 +924,7 @@ class JdFormListing(YouzanFormListing):
                         self.logger.info('京东品牌下拉失败，尝试手动填写：%s', JD_BRAND)
                     await self._enter_as_user(inputs[0], JD_BRAND)
                     await asyncio.sleep(0.5)
-                    brand, brand_values = await read_brand()
+                    brand, brand_values = await self._read_brand_value(brand_item)
 
             # 如果手动填写也失败，尝试一键应用
             if not brand:
@@ -619,7 +938,7 @@ class JdFormListing(YouzanFormListing):
                     deadline = asyncio.get_running_loop().time() + 15
                     while asyncio.get_running_loop().time() < deadline:
                         await self._raise_as_jd(super()._wait_for_loading_masks())
-                        brand, brand_values = await read_brand()
+                        brand, brand_values = await self._read_brand_value(brand_item)
                         if brand:
                             break
                         await asyncio.sleep(0.1)
@@ -689,9 +1008,11 @@ class JdFormListing(YouzanFormListing):
         top, end = await self._attribute_bounds()
         result: Dict[str, Tuple[str, Any]] = {}
         counts: Dict[str, int] = {}
-        items = self.panel.locator(".el-form-item:visible")
+        items = self.panel.locator(".el-form-item")
         for index in range(await items.count()):
             item = items.nth(index)
+            if not await item.is_visible():
+                continue
             box = await item.bounding_box()
             if box is not None:
                 if top is not None and box["y"] <= top:
@@ -772,6 +1093,23 @@ class JdFormListing(YouzanFormListing):
         self, page_label: str, item: Any, expected: str, *, required: bool
     ) -> Optional[Tuple[str, ...]]:
         normalized = normalize_label(page_label)
+
+        # 先检查是否是级联选择器
+        cascader = item.locator(".el-cascader").first
+        if await cascader.count():
+            if self.logger is not None:
+                self.logger.info('京东属性%s是级联选择器，尝试选择值，期望值=%s', page_label, expected)
+            actual = await self._select_cascader_values(
+                cascader,
+                selection_value_groups(page_label, expected),
+                label=page_label,
+            )
+            if actual is None:
+                if required:
+                    raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
+                return None
+            return actual
+
         selects = item.locator(":scope > .el-form-item__content .el-select:visible")
         inputs = await self._editable_inputs(item)
         material = normalized in {normalize_label("面料"), normalize_label("材质")}
@@ -1051,34 +1389,95 @@ class JdFormListing(YouzanFormListing):
     async def apply_sku_thickness(self) -> Mapping[str, str]:
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
-        headers = self.panel.get_by_text(re.compile(r"^\s*SKU\s*/?\s*属性\s*$", re.I))
-        triggers = []
-        for index in range(await headers.count()):
-            header = headers.nth(index)
-            if not await header.is_visible():
-                continue
-            root = header.locator("xpath=ancestor::th[1]")
-            if await root.count():
-                links = root.get_by_text("批量设置", exact=True)
-                for link_index in range(await links.count()):
-                    if await links.nth(link_index).is_visible():
-                        triggers.append(links.nth(link_index))
+        triggers = await self._header_actions("SKU属性", "批量设置")
+        if len(triggers) == 0:
+            raise JdFormListingError('京东 SKU 属性没有可定位的"批量设置"按钮')
         if len(triggers) != 1:
             raise JdFormListingError("京东 SKU 属性批量设置不是唯一项：{0}".format(len(triggers)))
         await triggers[0].click()
-        dialogs = self.page.locator(".el-dialog:visible, [role=dialog]:visible")
-        matches = []
-        for index in range(await dialogs.count()):
-            dialog = dialogs.nth(index)
-            if normalize_label("厚度") in normalize_label(await dialog.inner_text()):
-                matches.append(dialog)
-        if len(matches) != 1:
-            raise JdFormListingError("京东 SKU 属性批量弹窗不是唯一项：{0}".format(len(matches)))
-        dialog = matches[0]
-        labels = dialog.get_by_text(re.compile(r"^\s*厚度\s*[：:]?\s*$"))
-        if await labels.count() != 1:
-            raise JdFormListingError("京东 SKU 属性弹窗缺少厚度字段")
-        item = labels.first.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]")
+        dialog: Optional[Any] = None
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            dialogs = self.page.locator(".el-dialog:visible, [role=dialog]:visible")
+            matches = []
+            for index in range(await dialogs.count()):
+                candidate = dialogs.nth(index)
+                title = await self._innermost_visible_text(candidate, "SKU属性")
+                if title:
+                    matches.append(candidate)
+            if len(matches) == 1:
+                dialog = matches[0]
+                break
+            if len(matches) > 1:
+                raise JdFormListingError(
+                    "京东 SKU 属性批量弹窗不是唯一项：{0}".format(len(matches))
+                )
+            await asyncio.sleep(0.1)
+        if dialog is None:
+            raise JdFormListingError("京东 SKU 属性批量弹窗未出现")
+
+        async def visible_thickness_labels() -> List[Any]:
+            labels = dialog.get_by_text(re.compile(r"^\s*厚度\s*[：:]?\s*$"))
+            return [
+                labels.nth(index)
+                for index in range(await labels.count())
+                if await labels.nth(index).is_visible()
+            ]
+
+        labels = await visible_thickness_labels()
+        if not labels:
+            refreshes = await self._innermost_visible_text(dialog, "刷新数据")
+            if len(refreshes) != 1:
+                raise JdFormListingError(
+                    "京东 SKU 属性首次弹窗缺少唯一“刷新数据”入口"
+                )
+            response_paths: List[str] = []
+            thickness_paths: List[str] = []
+            tasks: List[asyncio.Task[Any]] = []
+
+            async def capture(response: Any) -> None:
+                try:
+                    headers = await response.all_headers()
+                    if "json" not in str(headers.get("content-type") or "").casefold():
+                        return
+                    payload = await response.json()
+                    path = urlsplit(response.url).path
+                    if path not in response_paths:
+                        response_paths.append(path)
+                    if self._json_contains_text(payload, "厚度") and path not in thickness_paths:
+                        thickness_paths.append(path)
+                except Exception:
+                    return
+
+            def handler(response: Any) -> None:
+                tasks.append(asyncio.create_task(capture(response)))
+
+            self.page.on("response", handler)
+            try:
+                await refreshes[0].click()
+                refresh_deadline = asyncio.get_running_loop().time() + 30
+                while asyncio.get_running_loop().time() < refresh_deadline:
+                    await self._raise_as_jd(super()._wait_for_loading_masks())
+                    labels = await visible_thickness_labels()
+                    if labels:
+                        break
+                    await asyncio.sleep(0.15)
+            finally:
+                self.page.remove_listener("response", handler)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            if self.logger is not None:
+                self.logger.info(
+                    "京东 SKU 属性刷新交叉校验：JSON响应=%s，含厚度响应=%s，DOM厚度=%s",
+                    response_paths,
+                    thickness_paths,
+                    len(labels),
+                )
+        if len(labels) != 1:
+            raise JdFormListingError(
+                "京东 SKU 属性刷新后厚度字段不是唯一项：{0}".format(len(labels))
+            )
+        item = labels[0].locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]")
         actual = await self._raise_as_jd(
             self._fill_attribute("厚度", item, JD_SKU_THICKNESS, required=True)
         )
@@ -1091,12 +1490,55 @@ class JdFormListing(YouzanFormListing):
         await dialog.wait_for(state="hidden", timeout=10_000)
         return {"厚度": actual[0]}
 
+    @staticmethod
+    def _json_contains_text(payload: Any, target: str) -> bool:
+        """Return whether a decoded JSON payload contains the exact text."""
+        wanted = normalize_label(target)
+        if isinstance(payload, Mapping):
+            return any(
+                JdFormListing._json_contains_text(key, target)
+                or JdFormListing._json_contains_text(value, target)
+                for key, value in payload.items()
+            )
+        if isinstance(payload, (list, tuple)):
+            return any(JdFormListing._json_contains_text(value, target) for value in payload)
+        if isinstance(payload, str):
+            if normalize_label(payload) == wanted:
+                return True
+            text = payload.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    return JdFormListing._json_contains_text(json.loads(text), target)
+                except (TypeError, ValueError):
+                    return False
+        return False
+
+    async def _header_actions(self, marker: str, name: str) -> List[Any]:
+        """Return exact actions whose own table header contains ``marker``.
+
+        The live JD header renders ``SKU属性`` and its action in one wrapper,
+        so locating a standalone header node by exact text returns zero.
+        """
+        if self.panel is None:
+            raise JdFormListingError("请先打开京东资料")
+        wanted = normalize_label(marker)
+        matches: List[Any] = []
+        for action in await self._innermost_visible_text(self.panel, name):
+            header = action.locator("xpath=ancestor::th[1]")
+            if not await header.count():
+                header = action.locator(
+                    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-table__cell ')][1]"
+                )
+            if await header.count() and wanted in normalize_label(await header.inner_text()):
+                matches.append(action)
+        return matches
+
     async def fill_summary_prices(self, fields: Mapping[str, str]) -> Mapping[str, str]:
         jd_price = _required_excel_value(fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价")
         market = _required_excel_value(fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价")
         return {
-            "京东价": await self._fill_input_item("京东价（元）", jd_price),
-            "市场价": await self._fill_input_item("市场价（元）", market),
+            "京东价": await self._fill_input_item("京东价（元）", jd_price, numeric=True),
+            "市场价": await self._fill_input_item("市场价（元）", market, numeric=True),
         }
 
     async def fill_delivery_template(self) -> str:
@@ -1124,8 +1566,443 @@ class JdFormListing(YouzanFormListing):
             )
         )
 
+    async def _innermost_visible_text(self, root: Any, name: str) -> List[Any]:
+        nodes = root.get_by_text(name, exact=True)
+        matches = []
+        for index in range(await nodes.count()):
+            node = nodes.nth(index)
+            if not await node.is_visible():
+                continue
+            nested = node.locator(":scope *").get_by_text(name, exact=True)
+            has_visible_child = False
+            for nested_index in range(await nested.count()):
+                if await nested.nth(nested_index).is_visible():
+                    has_visible_child = True
+                    break
+            if not has_visible_child:
+                matches.append(node)
+        return matches
+
+    async def _click_section_action(self, section: str, name: str) -> None:
+        """Click one exact action even when the page repeats its section title."""
+        if self.panel is None:
+            raise JdFormListingError("请先打开京东资料")
+        actions = await self._innermost_visible_text(self.panel, name)
+        if len(actions) != 1:
+            raise JdFormListingError(
+                "京东{0}动作“{1}”不是唯一项：{2}".format(
+                    section, name, len(actions)
+                )
+            )
+        await actions[0].scroll_into_view_if_needed()
+        await actions[0].click(timeout=5_000)
+        if self.logger is not None:
+            self.logger.info("京东已点击图片动作：%s", name)
+
+    async def _media_upload_diagnostics(self) -> Tuple[Mapping[str, Any], ...]:
+        if self.panel is None:
+            return ()
+        return tuple(
+            await self.panel.evaluate(
+                """root => Array.from(root.querySelectorAll('.sc-upload'))
+                  .filter(upload => {
+                    const style = getComputedStyle(upload);
+                    return upload.getClientRects().length > 0
+                      && style.display !== 'none' && style.visibility !== 'hidden';
+                  })
+                  .map((upload, index) => {
+                    const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const ancestors = [];
+                    let current = upload.parentElement;
+                    for (let depth = 0; current && current !== root && depth < 4; depth += 1) {
+                      ancestors.push({
+                        tag: current.tagName,
+                        className: clean(current.className).slice(0, 120),
+                        text: clean(current.innerText).slice(0, 220),
+                      });
+                      current = current.parentElement;
+                    }
+                    return {
+                      index,
+                      fileImages: upload.querySelectorAll('.file-img').length,
+                      decodedImages: Array.from(upload.querySelectorAll('img')).filter(
+                        image => image.complete && image.naturalWidth > 0
+                      ).length,
+                      ancestors,
+                    };
+                  })"""
+            )
+        )
+
+    async def _sku_color_image_groups(self) -> Tuple[Mapping[str, Any], ...]:
+        """Pair each color's 商品展示图 and 规格长图 groups.
+
+        The same 商品展示图 caption is also used by the public image block.
+        Color blocks are therefore anchored by their own 使用商品图片 action and
+        paired by DOM order.  The method marks only the paired upload groups so
+        later mutations cannot accidentally touch the public product images.
+        """
+        if self.panel is None:
+            raise JdFormListingError("请先打开京东资料")
+        result = await self.panel.evaluate(
+            """root => {
+              const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+              const visible = element => {
+                const style = getComputedStyle(element);
+                return element.getClientRects().length > 0
+                  && style.display !== 'none' && style.visibility !== 'hidden';
+              };
+              const follows = (first, second) => Boolean(
+                first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING
+              );
+              root.querySelectorAll('[data-codex-jd-color-display], [data-codex-jd-color-long], [data-codex-jd-public-display]')
+                .forEach(element => {
+                  element.removeAttribute('data-codex-jd-color-display');
+                  element.removeAttribute('data-codex-jd-color-long');
+                  element.removeAttribute('data-codex-jd-public-display');
+                });
+              const itemGroup = item => Array.from(item.querySelectorAll('.muti-upload'))
+                .find(group => group.closest('.el-form-item') === item && visible(group));
+              const items = Array.from(root.querySelectorAll('.el-form-item')).filter(visible);
+              const displays = items.filter(item => {
+                const text = clean(item.innerText).replace(/^\*\s*/, '');
+                return text.startsWith('商品展示图') && Boolean(itemGroup(item));
+              });
+              const longs = items.filter(item => {
+                const text = clean(item.innerText).replace(/^\*\s*/, '');
+                return (text.startsWith('规格长图') || item.classList.contains('showSearchImg'))
+                  && Boolean(itemGroup(item));
+              });
+              let buttons = Array.from(root.querySelectorAll('button, [role="button"]'))
+                .filter(element => visible(element) && clean(element.innerText) === '使用商品图片');
+              buttons = buttons.filter(element => !buttons.some(
+                other => other !== element && element.contains(other)
+              ));
+              const colorName = button => {
+                const ignored = new Set(['使用商品图片', '商品展示图', '规格长图']);
+                const dataOwner = button.closest('[data-color]');
+                if (dataOwner && clean(dataOwner.dataset.color)) return clean(dataOwner.dataset.color);
+                let cursor = button;
+                for (let depth = 0; cursor && cursor !== root && depth < 6; depth += 1) {
+                  let sibling = cursor.previousElementSibling;
+                  while (sibling) {
+                    const text = clean(sibling.innerText || sibling.textContent).replace(/^\*\s*/, '');
+                    if (text && text.length <= 32 && !ignored.has(text)) return text;
+                    sibling = sibling.previousElementSibling;
+                  }
+                  const parent = cursor.parentElement;
+                  if (parent) {
+                    const clone = parent.cloneNode(true);
+                    clone.querySelectorAll('button, [role="button"]').forEach(node => node.remove());
+                    const text = clean(clone.innerText || clone.textContent).replace(/^\*\s*/, '');
+                    if (text && text.length <= 32 && !ignored.has(text)) return text;
+                  }
+                  cursor = parent;
+                }
+                return '';
+              };
+              const pairs = [];
+              const usedDisplays = new Set();
+              const usedLongs = new Set();
+              const errors = [];
+              buttons.forEach((button, index) => {
+                const next = buttons[index + 1] || null;
+                const within = item => follows(button, item) && (!next || follows(item, next));
+                const displayMatches = displays.filter(item => within(item));
+                const longMatches = longs.filter(item => within(item));
+                const color = colorName(button);
+                if (!color) errors.push(`第 ${index + 1} 个颜色名无法回读`);
+                if (displayMatches.length !== 1) {
+                  errors.push(`${color || `第${index + 1}个颜色`} 商品展示图=${displayMatches.length}`);
+                }
+                if (longMatches.length !== 1) {
+                  errors.push(`${color || `第${index + 1}个颜色`} 规格长图=${longMatches.length}`);
+                }
+                if (displayMatches.length !== 1 || longMatches.length !== 1) return;
+                const display = itemGroup(displayMatches[0]);
+                const longImage = itemGroup(longMatches[0]);
+                display.setAttribute('data-codex-jd-color-display', String(index));
+                longImage.setAttribute('data-codex-jd-color-long', String(index));
+                usedDisplays.add(displayMatches[0]);
+                usedLongs.add(longMatches[0]);
+                pairs.push({index, color});
+              });
+              const publicDisplays = displays.filter(item => !usedDisplays.has(item));
+              if (publicDisplays.length !== 1) {
+                errors.push(`公共商品展示图=${publicDisplays.length}`);
+              } else {
+                itemGroup(publicDisplays[0]).setAttribute('data-codex-jd-public-display', 'true');
+              }
+              if (!buttons.length) errors.push('未找到颜色分组的使用商品图片按钮');
+              if (new Set(pairs.map(pair => pair.color)).size !== pairs.length) {
+                errors.push('颜色名重复或无法唯一区分');
+              }
+              return {pairs, errors};
+            }"""
+        )
+        errors = tuple(str(value) for value in result.get("errors", ()))
+        if errors:
+            if self.logger is not None:
+                self.logger.info(
+                    "京东颜色图片分组定位失败 DOM 摘要：%s",
+                    json.dumps(await self._media_upload_diagnostics(), ensure_ascii=False),
+                )
+            raise JdFormListingError("京东颜色图片分组无法一一对应：" + "；".join(errors))
+        pairs: List[Mapping[str, Any]] = []
+        for pair in result.get("pairs", ()):
+            index = int(pair["index"])
+            display = self.panel.locator(
+                '[data-codex-jd-color-display="{0}"]'.format(index)
+            )
+            long_image = self.panel.locator(
+                '[data-codex-jd-color-long="{0}"]'.format(index)
+            )
+            if await display.count() != 1 or await long_image.count() != 1:
+                raise JdFormListingError("京东颜色图片分组 DOM 标记回读失败")
+            pairs.append(
+                {
+                    "index": index,
+                    "color": str(pair["color"]),
+                    "display": display,
+                    "long": long_image,
+                }
+            )
+        return tuple(pairs)
+
+    async def _delete_uploaded_image_at(self, scope: Any, index: int) -> None:
+        images = scope.locator(".file-img")
+        before = await images.count()
+        if index < 0 or index >= before:
+            raise JdFormListingError("京东商品展示图没有可删除的第 {0} 张图".format(index + 1))
+        image = images.nth(index)
+        button = image.locator(".del-btn").first
+        if not await button.count():
+            raise JdFormListingError("京东商品展示图第 {0} 张缺少删除按钮".format(index + 1))
+        try:
+            # The delete control is present but CSS-hidden until hover.  A DOM
+            # click invokes the same Vue handler without paying a hover timeout
+            # for every image in a multi-colour product.
+            await button.evaluate("element => element.click()")
+        except Exception:
+            await image.hover(timeout=2000)
+            await button.click(timeout=2000)
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
+            if await images.count() < before:
+                return
+            await asyncio.sleep(0.1)
+        raise JdFormListingError("京东商品展示图删除后页面未更新")
+
+    async def _delete_first_uploaded_image(self, scope: Any) -> None:
+        await self._delete_uploaded_image_at(scope, 0)
+
+    async def scroll_label_into_view(self, label: str) -> None:
+        if self.panel is None:
+            raise JdFormListingError("请先打开京东资料")
+        node = self.panel.get_by_text(
+            re.compile(r"^\s*\*?\s*{0}\s*[：:]?\s*$".format(re.escape(label)))
+        ).first
+        if await node.count():
+            await node.scroll_into_view_if_needed()
+
+    async def scroll_color_image_groups_into_view(self) -> None:
+        groups = await self._sku_color_image_groups()
+        await groups[0]["display"].scroll_into_view_if_needed()
+
+    async def append_sku_images(
+        self,
+        *,
+        image_indices_by_color: Optional[Sequence[Sequence[int]]] = None,
+        square_paths: Sequence[Path] = (),
+        portrait_paths: Sequence[Path] = (),
+        sku_paths: Sequence[Path] = (),
+    ) -> Mapping[str, Any]:
+        """Append both image sets and normalize each color pair in place."""
+        initial_groups = await self._sku_color_image_groups()
+        public = self.panel.locator('[data-codex-jd-public-display="true"]')
+        public_before = await public.locator(".file-img").count()
+        if image_indices_by_color is None and (square_paths or portrait_paths or sku_paths):
+            image_indices_by_color = classify_image_indices_by_color(
+                square_paths,
+                portrait_paths,
+                sku_paths,
+                len(initial_groups),
+            )
+        if image_indices_by_color is not None and len(image_indices_by_color) != len(initial_groups):
+            raise JdFormListingError(
+                "京东图片颜色分类数与页面颜色数不一致：{0}/{1}".format(
+                    len(image_indices_by_color), len(initial_groups)
+                )
+            )
+        requested_indices = (
+            tuple(
+                tuple(dict.fromkeys(int(index) for index in indices))
+                for indices in image_indices_by_color
+            )
+            if image_indices_by_color is not None
+            else None
+        )
+        initial_counts = [
+            (
+                await group["display"].locator(".file-img").count(),
+                await group["long"].locator(".file-img").count(),
+            )
+            for group in initial_groups
+        ]
+        already_normalized = requested_indices is not None and all(
+            bool(keep) and display == long_count == len(keep)
+            for (display, long_count), keep in zip(initial_counts, requested_indices)
+        )
+        if already_normalized:
+            reports = [
+                {
+                    "color": group["color"],
+                    "product_display_before": display,
+                    "product_display_remaining": display,
+                    "long_image_count": long_count,
+                    "source_image_positions": [index + 1 for index in keep],
+                    "sequence_verified": True,
+                    "already_normalized": True,
+                }
+                for group, (display, long_count), keep in zip(
+                    initial_groups,
+                    initial_counts,
+                    requested_indices,
+                )
+            ]
+            if self.logger is not None:
+                self.logger.info(
+                    "京东二次打开的颜色图片已是保存后的对应状态，跳过重复追加和删除：%s",
+                    "、".join(
+                        "{0}={1}/{2}".format(
+                            item["color"],
+                            item["product_display_remaining"],
+                            item["long_image_count"],
+                        )
+                        for item in reports
+                    ),
+                )
+            return {
+                "sku_images": "already_normalized",
+                "sku_long_images": "already_normalized",
+                "public_product_display_unchanged": public_before,
+                "colors": reports,
+            }
+        await self._click_section_action("商品图片", "一键追加到所有sku图")
+        await self._raise_as_jd(super()._wait_for_loading_masks())
+        await self._click_section_action("商品长图", "一键追加到所有sku长图")
+        await self._raise_as_jd(super()._wait_for_loading_masks())
+        deadline = asyncio.get_running_loop().time() + 20
+        groups = initial_groups
+        counts: List[Tuple[int, int]] = []
+        while asyncio.get_running_loop().time() < deadline:
+            groups = await self._sku_color_image_groups()
+            counts = [
+                (
+                    await group["display"].locator(".file-img").count(),
+                    await group["long"].locator(".file-img").count(),
+                )
+                for group in groups
+            ]
+            if counts and all(display == long_count + 1 and long_count >= 1 for display, long_count in counts):
+                break
+            await asyncio.sleep(0.1)
+        if not counts or not all(
+            display == long_count + 1 and long_count >= 1
+            for display, long_count in counts
+        ):
+            if self.logger is not None:
+                self.logger.info(
+                    "京东颜色图片追加未完成时的上传区 DOM 摘要：%s",
+                    json.dumps(
+                        await self._media_upload_diagnostics(),
+                        ensure_ascii=False,
+                    ),
+                )
+            raise JdFormListingError("京东颜色分组的商品展示图与规格长图未按顺序追加完成")
+
+        reports: List[Mapping[str, Any]] = []
+        source_count = counts[0][1]
+        if any(long_count != source_count for _display, long_count in counts):
+            raise JdFormListingError("京东各颜色规格长图数量不一致")
+        if requested_indices is None:
+            normalized_indices = tuple(tuple(range(source_count)) for _group in groups)
+        else:
+            normalized_indices = requested_indices
+            invalid = [
+                index
+                for indices in normalized_indices
+                for index in indices
+                if index < 0 or index >= source_count
+            ]
+            if invalid:
+                raise JdFormListingError("京东图片颜色分类产生越界顺序：{0}".format(invalid))
+            missing = sorted(set(range(source_count)).difference(
+                index for indices in normalized_indices for index in indices
+            ))
+            if missing or any(not indices for indices in normalized_indices):
+                raise JdFormListingError("京东图片颜色分类不完整，未归类顺序：{0}".format(missing))
+
+        for group, (display_before, long_before), keep in zip(groups, counts, normalized_indices):
+            await self._delete_first_uploaded_image(group["display"])
+            rejected = sorted(set(range(source_count)).difference(keep), reverse=True)
+            for index in rejected:
+                await self._delete_uploaded_image_at(group["display"], index)
+                await self._delete_uploaded_image_at(group["long"], index)
+            display_remaining = await group["display"].locator(".file-img").count()
+            long_remaining = await group["long"].locator(".file-img").count()
+            if display_remaining != len(keep) or long_remaining != len(keep):
+                raise JdFormListingError(
+                    "京东颜色 {0} 的商品展示图/规格长图数量回读失败：{1}/{2}".format(
+                        group["color"], display_remaining, long_remaining
+                    )
+                )
+            reports.append(
+                {
+                    "color": group["color"],
+                    "product_display_before": display_before,
+                    "product_display_remaining": display_remaining,
+                    "long_image_count": long_remaining,
+                    "source_image_positions": [index + 1 for index in keep],
+                    "sequence_verified": True,
+                }
+            )
+
+        groups = await self._sku_color_image_groups()
+        public_after = await self.panel.locator(
+            '[data-codex-jd-public-display="true"]'
+        ).locator(".file-img").count()
+        if public_after != public_before:
+            raise JdFormListingError(
+                "京东公共商品展示图被误改：{0}->{1}".format(public_before, public_after)
+            )
+        if self.logger is not None:
+            self.logger.info(
+                "京东已点击商品图片“一键追加到所有sku图”和商品长图“一键追加到所有sku长图”，"
+                "逐颜色删除分组商品展示图第一张，公共商品图保持 %s 张：%s",
+                public_after,
+                "、".join(
+                    "{0}={1}/{2}".format(
+                        item["color"], item["product_display_remaining"], item["long_image_count"]
+                    )
+                    for item in reports
+                ),
+            )
+        return {
+            "sku_images": "appended",
+            "sku_long_images": "appended",
+            "public_product_display_unchanged": public_after,
+            "colors": reports,
+        }
+
     async def apply_excel_fields(
-        self, fields: JdFields, *, style_code: str
+        self,
+        fields: JdFields,
+        *,
+        style_code: str,
+        square_paths: Sequence[Path] = (),
+        portrait_paths: Sequence[Path] = (),
+        sku_paths: Sequence[Path] = (),
     ) -> Mapping[str, Any]:
         category = await self.apply_category()
         identity = await self.fill_identity_and_parameters(fields.fields, style_code=style_code)
@@ -1134,6 +2011,11 @@ class JdFormListing(YouzanFormListing):
         sku_attributes = await self.apply_sku_thickness()
         prices = await self.fill_summary_prices(fields.fields)
         delivery = await self.fill_delivery_template()
+        images = await self.append_sku_images(
+            square_paths=square_paths,
+            portrait_paths=portrait_paths,
+            sku_paths=sku_paths,
+        )
         errors = await self._visible_validation_errors()
         if errors:
             raise JdFormListingError("京东页面校验错误：" + "；".join(errors))
@@ -1145,6 +2027,7 @@ class JdFormListing(YouzanFormListing):
             "sku_attributes": sku_attributes,
             "summary_prices": prices,
             "delivery_template": delivery,
+            "images": images,
         }
 
     async def verify_persisted_values(
@@ -1154,10 +2037,11 @@ class JdFormListing(YouzanFormListing):
         if _category_parts(category)[-1:] != (normalize_label(JD_CATEGORY_PATH[-1]),):
             raise JdFormListingError("京东保存后类目回读失败：{0!r}".format(category))
         brand_item = await self._form_item_exact("品牌")
-        brand_inputs = await self._editable_inputs(brand_item)
-        brand = (await brand_inputs[0].input_value()).strip() if len(brand_inputs) == 1 else ""
+        brand, brand_values = await self._read_brand_value(brand_item)
         if brand != JD_BRAND:
-            raise JdFormListingError("京东保存后品牌回读失败：{0!r}".format(brand))
+            raise JdFormListingError(
+                "京东保存后品牌回读失败：{0!r}".format(brand_values)
+            )
         expected = self._expected_sku(fields.fields)
         rows = self._validate_sku(await self._sku_table_snapshot(), expected)
         prices = await self.fill_summary_prices(fields.fields)

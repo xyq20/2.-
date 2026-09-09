@@ -87,6 +87,7 @@ TAOBAO_VALUE_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
     (normalize_label("产地"), normalize_option("中国大陆")): ("中国",),
     (normalize_label("弹力"), normalize_option("无弹")): ("无弹力",),
     (normalize_label("弹力"), normalize_option("无弹力")): ("无弹",),
+    (normalize_label("版型"), normalize_option("直筒")): ("直筒型",),
 }
 
 

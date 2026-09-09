@@ -121,10 +121,10 @@ PLATFORM_SPECS: Tuple[PlatformSpec, ...] = (
         display_name="京东资料",
         tab_label="京东资料",
         lifecycle="implemented",
-        enabled_in_all=False,
+        enabled_in_all=True,
         supports_inspect=False,
         save_policy="allowed",
-        publish_allowed=False,
+        publish_allowed=True,
         discovery_adapter=None,
     ),
 )

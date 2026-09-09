@@ -41,6 +41,7 @@ class PlatformRegistryTests(unittest.TestCase):
                 ("wxsph", "wxsph", "微信小店（视频号）资料", "微信小店（视频号）资料", "implemented", True, True, "allowed", True, "wxsph_listing:WxsphListing"),
                 ("xhs", "xhs", "小红书资料", "小红书资料", "implemented", True, True, "allowed", True, "xhs_listing:XhsListing"),
                 ("youzan", "yz", "有赞资料", "有赞资料", "implemented", True, False, "allowed", True, None),
+                ("jd", "jd", "京东资料", "京东资料", "implemented", True, False, "allowed", True, None),
             ],
         )
 
@@ -49,7 +50,7 @@ class PlatformRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             registry.platform_cli_choices(),
-            ("all", "base", "douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan"),
+            ("all", "base", "douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
         )
 
     def test_lookup_supports_public_name_and_unique_platform_id(self):
@@ -63,7 +64,7 @@ class PlatformRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(spec.cli_name for spec in registry.expand_platform_selection("all")),
-            ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan"),
+            ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
         )
         self.assertEqual(
             tuple(spec.cli_name for spec in registry.expand_platform_selection("taobao")),
