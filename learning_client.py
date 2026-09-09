@@ -80,6 +80,12 @@ class CloudLearningClient:
         status, body = self._request("POST", "/api/device/decide", payload)
         return self._successful_json(status, body)
 
+    def analyze(self, product_version: str) -> Mapping[str, Any]:
+        status, body = self._request(
+            "POST", "/api/device/analyze", {"product_version": product_version}
+        )
+        return self._successful_json(status, body)
+
     def poll_resume(
         self,
         device_id: str,

@@ -151,6 +151,13 @@ class LearningClientTests(unittest.TestCase):
                 ("POST", "/api/device/decide", {"field": "fabric"}),
             )
 
+        with patch.object(client, "_request", return_value=(200, {"status": "ready"})) as request:
+            self.assertEqual(client.analyze("product-1"), {"status": "ready"})
+            self.assertEqual(
+                request.call_args.args,
+                ("POST", "/api/device/analyze", {"product_version": "product-1"}),
+            )
+
         with patch.object(client, "_request", return_value=(200, {"events": []})) as request:
             self.assertEqual(client.poll_resume("device 1", wait_seconds=30), {"events": []})
             self.assertEqual(
