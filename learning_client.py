@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import json
 import os
@@ -230,6 +231,36 @@ def flush_outbox(
     for event in store.pending_outbox(limit=50):
         try:
             client.post_event(
+                event.idempotency_key,
+                event.event_type,
+                event.payload,
+            )
+        except RetryableCloudError as caught:
+            delay = min(300, 2 ** min(event.attempts, 8))
+            store.mark_retry(
+                event.id,
+                str(caught),
+                (now + timedelta(seconds=delay)).isoformat(),
+            )
+            continue
+        except PermanentCloudError:
+            raise
+        store.mark_delivered(event.id)
+        delivered += 1
+    return delivered
+
+
+async def flush_outbox_async(
+    store: LearningStore,
+    client: CloudLearningClient,
+    now: datetime,
+) -> int:
+    """Deliver network requests off-thread while keeping SQLite on its owner thread."""
+    delivered = 0
+    for event in store.pending_outbox(limit=50):
+        try:
+            await asyncio.to_thread(
+                client.post_event,
                 event.idempotency_key,
                 event.event_type,
                 event.payload,

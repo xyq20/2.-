@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Tuple
 import uuid
 
 from attribute_decision import DecisionInput, DecisionStatus, validate_decision
 from canonical_fields import FieldMappingError, map_platform_field
-from learning_client import PermanentCloudError, RetryableCloudError
+from learning_client import flush_outbox_async
 from learning_models import CandidateSnapshot, CandidateValue, canonical_sha256
 from learning_store import LearningStore
 
@@ -70,26 +70,11 @@ class AttributeRuntime:
         self.device_id = device_id or store.get_or_create_device_id()
 
     async def _flush(self) -> None:
-        now = datetime.now(timezone.utc)
-        for event in self.store.pending_outbox(limit=50):
-            try:
-                await asyncio.to_thread(
-                    self.client.post_event,
-                    event.idempotency_key,
-                    event.event_type,
-                    event.payload,
-                )
-            except RetryableCloudError as caught:
-                delay = min(300, 2 ** min(event.attempts, 8))
-                self.store.mark_retry(
-                    event.id,
-                    str(caught),
-                    (now + timedelta(seconds=delay)).isoformat(),
-                )
-                continue
-            except PermanentCloudError:
-                raise
-            self.store.mark_delivered(event.id)
+        await flush_outbox_async(
+            self.store,
+            self.client,
+            datetime.now(timezone.utc),
+        )
 
     async def _raise_review(
         self,

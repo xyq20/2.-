@@ -289,6 +289,12 @@ class LearningStore:
             image_version=row["image_version"],
         )
 
+    def latest_checkpoint(self) -> Optional[RunCheckpoint]:
+        row = self.connection.execute(
+            "SELECT run_id FROM run_checkpoints ORDER BY updated_at DESC, run_id DESC LIMIT 1"
+        ).fetchone()
+        return self.load_checkpoint(row["run_id"]) if row is not None else None
+
     def record_stage(self, result: StageResult) -> None:
         reject_sensitive_fields(result.expected)
         reject_sensitive_fields(result.readback)
