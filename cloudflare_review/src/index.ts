@@ -23,6 +23,7 @@ import {
 } from "./assets";
 import { body, HttpError, json, requireValue, text } from "./http";
 import { analyzeProduct } from "./model";
+import { decideAttribute, parseDecisionRequest } from "./decision";
 import type { ReviewEnv } from "./types";
 export default {
   async fetch(request: Request, env: ReviewEnv): Promise<Response> {
@@ -53,6 +54,8 @@ export default {
           const data = await body(request);
           return json(await analyzeProduct(env, text(data.product_version, "product_version")));
         }
+        if (method === "POST" && path === "/api/device/decide")
+          return json(await decideAttribute(env, parseDecisionRequest(await body(request))));
         if (method === "GET" && path === "/api/device/resume")
           return await resumeEvents(
             env,
