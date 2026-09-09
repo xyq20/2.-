@@ -200,6 +200,19 @@ class AttributeDecisionTests(unittest.TestCase):
         self.assertEqual(result.status, DecisionStatus.AUTO_FILL_READY)
         self.assertEqual((result.value_id, result.value_label), ("long", "长裤"))
 
+    def test_three_verified_model_outcomes_below_ninety_five_percent_are_rejected(self):
+        result = validate_decision(
+            make_decision(
+                source="constrained_model",
+                mature_rule=False,
+                support_count=3,
+                calibrated_acceptance_rate=0.949,
+            ),
+            make_snapshot(),
+        )
+
+        self.assert_review(result, "confidence_gate_not_met")
+
     def test_model_self_reported_confidence_does_not_affect_gate(self):
         weak = validate_decision(
             make_decision(
