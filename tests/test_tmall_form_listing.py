@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from attribute_runtime import ResolvedAttribute
+from platform_schema import FieldOption
 from tmall_form_listing import (
     TmallFormListing,
     TmallFormListingError,
@@ -27,7 +29,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def _listing(self, body, api_index=None):
+    async def _listing(self, body, api_index=None, attribute_runtime=None):
         await self.page.set_content(
             f"""
             <button role="tab" aria-selected="false" id="tmall-tab"
@@ -45,6 +47,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             self.page.locator("body"),
             None,
             api_index=api_index,
+            attribute_runtime=attribute_runtime,
         )
         await listing.open()
         return listing
@@ -125,6 +128,92 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         api_index.resolve_option.assert_called_once()
         self.assertEqual(api_index.resolve_option.call_args.args[0], "风格")
         self.assertIn("时尚都市", api_index.resolve_option.call_args.args[1])
+
+    async def test_learning_uses_tmall_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-tmall-1",
+                )
+
+        runtime = Runtime()
+        api_index = SimpleNamespace(
+            settle=AsyncMock(),
+            source_ids=Mock(return_value=("thickness",)),
+            resolve_option=Mock(return_value="常规"),
+            candidate_fields=Mock(
+                return_value=(
+                    SimpleNamespace(
+                        source_id="thickness",
+                        category_leaf_id="3035",
+                        option_values=(
+                            FieldOption("regular", "常规", 0),
+                            FieldOption("thick", "加厚", 1),
+                        ),
+                    ),
+                )
+            ),
+        )
+        listing = await self._listing(
+            """
+            <div class="conf"><div class="complex-wrap">
+              <div class="complex-item" id="thickness-item">
+                <div class="el-form-item is-required">
+                  <label class="el-form-item__label">厚薄</label>
+                  <div class="el-form-item__content"><div class="el-select">
+                    <input class="el-input__inner" readonly onclick="openTmallSelect(this)">
+                    <div class="el-select-dropdown" style="display:none"><ul>
+                      <li class="el-select-dropdown__item" onclick="chooseTmallOption(this)">常规</li>
+                      <li class="el-select-dropdown__item" onclick="chooseTmallOption(this)">加厚</li>
+                    </ul></div>
+                  </div></div>
+                </div>
+              </div>
+            </div></div>
+            <script>
+              function openTmallSelect(input) {
+                input.closest('.el-select').querySelector('.el-select-dropdown').style.display='block';
+              }
+              function chooseTmallOption(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = option.textContent.trim();
+                select.querySelector('.el-select-dropdown').style.display='none';
+              }
+            </script>
+            """,
+            api_index=api_index,
+            attribute_runtime=runtime,
+        )
+
+        actual = await listing.fill_attribute(
+            "厚薄",
+            "常规",
+            item=self.page.locator("#thickness-item"),
+        )
+
+        self.assertEqual(actual, ("常规",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "tm")
+        self.assertEqual(request.category_leaf_id, "3035")
+        self.assertEqual(request.field_id, "thickness")
+        self.assertEqual(request.excel_value, "常规")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("regular", "常规"), ("thick", "加厚")),
+        )
 
     async def test_open_refreshes_stale_shop_authorization_once(self):
         await self.page.set_content(

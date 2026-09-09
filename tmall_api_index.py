@@ -11,7 +11,9 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from platform_schema import FieldOption
 
 
 TMALL_READ_ONLY_ENDPOINTS: Mapping[str, str] = {
@@ -46,6 +48,7 @@ _OPTION_KEYS = (
 )
 _ID_KEYS = ("propId", "fieldId", "id", "key", "name")
 _LABEL_KEYS = ("label", "propName", "displayName", "title", "name")
+_OPTION_ID_KEYS = ("value", "valueId", "vid", "id", "key")
 
 
 def normalize_api_label(value: object) -> str:
@@ -119,6 +122,50 @@ def _descriptor_options(descriptor: Mapping[str, Any]) -> Tuple[str, ...]:
     return ()
 
 
+def _option_values(value: Any) -> Tuple[FieldOption, ...]:
+    if isinstance(value, Mapping):
+        nested = value.get("options")
+        value = nested if isinstance(nested, (tuple, list)) else tuple(value.values())
+    if not isinstance(value, (tuple, list)):
+        return ()
+    options = []
+    for position, option in enumerate(value):
+        if isinstance(option, Mapping):
+            label = _text(
+                option,
+                ("displayName", "label", "name", "text", "valueName"),
+            )
+            value_id = _text(option, _OPTION_ID_KEYS)
+        elif isinstance(option, (str, int, float)):
+            label = str(option).strip()
+            value_id = label
+        else:
+            continue
+        if label:
+            options.append(FieldOption(value_id, label, position))
+    return tuple(options)
+
+
+def _descriptor_option_values(
+    descriptor: Mapping[str, Any],
+) -> Tuple[FieldOption, ...]:
+    for key in _OPTION_KEYS:
+        if key not in descriptor:
+            continue
+        values = _option_values(descriptor.get(key))
+        if values:
+            return values
+    component = descriptor.get("component")
+    if isinstance(component, Mapping):
+        props = component.get("props")
+        if isinstance(props, Mapping):
+            for key in _OPTION_KEYS:
+                values = _option_values(props.get(key))
+                if values:
+                    return values
+    return ()
+
+
 def _required(descriptor: Mapping[str, Any]) -> Optional[bool]:
     value = descriptor.get("required")
     if isinstance(value, bool):
@@ -131,6 +178,25 @@ def _required(descriptor: Mapping[str, Any]) -> Optional[bool]:
     return None
 
 
+def _response_category_id(response: Any) -> str:
+    values = []
+    try:
+        query = parse_qs(urlsplit(str(response.url)).query, keep_blank_values=True)
+        for key in ("leafCategoryId", "categoryId"):
+            values.extend(str(value).strip() for value in query.get(key, ()) if str(value).strip())
+    except Exception:
+        pass
+    try:
+        post_data = str(getattr(response.request, "post_data", "") or "")
+        form = parse_qs(post_data, keep_blank_values=True)
+        for key in ("leafCategoryId", "categoryId"):
+            values.extend(str(value).strip() for value in form.get(key, ()) if str(value).strip())
+    except Exception:
+        pass
+    unique = tuple(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else ""
+
+
 @dataclass(frozen=True)
 class TmallApiField:
     endpoint_path: str
@@ -138,6 +204,8 @@ class TmallApiField:
     label: str
     required: Optional[bool]
     options: Tuple[str, ...]
+    option_values: Tuple[FieldOption, ...] = ()
+    category_leaf_id: str = ""
 
 
 def extract_api_fields(payload: Any, endpoint_path: str) -> Tuple[TmallApiField, ...]:
@@ -156,13 +224,16 @@ def extract_api_fields(payload: Any, endpoint_path: str) -> Tuple[TmallApiField,
         if identity in seen_fields:
             return
         seen_fields.add(identity)
+        option_values = _descriptor_option_values(descriptor)
         fields.append(
             TmallApiField(
                 endpoint_path=endpoint_path,
                 source_id=source_id,
                 label=label,
                 required=_required(descriptor),
-                options=_descriptor_options(descriptor),
+                options=tuple(value.label for value in option_values)
+                or _descriptor_options(descriptor),
+                option_values=option_values,
             )
         )
 
@@ -278,7 +349,19 @@ class TmallApiJsonIndex:
             if self.logger is not None:
                 self.logger.info("天猫产品匹配接口：已匹配既有产品=%s", self.matched_existing_product)
 
-        fields = extract_api_fields(payload, path)
+        category_id = _response_category_id(response)
+        fields = tuple(
+            TmallApiField(
+                endpoint_path=field.endpoint_path,
+                source_id=field.source_id,
+                label=field.label,
+                required=field.required,
+                options=field.options,
+                option_values=field.option_values,
+                category_leaf_id=category_id,
+            )
+            for field in extract_api_fields(payload, path)
+        )
         # payload 在这里离开作用域；只保留字段 schema，不保留原始响应。
         existing = {
             (field.endpoint_path, field.source_id, normalize_api_label(field.label))
@@ -326,6 +409,27 @@ class TmallApiJsonIndex:
                 field.source_id for field in self.fields_for_label(label) if field.source_id
             )
         )
+
+    def candidate_fields(self, label: object) -> Tuple[TmallApiField, ...]:
+        """Return current category fields that retain authoritative option IDs."""
+        result = []
+        identities = set()
+        for field in self.fields_for_label(label):
+            if not field.category_leaf_id or not field.option_values:
+                continue
+            identity = (
+                field.category_leaf_id,
+                field.source_id,
+                tuple(
+                    (option.value_id, option.label)
+                    for option in field.option_values
+                ),
+            )
+            if identity in identities:
+                continue
+            identities.add(identity)
+            result.append(field)
+        return tuple(result)
 
     def resolve_option(
         self,

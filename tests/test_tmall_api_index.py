@@ -64,6 +64,13 @@ class TmallApiExtractionTests(unittest.TestCase):
         self.assertEqual(fields[0].label, "裤型")
         self.assertTrue(fields[0].required)
         self.assertEqual(fields[0].options, ("直筒裤", "工装裤"))
+        self.assertEqual(
+            tuple(
+                (option.value_id, option.label)
+                for option in fields[0].option_values
+            ),
+            (("secret-id", "直筒裤"), ("other-id", "工装裤")),
+        )
         self.assertNotIn("店铺", repr(fields))
         self.assertNotIn("商品标题", repr(fields))
 
@@ -141,6 +148,39 @@ class TmallApiIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", repr(summary))
         index.uninstall()
         self.assertNotIn("response", page.handlers)
+
+    async def test_candidate_field_keeps_request_category_and_option_ids(self):
+        index = TmallApiJsonIndex(FakePage())
+        path = "/dsb/queryCategoryConfigInfo.json"
+        await index._consume(
+            FakeResponse(
+                "https://scm.example/dsb/queryCategoryConfigInfo.json?leafCategoryId=3035",
+                {
+                    "data": {
+                        "attrList": [
+                            {
+                                "propId": "thickness",
+                                "label": "厚薄",
+                                "options": [
+                                    {"value": "regular", "displayName": "常规"},
+                                    {"value": "thick", "displayName": "加厚"},
+                                ],
+                            }
+                        ]
+                    },
+                    "success": True,
+                },
+            ),
+            path,
+            "GET",
+        )
+
+        fields = index.candidate_fields("厚薄")
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].category_leaf_id, "3035")
+        self.assertEqual(fields[0].source_id, "thickness")
+        self.assertEqual(fields[0].option_values[0].value_id, "regular")
 
     async def test_resolve_option_follows_candidate_order_and_rejects_duplicates(self):
         page = FakePage()

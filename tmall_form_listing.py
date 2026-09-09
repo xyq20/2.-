@@ -13,6 +13,13 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from attribute_runtime import AttributeRequest
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
 from taobao_listing import (
     MaterialComponent,
     TaobaoListing,
@@ -197,6 +204,101 @@ class TmallFormListing(TaobaoListing):
                 return tuple(tuple(value) for value in groups)
             resolved.append((option,))
         return tuple(resolved)
+
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise TmallFormListingError("天猫属性学习运行器未启用")
+        if self.api_index is None:
+            raise TmallFormListingError(
+                f"天猫属性“{page_label}”缺少接口 JSON 索引"
+            )
+        await self.api_index.settle(timeout_seconds=0.25)
+        fields = self.api_index.candidate_fields(page_label)
+        if len(fields) != 1:
+            raise TmallFormListingError(
+                f"天猫属性“{page_label}”接口候选字段匹配数为 {len(fields)}"
+            )
+        field = fields[0]
+        field_id = str(field.source_id or "").strip()
+        category_id = str(field.category_leaf_id or "").strip()
+        if not field_id or not category_id:
+            raise TmallFormListingError(
+                f"天猫属性“{page_label}”缺少接口字段 ID 或类目 ID"
+            )
+
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        try:
+            candidates = reconcile_candidates(
+                field.option_values,
+                tuple(
+                    DomCandidate(
+                        str(option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in dom_options
+                ),
+            )
+        except CandidateSourceError as exc:
+            raise TmallFormListingError(
+                f"天猫属性“{page_label}”接口候选与页面候选不一致：{exc.reason_code}"
+            ) from exc
+
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tm",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_values = []
+        for group in groups:
+            exact = tuple(
+                value.label
+                for value in candidates
+                if any(
+                    normalize_option(value.label) == normalize_option(alias)
+                    for alias in group
+                )
+            )
+            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="tm",
+                    category_leaf_id=category_id,
+                    field_id=field_id,
+                    field_label=page_label,
+                    candidates=tuple(
+                        CandidateValue(value.value_id, value.label)
+                        for value in candidates
+                    ),
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=False,
+                    schema_version=schema_version,
+                    control_type="select",
+                )
+            )
+            resolved_values.append(resolved.label)
+        return tuple(resolved_values)
 
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -1492,12 +1594,36 @@ class TmallFormListing(TaobaoListing):
             if exact_values is not None
             else selection_value_groups(label, expected)
         )
-        resolved_groups = await self._api_resolved_groups(label, groups)
-        resolved_values = (
-            tuple(group[0] for group in resolved_groups)
-            if all(len(group) == 1 for group in resolved_groups)
-            else None
-        )
+        resolved_values: Optional[Tuple[str, ...]] = None
+        if self.attribute_runtime is not None and groups:
+            if item is None:
+                items = await self._attribute_items()
+                records = [
+                    record
+                    for key, record in items.items()
+                    if key.split("#", 1)[0] == normalize_label(label)
+                ]
+                if len(records) != 1:
+                    raise TmallFormListingError(
+                        f"当前天猫类目中属性“{label}”匹配数为 {len(records)}"
+                    )
+                _page_label, item = records[0]
+            selects = item.locator(
+                ":scope > .el-form-item > .el-form-item__content .el-select"
+            )
+            if await selects.count() == 1:
+                resolved_values = await self._resolve_learning_select_groups(
+                    label,
+                    selects.first,
+                    groups,
+                )
+        else:
+            resolved_groups = await self._api_resolved_groups(label, groups)
+            resolved_values = (
+                tuple(group[0] for group in resolved_groups)
+                if all(len(group) == 1 for group in resolved_groups)
+                else None
+            )
         try:
             return await super().fill_attribute(
                 label,
