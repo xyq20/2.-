@@ -1,5 +1,6 @@
 import unittest
 
+from attribute_runtime import ResolvedAttribute
 from youzan_data import parse_youzan_fields
 from youzan_form_listing import YouzanFormListing, YouzanFormListingError
 
@@ -88,6 +89,10 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
               <div class="el-form-item is-required" id="material">
                 <label class="el-form-item__label">面料</label>
                 <div class="el-form-item__content">{material_select}</div>
+              </div>
+              <div class="el-form-item" id="thickness">
+                <label class="el-form-item__label">厚薄</label>
+                <div class="el-form-item__content">{thickness_select}</div>
               </div>
               <div class="el-form-item is-required" id="outer-id">
                 <label class="el-form-item__label">货号</label>
@@ -207,6 +212,7 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
             </script>
             """.format(
                 material_select=select_markup(["棉"]),
+                thickness_select=select_markup(["常规", "加厚"]),
                 style_select=select_markup(
                     [] if empty_style else ["休闲风", "时尚都市"],
                     empty_message=empty_style,
@@ -289,6 +295,80 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(YouzanFormListingError, "保存后类目属性回读失败"):
             await listing._verify_persisted_attributes(fields)
+
+    async def test_learning_uses_youzan_api_field_and_value_names(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-yz-1",
+                )
+
+        async def fulfill_attributes(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "result": {
+                            "publicPropertys": [
+                                {
+                                    "propertyGroup": 1,
+                                    "isRequired": False,
+                                    "property": {
+                                        "id": "thickness-id",
+                                        "name": "厚薄",
+                                        "valueType": 5,
+                                        "valueNames": ["常规", "加厚"],
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+            )
+
+        runtime = Runtime()
+        listing = await self._listing()
+        listing.attribute_runtime = runtime
+        await self.page.route(
+            "**/yz/getCategoryProperties.json*", fulfill_attributes
+        )
+        await self.page.evaluate(
+            "fetch('https://api.test/yz/getCategoryProperties.json?categoryId=3846')"
+        )
+        item = (await listing._attribute_items())["厚薄"][1]
+
+        actual = await listing._fill_attribute(
+            "厚薄",
+            item,
+            "常规",
+            required=False,
+        )
+
+        self.assertEqual(actual, ("常规",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "yz")
+        self.assertEqual(request.category_leaf_id, "3846")
+        self.assertEqual(request.field_id, "thickness-id")
+        self.assertEqual(request.excel_value, "常规")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("常规", "常规"), ("加厚", "加厚")),
+        )
 
     async def test_fills_pants_sales_and_logistics(self):
         listing = await self._listing()

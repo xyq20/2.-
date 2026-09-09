@@ -7,9 +7,20 @@ remain owned by the common runner in ``kuaimai_erp.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlsplit
+
+from attribute_runtime import AttributeRequest
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldOption
 
 from taobao_listing import (
     TaobaoListing,
@@ -72,6 +83,9 @@ YOUZAN_FREIGHT_TEMPLATES = {
     "pants": "T恤、裤子、饰品邮费模版",
     "coat": "鞋子、皮衣、外套邮费模版",
 }
+YOUZAN_ATTRIBUTE_PATHS = frozenset(
+    ("/yz/getCategoryProperties", "/yz/getCategoryProperties.json")
+)
 
 
 def _numeric_equal(actual: str, expected: str) -> bool:
@@ -121,6 +135,173 @@ class YouzanFormListing(TaobaoListing):
     # even though they came from the platform API.  Exact visible text is still
     # required and is read back after the click.
     allow_created_exact_dom_option = True
+
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        *,
+        attribute_runtime: Optional[Any] = None,
+    ) -> None:
+        super().__init__(
+            page,
+            drawer,
+            logger,
+            attribute_runtime=attribute_runtime,
+        )
+        self._youzan_api_generation = 0
+        self._youzan_api_category_id = ""
+        self._youzan_api_fields: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
+        self._youzan_request_contexts: Dict[int, Tuple[int, str]] = {}
+        self._youzan_response_tasks: set[asyncio.Task[Any]] = set()
+        self._install_youzan_attribute_listener()
+
+    @staticmethod
+    def _request_parameter(request: Any, name: str) -> str:
+        try:
+            query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+            values = [
+                str(value).strip()
+                for value in query.get(name, ())
+                if str(value).strip()
+            ]
+        except Exception:
+            values = []
+        if len(values) == 1:
+            return values[0]
+        raw = str(getattr(request, "post_data", "") or "")
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = parse_qs(raw, keep_blank_values=True)
+        if isinstance(parsed, Mapping):
+            value = parsed.get(name)
+            if isinstance(value, Sequence) and not isinstance(value, str):
+                values = [str(item).strip() for item in value if str(item).strip()]
+                return values[0] if len(values) == 1 else ""
+            return str(value or "").strip()
+        return ""
+
+    def _install_youzan_attribute_listener(self) -> None:
+        if not hasattr(self.page, "on"):
+            return
+
+        def on_request(request: Any) -> None:
+            try:
+                path = urlsplit(str(request.url)).path
+            except Exception:
+                return
+            if path not in YOUZAN_ATTRIBUTE_PATHS:
+                return
+            category_id = self._request_parameter(request, "categoryId")
+            if not category_id:
+                return
+            self._youzan_api_generation += 1
+            self._youzan_api_category_id = category_id
+            self._youzan_api_fields = {}
+            self._youzan_request_contexts[id(request)] = (
+                self._youzan_api_generation,
+                category_id,
+            )
+
+        def on_response(response: Any) -> None:
+            request = getattr(response, "request", None)
+            context = self._youzan_request_contexts.pop(id(request), None)
+            if context is None:
+                return
+            task = asyncio.create_task(
+                self._consume_youzan_attribute_response(response, context)
+            )
+            self._youzan_response_tasks.add(task)
+            task.add_done_callback(self._youzan_response_tasks.discard)
+
+        def on_request_failed(request: Any) -> None:
+            self._youzan_request_contexts.pop(id(request), None)
+
+        self.page.on("request", on_request)
+        self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
+
+    async def _consume_youzan_attribute_response(
+        self,
+        response: Any,
+        context: Tuple[int, str],
+    ) -> None:
+        generation, category_id = context
+        if generation != self._youzan_api_generation:
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+        if generation != self._youzan_api_generation:
+            return
+        data = payload.get("data", payload) if isinstance(payload, Mapping) else {}
+        result = data.get("result", data) if isinstance(data, Mapping) else {}
+        raw_fields = result.get("publicPropertys") if isinstance(result, Mapping) else None
+        if not isinstance(raw_fields, Sequence) or isinstance(raw_fields, (str, bytes)):
+            return
+        records: Dict[str, List[Mapping[str, Any]]] = {}
+        for raw_field in raw_fields:
+            if not isinstance(raw_field, Mapping) or raw_field.get("propertyGroup") != 1:
+                continue
+            prop = raw_field.get("property")
+            if not isinstance(prop, Mapping):
+                continue
+            field_id = str(prop.get("id") or "").strip()
+            label = str(prop.get("name") or "").strip()
+            if not field_id or not label:
+                continue
+            raw_options = prop.get("valueNames")
+            if not isinstance(raw_options, Sequence) or isinstance(
+                raw_options, (str, bytes)
+            ):
+                raw_options = ()
+            options = tuple(
+                FieldOption(str(value).strip(), str(value).strip(), position)
+                for position, value in enumerate(raw_options)
+                if str(value).strip()
+            )
+            value_type = int(prop.get("valueType") or 0)
+            records.setdefault(normalize_label(label), []).append(
+                {
+                    "id": field_id,
+                    "label": label,
+                    "options": options,
+                    "custom_allowed": value_type == 1,
+                    "category_id": category_id,
+                }
+            )
+        self._youzan_api_fields = {key: tuple(value) for key, value in records.items()}
+
+    async def _drain_youzan_attribute_tasks(self) -> None:
+        await asyncio.sleep(0)
+        while self._youzan_response_tasks:
+            await asyncio.gather(
+                *tuple(self._youzan_response_tasks), return_exceptions=True
+            )
+
+    async def _captured_youzan_field(
+        self,
+        page_label: str,
+        *,
+        timeout_seconds: float = 3.0,
+    ) -> Mapping[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            await self._drain_youzan_attribute_tasks()
+            records = self._youzan_api_fields.get(normalize_label(page_label), ())
+            if len(records) == 1 and self._youzan_api_category_id:
+                return records[0]
+            await asyncio.sleep(0.05)
+        records = self._youzan_api_fields.get(normalize_label(page_label), ())
+        raise YouzanFormListingError(
+            "有赞属性“{0}”缺少唯一的接口 JSON 字段：字段数 {1}".format(
+                page_label,
+                len(records),
+            )
+        )
 
     async def _dismiss_select_dropdown(self, select: Any) -> None:
         for _attempt in range(2):
@@ -577,6 +758,94 @@ class YouzanFormListing(TaobaoListing):
             return (year.group(0),) if year else None
         return None
 
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise YouzanFormListingError("有赞属性学习运行器未启用")
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(select)
+            field = await self._captured_youzan_field(page_label)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        api_options = tuple(field.get("options") or ())
+        if not api_options and field.get("custom_allowed") is True:
+            # Youzan valueType=1 is an API-declared free-form selector.  It has
+            # no constrained platform candidate set, so retain the Excel value
+            # and let the existing Element-UI custom-entry path verify it.
+            return tuple(group[0] for group in groups if group)
+        try:
+            candidates = reconcile_candidates(
+                api_options,
+                tuple(
+                    DomCandidate(
+                        str(option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in dom_options
+                ),
+            )
+        except CandidateSourceError as exc:
+            raise YouzanFormListingError(
+                "有赞属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label,
+                    exc.reason_code,
+                )
+            ) from exc
+        field_id = str(field.get("id") or "").strip()
+        category_id = str(field.get("category_id") or "").strip()
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "yz",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_values = []
+        for group in groups:
+            exact = tuple(
+                value.label
+                for value in candidates
+                if any(
+                    normalize_option(value.label) == normalize_option(alias)
+                    for alias in group
+                )
+            )
+            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="yz",
+                    category_leaf_id=category_id,
+                    field_id=field_id,
+                    field_label=page_label,
+                    candidates=tuple(
+                        CandidateValue(value.value_id, value.label)
+                        for value in candidates
+                    ),
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=bool(field.get("custom_allowed")),
+                    schema_version=schema_version,
+                    control_type="select",
+                )
+            )
+            resolved_values.append(resolved.label)
+        return tuple(resolved_values)
+
     async def _fill_attribute(
         self,
         page_label: str,
@@ -600,6 +869,15 @@ class YouzanFormListing(TaobaoListing):
             )
             if not groups or (not multi and len(groups) != 1):
                 raise YouzanFormListingError("有赞属性“{0}”候选分组无法用于当前控件".format(page_label))
+            if self.attribute_runtime is not None:
+                groups = tuple(
+                    (value,)
+                    for value in await self._resolve_learning_select_groups(
+                        page_label,
+                        select,
+                        groups,
+                    )
+                )
             direct_values = tuple(group[0] for group in groups if group)
             if await self._select_explicitly_has_no_data(select, multi=multi):
                 return await self._set_select_values_directly(
