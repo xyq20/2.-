@@ -5,3 +5,7 @@ __pycache__/
 output/
 .DS_Store
 .playwright-cli/
+.local-state/
+cloudflare_review/node_modules/
+cloudflare_review/.wrangler/
+cloudflare_review/dist/

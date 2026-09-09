@@ -157,6 +157,30 @@
 
 ## 安全机制
 
+### 可选 AI 学习本地状态
+
+AI 学习基础能力默认关闭。现有 `run.command` 和 Python 命令在没有
+`--learning-enabled` 时不会创建学习数据库、访问审核服务，也不会改变平台填写、保存或铺货逻辑。
+
+显式启用时，本地 SQLite 默认位于 `.local-state/learning.sqlite3`，只作为缓存、离线
+outbox 和运行恢复索引，不是中心权威数据源。可用以下安全环境变量覆盖配置：
+
+- `KUAIMAI_LEARNING_DB`：本地 SQLite 路径。
+- `KUAIMAI_LEARNING_API_URL`：审核服务地址。
+- `KUAIMAI_LEARNING_DEVICE_TOKEN`：设备认证令牌，仅从环境读取；没有对应命令行参数，
+  且不会写入 SQLite、JSON 结果或日志。
+
+也可在单次命令中设置非敏感参数：
+
+```bash
+./run.command --platform all --save-only --learning-enabled \
+  --learning-db .local-state/learning.sqlite3 \
+  --learning-api-url https://review.example
+```
+
+本地阶段记录是旁路数据：预览只记为未验证；保存后仅在现有平台回读校验文件存在且
+通过时标记 `readback_verified`。未回读或仅提交后台任务不算完成，也不会成为学习样本。
+
 - 查询不到唯一款式编码时停止。
 - SKU 图数量与第一规格值数量不一致时停止，防止颜色错配。
 - 图片未全部上传或页面存在校验错误时不保存。

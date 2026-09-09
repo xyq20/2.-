@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -33,6 +34,13 @@ from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_looku
 from douyin_listing import DouyinListing, DouyinListingError
 from jd_data import JdFields, parse_jd_fields
 from jd_form_listing import JdFormListing, JdFormListingError
+from learning_models import (
+    ProductFingerprint,
+    RunCheckpoint,
+    StageResult,
+    canonical_sha256,
+)
+from learning_store import LearningStore
 from pdd_data import PddFields, parse_pdd_fields
 from pdd_form_listing import PddFormListing, PddFormListingError
 from platform_discovery import PlatformDiscoveryError
@@ -297,6 +305,37 @@ class ProductData:
     def __post_init__(self) -> None:
         if (self.douyin_fields is None) != (self.douyin_assets is None):
             raise ValueError("抖音字段与素材必须成对提供或同时省略")
+
+
+@dataclass
+class LearningRunContext:
+    store: LearningStore
+    run_id: str
+    product_version: str
+
+
+def create_learning_context(
+    args: argparse.Namespace,
+    product: ProductData,
+) -> Optional[LearningRunContext]:
+    if not getattr(args, "learning_enabled", False):
+        return None
+    fingerprint = ProductFingerprint.from_inputs(
+        product.style_code,
+        product.title,
+        tuple(product.main_images)
+        + tuple(product.main_images_34)
+        + tuple(product.detail_images),
+    )
+    store = LearningStore(Path(args.learning_db))
+    store.migrate()
+    store.upsert_product(fingerprint)
+    store.enqueue(
+        f"product.upsert:{fingerprint.product_version}",
+        "product.upsert",
+        asdict(fingerprint),
+    )
+    return LearningRunContext(store, uuid.uuid4().hex, fingerprint.product_version)
 
 
 def natural_key(path: Path) -> List[Any]:
@@ -4728,6 +4767,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="要铺货的抖音店铺，可重复传入；不传时使用已配置的 6 个店铺",
     )
+    parser.add_argument(
+        "--learning-enabled",
+        action="store_true",
+        help="启用 AI 学习检查点和审核服务",
+    )
+    parser.add_argument(
+        "--learning-db",
+        default=os.environ.get(
+            "KUAIMAI_LEARNING_DB", ".local-state/learning.sqlite3"
+        ),
+        help="本地学习缓存数据库",
+    )
+    parser.add_argument(
+        "--learning-api-url",
+        default=os.environ.get("KUAIMAI_LEARNING_API_URL", ""),
+        help="AI 学习审核服务地址",
+    )
     return parser
 
 
@@ -4860,11 +4916,193 @@ def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...
     return selected
 
 
+def learning_execution_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "dry_run", False):
+        return "dry_run"
+    if getattr(args, "inspect_only", False):
+        return "inspect_only"
+    if not args.save:
+        return "preview"
+    if getattr(args, "save_only", False) or args.platform == "base":
+        return "save_only"
+    return "save_and_publish"
+
+
+def load_stage_readback(
+    platform_id: str,
+    artifact_dir: Path,
+) -> Optional[Mapping[str, Any]]:
+    validation_path = artifact_dir / f"{platform_id}-after-save-validation.json"
+    if not validation_path.is_file():
+        return None
+    try:
+        payload = json.loads(validation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("verified") is False or payload.get("status") in {
+        "failed",
+        "partial",
+        "mismatch",
+    }:
+        return None
+    return payload
+
+
+def learning_stage_result(
+    context: LearningRunContext,
+    args: argparse.Namespace,
+    platform_id: str,
+    artifact_dir: Path,
+) -> StageResult:
+    if not args.save:
+        return StageResult(
+            context.run_id,
+            platform_id,
+            "previewed",
+            {},
+            {},
+            False,
+        )
+    readback = load_stage_readback(platform_id, artifact_dir)
+    if readback is None:
+        return StageResult(
+            context.run_id,
+            platform_id,
+            "saved_unverified",
+            {},
+            {},
+            False,
+        )
+    return StageResult(
+        context.run_id,
+        platform_id,
+        "readback_verified",
+        {},
+        readback,
+        True,
+    )
+
+
+def save_learning_checkpoint(
+    context: LearningRunContext,
+    args: argparse.Namespace,
+    platform_order: Tuple[str, ...],
+    current_index: int,
+    status: str,
+) -> None:
+    requested = RunCheckpoint(
+        context.run_id,
+        context.product_version,
+        learning_execution_mode(args),
+        platform_order,
+        current_index,
+        status,
+    )
+    stored = context.store.save_checkpoint(requested)
+    persisted = stored if isinstance(stored, RunCheckpoint) else requested
+    context.store.enqueue(
+        f"checkpoint.updated:{persisted.run_id}:{persisted.version}",
+        "checkpoint.updated",
+        {
+            "checkpoint_id": persisted.run_id,
+            "run_id": persisted.run_id,
+            "product_version": persisted.product_version,
+            "execution_mode": persisted.execution_mode,
+            "platform_order": list(persisted.platform_order),
+            "current_index": persisted.current_index,
+            "status": persisted.status,
+            "pending_review_id": persisted.pending_review_id,
+            "version": persisted.version,
+        },
+    )
+
+
+def record_learning_stage(
+    context: LearningRunContext,
+    result: StageResult,
+) -> None:
+    context.store.record_stage(result)
+    if not result.verified:
+        return
+    payload = {
+        "run_id": result.run_id,
+        "product_version": context.product_version,
+        "platform_id": result.platform_id,
+        "status": result.status,
+        "expected": result.expected,
+        "readback": result.readback,
+        "verified": True,
+    }
+    content_version = canonical_sha256(payload)
+    context.store.enqueue(
+        f"readback.recorded:{result.run_id}:{result.platform_id}:{content_version}",
+        "readback.recorded",
+        payload,
+    )
+    context.store.enqueue(
+        f"stage.completed:{result.run_id}:{result.platform_id}:{content_version}",
+        "stage.completed",
+        payload,
+    )
+
+
+async def run_single_platform_with_learning(
+    args: argparse.Namespace,
+    product: ProductData,
+    artifact_dir: Path,
+    logger: logging.Logger,
+    *,
+    learning_context: Optional[LearningRunContext] = None,
+    **browser_kwargs: Any,
+) -> None:
+    if learning_context is None:
+        await run_browser_automation(
+            args,
+            product,
+            artifact_dir,
+            logger,
+            **browser_kwargs,
+        )
+        return
+    platform_order = (args.platform,)
+    save_learning_checkpoint(
+        learning_context, args, platform_order, 0, "running"
+    )
+    try:
+        await run_browser_automation(
+            args,
+            product,
+            artifact_dir,
+            logger,
+            **browser_kwargs,
+        )
+    except Exception:
+        save_learning_checkpoint(
+            learning_context, args, platform_order, 0, "failed"
+        )
+        raise
+    record_learning_stage(
+        learning_context,
+        learning_stage_result(
+            learning_context,
+            args,
+            args.platform,
+            artifact_dir,
+        )
+    )
+    save_learning_checkpoint(
+        learning_context, args, platform_order, 1, "completed"
+    )
+
+
 async def run_all_implemented_platforms(
     args: argparse.Namespace,
     product: ProductData,
     artifact_dir: Path,
     logger: logging.Logger,
+    learning_context: Optional[LearningRunContext] = None,
 ) -> None:
     """同一编辑页内依次保存基础资料和各平台资料。"""
     commerce_stages = (
@@ -4878,8 +5116,17 @@ async def run_all_implemented_platforms(
     stage_results: List[Dict[str, Any]] = []
     shared_session: Dict[str, Any] = {}
 
+    if learning_context is not None:
+        save_learning_checkpoint(
+            learning_context,
+            args,
+            stages,
+            0,
+            "running",
+        )
+
     try:
-        for platform_name in stages:
+        for stage_index, platform_name in enumerate(stages):
             stage_dir = artifact_dir / platform_name
             stage_dir.mkdir(parents=True, exist_ok=True)
             stage_args = argparse.Namespace(**vars(args))
@@ -4925,12 +5172,37 @@ async def run_all_implemented_platforms(
                     json.dumps(stage_results, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                if learning_context is not None:
+                    save_learning_checkpoint(
+                        learning_context,
+                        args,
+                        stages,
+                        stage_index,
+                        "failed",
+                    )
                 raise
             stage_results.append({"platform": platform_name, "status": "success"})
             (artifact_dir / "all-platform-result.json").write_text(
                 json.dumps(stage_results, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            if learning_context is not None:
+                record_learning_stage(
+                    learning_context,
+                    learning_stage_result(
+                        learning_context,
+                        stage_args,
+                        platform_name,
+                        stage_dir,
+                    )
+                )
+                save_learning_checkpoint(
+                    learning_context,
+                    args,
+                    stages,
+                    stage_index + 1,
+                    "completed" if stage_index + 1 == len(stages) else "running",
+                )
             logger.info("全平台流程完成：%s；当前编辑页保留给下一平台", platform_name)
     finally:
         await close_shared_browser_session(shared_session)
@@ -4950,6 +5222,7 @@ def main() -> int:
         artifact_dir = SCRIPT_DIR / "output/kuaimai/runs" / timestamp
         redactor = None
         logger = setup_logging(artifact_dir)
+    learning_context: Optional[LearningRunContext] = None
     try:
         if args.create_product:
             product = read_new_product_seed(resolve_excel_path(args.excel_url))
@@ -4958,6 +5231,7 @@ def main() -> int:
                 resolve_excel_path(args.excel_url),
                 include_douyin=args.platform in {"all", "douyin"},
             )
+        learning_context = create_learning_context(args, product)
         if redactor is not None:
             redactor.add_sensitive_values(product.style_code, product.title)
             summary = None
@@ -4996,17 +5270,27 @@ def main() -> int:
                         product,
                         artifact_dir,
                         logger,
+                        learning_context=learning_context,
                     )
                 )
             else:
-                asyncio.run(run_browser_automation(args, product, artifact_dir, logger))
+                asyncio.run(
+                    run_single_platform_with_learning(
+                        args,
+                        product,
+                        artifact_dir,
+                        logger,
+                        learning_context=learning_context,
+                    )
+                )
         else:
             asyncio.run(
-                run_browser_automation(
+                run_single_platform_with_learning(
                     args,
                     product,
                     artifact_dir,
                     logger,
+                    learning_context=learning_context,
                     redactor=redactor,
                 )
             )
@@ -5033,6 +5317,9 @@ def main() -> int:
     except Exception:
         logger.exception("程序出现未预期错误")
         return 1
+    finally:
+        if learning_context is not None:
+            learning_context.store.close()
 
 
 if __name__ == "__main__":

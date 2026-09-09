@@ -74,6 +74,16 @@ class LearningModelTests(unittest.TestCase):
         self.assertEqual(first.snapshot_version, first.snapshot_version)
         self.assertNotEqual(first.snapshot_version, second.snapshot_version)
 
+    def test_checkpoint_version_is_positive_and_defaults_to_one(self):
+        checkpoint = RunCheckpoint(
+            "run", "product", "preview", ("pdd",), 0, "running"
+        )
+        self.assertEqual(checkpoint.version, 1)
+        with self.assertRaises(ValueError):
+            RunCheckpoint(
+                "run", "product", "preview", ("pdd",), 0, "running", version=0
+            )
+
     def test_all_wire_models_are_immutable_dataclasses(self):
         instances = (
             AssetFingerprint("/tmp/a", "main", "sha", 1),

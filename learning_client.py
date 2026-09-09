@@ -90,7 +90,10 @@ class CloudLearningClient:
             {"device_id": device_id, "wait_seconds": bounded_wait}
         )
         status, body = self._request(
-            "GET", f"/api/device/resume?{query}", None
+            "GET",
+            f"/api/device/resume?{query}",
+            None,
+            timeout=max(self.timeout, bounded_wait + 5.0),
         )
         return self._successful_json(status, body)
 
@@ -101,10 +104,24 @@ class CloudLearningClient:
     ) -> Mapping[str, Any]:
         return self.poll_resume(device_id, wait_seconds=wait_seconds)
 
-    def acknowledge_resume(self, event_id: str) -> Mapping[str, Any]:
+    def acknowledge_resume(
+        self,
+        event_id: str,
+        *,
+        checkpoint_id: str,
+        device_id: str,
+    ) -> Mapping[str, Any]:
+        if not checkpoint_id or not device_id:
+            raise ValueError("durable checkpoint_id and device_id are required")
         encoded_event_id = parse.quote(event_id, safe="")
         status, body = self._request(
-            "POST", f"/api/device/resume/{encoded_event_id}/ack", {}
+            "POST",
+            f"/api/device/resume/{encoded_event_id}/ack",
+            {
+                "checkpoint_persisted": True,
+                "checkpoint_id": checkpoint_id,
+                "device_id": device_id,
+            },
         )
         return self._successful_json(status, body, idempotent_conflict=True)
 
@@ -154,6 +171,7 @@ class CloudLearningClient:
         *,
         body: Optional[bytes] = None,
         headers: Optional[Mapping[str, str]] = None,
+        timeout: Optional[float] = None,
     ) -> Tuple[int, Mapping[str, Any]]:
         request_headers = {
             "Authorization": f"Device {self.device_token}",
@@ -170,7 +188,10 @@ class CloudLearningClient:
             method=method,
         )
         try:
-            with request.urlopen(built_request, timeout=self.timeout) as response:
+            with request.urlopen(
+                built_request,
+                timeout=self.timeout if timeout is None else timeout,
+            ) as response:
                 return int(response.status), self._decode_response(response.read())
         except error.HTTPError as caught:
             return int(caught.code), self._decode_response(caught.read())

@@ -150,13 +150,40 @@ class LearningClientTests(unittest.TestCase):
                 request.call_args.args,
                 ("GET", "/api/device/resume?device_id=device+1&wait_seconds=30", None),
             )
+            self.assertEqual(request.call_args.kwargs, {"timeout": 35.0})
 
         with patch.object(client, "_request", return_value=(200, {"ok": True})) as request:
-            self.assertEqual(client.acknowledge_resume("event/1"), {"ok": True})
+            self.assertEqual(
+                client.acknowledge_resume(
+                    "event/1", checkpoint_id="run-1", device_id="device-1"
+                ),
+                {"ok": True},
+            )
             self.assertEqual(
                 request.call_args.args,
-                ("POST", "/api/device/resume/event%2F1/ack", {}),
+                (
+                    "POST",
+                    "/api/device/resume/event%2F1/ack",
+                    {
+                        "checkpoint_persisted": True,
+                        "checkpoint_id": "run-1",
+                        "device_id": "device-1",
+                    },
+                ),
             )
+
+    def test_resume_ack_requires_durable_checkpoint_identity(self):
+        client = CloudLearningClient("https://review.example", "device-secret")
+        with patch.object(client, "_request") as request:
+            with self.assertRaises(ValueError):
+                client.acknowledge_resume(
+                    "event-1", checkpoint_id="", device_id="device-1"
+                )
+            with self.assertRaises(ValueError):
+                client.acknowledge_resume(
+                    "event-1", checkpoint_id="run-1", device_id=""
+                )
+        request.assert_not_called()
 
     def test_upload_asset_uses_hash_path_and_metadata_headers(self):
         client = CloudLearningClient("https://review.example", "device-secret")

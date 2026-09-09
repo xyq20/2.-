@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Mapping, Optional, Tuple
+import unicodedata
 
 from learning_models import (
     CandidateSnapshot,
@@ -22,6 +23,20 @@ SCHEMA_VERSION = 1
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def reject_sensitive_fields(value: Any) -> None:
+    sensitive_names = {"authorization", "cookie", "password", "secret", "token", "key"}
+    if isinstance(value, Mapping):
+        for raw_key, nested in value.items():
+            key = unicodedata.normalize("NFKC", str(raw_key)).casefold().replace("-", "_")
+            parts = tuple(part for part in key.split("_") if part)
+            if any(part in sensitive_names for part in parts):
+                raise ValueError("sensitive field is not allowed in learning storage")
+            reject_sensitive_fields(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            reject_sensitive_fields(nested)
 
 
 class LearningStore:
@@ -62,6 +77,7 @@ class LearningStore:
               current_index INTEGER NOT NULL,
               status TEXT NOT NULL,
               pending_review_id TEXT,
+              version INTEGER NOT NULL CHECK(version > 0),
               updated_at TEXT NOT NULL
             )
             """,
@@ -122,7 +138,9 @@ class LearningStore:
         return int(row["value"]) if row is not None else 0
 
     def upsert_product(self, fingerprint: ProductFingerprint) -> None:
-        payload = canonical_json(asdict(fingerprint))
+        fingerprint_payload = asdict(fingerprint)
+        reject_sensitive_fields(fingerprint_payload)
+        payload = canonical_json(fingerprint_payload)
         with self.connection:
             self.connection.execute(
                 "INSERT INTO products(product_version, style_code, title, payload_json, created_at) "
@@ -139,16 +157,22 @@ class LearningStore:
                 ),
             )
 
-    def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+    def save_checkpoint(self, checkpoint: RunCheckpoint) -> RunCheckpoint:
         with self.connection:
             self.connection.execute(
                 "INSERT INTO run_checkpoints("
                 "run_id, product_version, execution_mode, platform_order_json, "
-                "current_index, status, pending_review_id, updated_at"
-                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                "current_index, status, pending_review_id, version, updated_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET "
                 "current_index=excluded.current_index, status=excluded.status, "
-                "pending_review_id=excluded.pending_review_id, updated_at=excluded.updated_at",
+                "pending_review_id=excluded.pending_review_id, "
+                "version=CASE WHEN "
+                "run_checkpoints.current_index<>excluded.current_index OR "
+                "run_checkpoints.status<>excluded.status OR "
+                "run_checkpoints.pending_review_id IS NOT excluded.pending_review_id "
+                "THEN run_checkpoints.version+1 ELSE run_checkpoints.version END, "
+                "updated_at=excluded.updated_at",
                 (
                     checkpoint.run_id,
                     checkpoint.product_version,
@@ -157,14 +181,19 @@ class LearningStore:
                     checkpoint.current_index,
                     checkpoint.status,
                     checkpoint.pending_review_id,
+                    1,
                     utc_now(),
                 ),
             )
+        persisted = self.load_checkpoint(checkpoint.run_id)
+        if persisted is None:
+            raise RuntimeError("checkpoint transaction did not persist a row")
+        return persisted
 
     def load_checkpoint(self, run_id: str) -> Optional[RunCheckpoint]:
         row = self.connection.execute(
             "SELECT run_id, product_version, execution_mode, platform_order_json, "
-            "current_index, status, pending_review_id "
+            "current_index, status, pending_review_id, version "
             "FROM run_checkpoints WHERE run_id=?",
             (run_id,),
         ).fetchone()
@@ -178,9 +207,12 @@ class LearningStore:
             row["current_index"],
             row["status"],
             row["pending_review_id"],
+            row["version"],
         )
 
     def record_stage(self, result: StageResult) -> None:
+        reject_sensitive_fields(result.expected)
+        reject_sensitive_fields(result.readback)
         with self.connection:
             self.connection.execute(
                 "INSERT INTO stage_results("
@@ -215,6 +247,8 @@ class LearningStore:
         )
 
     def save_candidate_snapshot(self, snapshot: CandidateSnapshot) -> None:
+        snapshot_payload = asdict(snapshot)
+        reject_sensitive_fields(snapshot_payload)
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO candidate_snapshots("
@@ -225,7 +259,7 @@ class LearningStore:
                     snapshot.platform_id,
                     snapshot.category_leaf_id,
                     snapshot.field_id,
-                    canonical_json(asdict(snapshot)),
+                    canonical_json(snapshot_payload),
                     utc_now(),
                 ),
             )
@@ -236,6 +270,7 @@ class LearningStore:
         event_type: str,
         payload: Mapping[str, Any],
     ) -> int:
+        reject_sensitive_fields(payload)
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO sync_outbox("

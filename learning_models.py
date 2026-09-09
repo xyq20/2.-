@@ -82,6 +82,11 @@ class RunCheckpoint:
     current_index: int
     status: str
     pending_review_id: Optional[str] = None
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.version < 1:
+            raise ValueError("checkpoint version must be positive")
 
 
 @dataclass(frozen=True)

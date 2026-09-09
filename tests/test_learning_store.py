@@ -73,9 +73,35 @@ class LearningStoreTests(unittest.TestCase):
                 1,
                 "waiting_review",
                 "r-1",
+                2,
             ),
         )
         self.assertIsNone(self.store.load_checkpoint("missing"))
+
+    def test_checkpoint_version_increments_on_change_and_survives_restart(self):
+        self.store.migrate()
+        initial = RunCheckpoint(
+            "run-1", "product-1", "save_only", ("base", "pdd"), 0, "running"
+        )
+        persisted = self.store.save_checkpoint(initial)
+        self.assertEqual(persisted.version, 1)
+        self.assertEqual(self.store.load_checkpoint("run-1").version, 1)
+
+        self.store.save_checkpoint(initial)
+        self.assertEqual(self.store.load_checkpoint("run-1").version, 1)
+
+        persisted = self.store.save_checkpoint(
+            dataclasses.replace(initial, current_index=1)
+        )
+        self.assertEqual(persisted.version, 2)
+        self.assertEqual(self.store.load_checkpoint("run-1").version, 2)
+        self.store.close()
+        self.store = LearningStore(self.path)
+        self.store.migrate()
+        self.store.save_checkpoint(
+            dataclasses.replace(initial, current_index=1, status="completed")
+        )
+        self.assertEqual(self.store.load_checkpoint("run-1").version, 3)
 
     def test_only_verified_stages_are_completed_in_checkpoint_order(self):
         self.store.migrate()
@@ -167,6 +193,35 @@ class LearningStoreTests(unittest.TestCase):
 
         self.store.mark_delivered(second)
         self.assertEqual(self.store.pending_outbox(), ())
+
+    def test_sensitive_payload_keys_are_rejected_before_database_write(self):
+        self.store.migrate()
+        with self.assertRaisesRegex(ValueError, "sensitive field"):
+            self.store.enqueue(
+                "unsafe",
+                "review.created",
+                {"request": {"Authorization": "Device real-secret"}},
+            )
+        with self.assertRaisesRegex(ValueError, "sensitive field"):
+            self.store.record_stage(
+                StageResult(
+                    "run-1",
+                    "tmall",
+                    "verified",
+                    {},
+                    {"access_token": "real-secret"},
+                    True,
+                )
+            )
+
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM stage_results").fetchone()[0],
+            0,
+        )
 
 
 if __name__ == "__main__":

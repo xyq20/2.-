@@ -100,6 +100,123 @@ class _AuthContext:
 
 
 class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_platform_learning_records_verified_stage(self):
+        args = SimpleNamespace(platform="pdd", save=True, save_only=True)
+        product = SimpleNamespace()
+        store = Mock()
+        context = SimpleNamespace(
+            store=store,
+            run_id="run-1",
+            product_version="product-1",
+        )
+
+        async def runner(_args, _product, stage_dir, _logger, **_kwargs):
+            (stage_dir / "pdd-after-save-validation.json").write_text(
+                json.dumps({"status": "verified"}), encoding="utf-8"
+            )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            kuaimai_erp, "run_browser_automation", side_effect=runner
+        ):
+            await kuaimai_erp.run_single_platform_with_learning(
+                args,
+                product,
+                Path(directory),
+                LOGGER,
+                learning_context=context,
+            )
+
+        result = store.record_stage.call_args.args[0]
+        self.assertTrue(result.verified)
+        self.assertEqual(result.platform_id, "pdd")
+        self.assertEqual(store.save_checkpoint.call_args_list[-1].args[0].status, "completed")
+
+    async def test_learning_orchestrator_records_only_verified_readback_as_completed(self):
+        args = SimpleNamespace(
+            platform="all",
+            save=True,
+            save_only=True,
+            taobao_publish_preview=False,
+            allow_taobao_save_once=False,
+            allow_taobao_publish_once=False,
+        )
+        product = SimpleNamespace(douyin_fields=None)
+        store = Mock()
+        context = SimpleNamespace(
+            store=store,
+            run_id="run-1",
+            product_version="product-1",
+        )
+
+        async def runner(_args, _product, stage_dir, _logger, **_kwargs):
+            if _args.platform == "pdd":
+                (stage_dir / "pdd-after-save-validation.json").write_text(
+                    json.dumps({"status": "verified", "row_count": 5}),
+                    encoding="utf-8",
+                )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            kuaimai_erp, "run_browser_automation", side_effect=runner
+        ):
+            await kuaimai_erp.run_all_implemented_platforms(
+                args,
+                product,
+                Path(directory),
+                LOGGER,
+                learning_context=context,
+            )
+
+        recorded = [call.args[0] for call in store.record_stage.call_args_list]
+        self.assertEqual(len(recorded), 8)
+        self.assertEqual(
+            tuple(result.platform_id for result in recorded if result.verified),
+            ("pdd",),
+        )
+        pdd = next(result for result in recorded if result.platform_id == "pdd")
+        self.assertEqual(pdd.status, "readback_verified")
+        self.assertEqual(pdd.readback["row_count"], 5)
+        self.assertEqual(store.save_checkpoint.call_args_list[-1].args[0].status, "completed")
+        enqueued_types = tuple(call.args[1] for call in store.enqueue.call_args_list)
+        self.assertIn("checkpoint.updated", enqueued_types)
+        self.assertIn("readback.recorded", enqueued_types)
+        self.assertIn("stage.completed", enqueued_types)
+
+    async def test_learning_orchestrator_failure_is_unverified_and_stops_later_stages(self):
+        args = SimpleNamespace(
+            platform="all",
+            save=False,
+            save_only=False,
+            taobao_publish_preview=False,
+            allow_taobao_save_once=False,
+            allow_taobao_publish_once=False,
+        )
+        product = SimpleNamespace(douyin_fields=None)
+        store = Mock()
+        context = SimpleNamespace(
+            store=store,
+            run_id="run-1",
+            product_version="product-1",
+        )
+        runner = AsyncMock(side_effect=RuntimeError("platform failed"))
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            kuaimai_erp, "run_browser_automation", runner
+        ):
+            with self.assertRaisesRegex(RuntimeError, "platform failed"):
+                await kuaimai_erp.run_all_implemented_platforms(
+                    args,
+                    product,
+                    Path(directory),
+                    LOGGER,
+                    learning_context=context,
+                )
+
+        self.assertEqual(runner.await_count, 1)
+        store.record_stage.assert_not_called()
+        failed_checkpoint = store.save_checkpoint.call_args_list[-1].args[0]
+        self.assertEqual(failed_checkpoint.status, "failed")
+        self.assertEqual(failed_checkpoint.current_index, 0)
+
     async def test_shared_playwright_session_starts_once_and_closes_once(self):
         playwright = SimpleNamespace(stop=AsyncMock())
         manager = SimpleNamespace(start=AsyncMock(return_value=playwright))
@@ -1710,6 +1827,91 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
 class ExecutionModeTests(unittest.TestCase):
     def _args(self, *arguments):
         return kuaimai_erp.build_parser().parse_args(list(arguments))
+
+    def test_learning_is_opt_in_with_safe_environment_defaults(self):
+        with patch.dict(
+            os.environ,
+            {
+                "KUAIMAI_LEARNING_DB": "/tmp/learning-state.sqlite3",
+                "KUAIMAI_LEARNING_API_URL": "https://review.example",
+                "KUAIMAI_LEARNING_DEVICE_TOKEN": "must-not-appear",
+            },
+        ):
+            args = self._args("--platform", "all")
+
+        self.assertFalse(args.learning_enabled)
+        self.assertEqual(args.learning_db, "/tmp/learning-state.sqlite3")
+        self.assertEqual(args.learning_api_url, "https://review.example")
+        self.assertNotIn("must-not-appear", repr(args))
+        self.assertFalse(hasattr(args, "learning_device_token"))
+
+        with patch.dict(os.environ, {}, clear=True):
+            defaults = self._args("--platform", "all")
+        self.assertEqual(defaults.learning_db, ".local-state/learning.sqlite3")
+        self.assertEqual(defaults.learning_api_url, "")
+
+    def test_disabled_learning_context_does_not_open_a_store(self):
+        args = self._args("--platform", "all")
+        with patch.object(kuaimai_erp, "LearningStore") as store:
+            context = kuaimai_erp.create_learning_context(
+                args,
+                SimpleNamespace(),
+            )
+        self.assertIsNone(context)
+        store.assert_not_called()
+
+    def test_enabled_learning_context_fingerprints_and_upserts_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = root / "main.jpg"
+            square = root / "square.jpg"
+            detail = root / "detail.jpg"
+            main.write_bytes(b"main")
+            square.write_bytes(b"square")
+            detail.write_bytes(b"detail")
+            product = SimpleNamespace(
+                style_code="NGBL-1",
+                title="标题",
+                main_images=[main],
+                main_images_34=[square],
+                detail_images=[detail],
+            )
+            args = self._args(
+                "--platform",
+                "all",
+                "--learning-enabled",
+                "--learning-db",
+                str(root / "learning.sqlite3"),
+            )
+            fake_store = Mock()
+            with patch.object(kuaimai_erp, "LearningStore", return_value=fake_store):
+                context = kuaimai_erp.create_learning_context(args, product)
+
+        self.assertIsNotNone(context)
+        fake_store.migrate.assert_called_once_with()
+        fingerprint = fake_store.upsert_product.call_args.args[0]
+        self.assertEqual(fingerprint.style_code, "NGBL-1")
+        self.assertEqual(len(fingerprint.assets), 3)
+        self.assertNotIn("must-not-appear", repr(context))
+        fake_store.enqueue.assert_called_once()
+        self.assertEqual(fake_store.enqueue.call_args.args[1], "product.upsert")
+
+    def test_checkpoint_event_uses_committed_store_version(self):
+        args = self._args("--platform", "pdd", "--save-only")
+        store = Mock()
+        store.save_checkpoint.return_value = kuaimai_erp.RunCheckpoint(
+            "run-1", "product-1", "save_only", ("pdd",), 1, "completed", version=3
+        )
+        context = kuaimai_erp.LearningRunContext(store, "run-1", "product-1")
+
+        kuaimai_erp.save_learning_checkpoint(
+            context, args, ("pdd",), 1, "completed"
+        )
+
+        key, event_type, payload = store.enqueue.call_args.args
+        self.assertEqual(key, "checkpoint.updated:run-1:3")
+        self.assertEqual(event_type, "checkpoint.updated")
+        self.assertEqual(payload["version"], 3)
 
     def test_parser_uses_registry_platforms_and_accepts_inspect_only(self):
         args = self._args("--platform", "tmall", "--inspect-only", "--no-save")
