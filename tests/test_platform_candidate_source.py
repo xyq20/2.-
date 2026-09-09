@@ -44,6 +44,30 @@ class CandidateSourceTests(unittest.TestCase):
             reconcile_candidates(api, (DomCandidate("long", "长裤"),))
         self.assertEqual(caught.exception.reason_code, "api_candidate_duplicate_id")
 
+    def test_api_candidate_missing_authoritative_id_is_rejected(self):
+        with self.assertRaises(CandidateSourceError) as caught:
+            reconcile_candidates(
+                (FieldOption("", "长裤", 0),),
+                (DomCandidate("", "长裤"),),
+            )
+        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+
+    def test_api_candidate_missing_label_is_rejected(self):
+        with self.assertRaises(CandidateSourceError) as caught:
+            reconcile_candidates(
+                (FieldOption("long", " ", 0),),
+                (DomCandidate("long", "长裤"),),
+            )
+        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+
+    def test_whitespace_api_candidate_id_is_rejected(self):
+        with self.assertRaises(CandidateSourceError) as caught:
+            reconcile_candidates(
+                (FieldOption("  ", "长裤", 0),),
+                (DomCandidate("", "长裤"),),
+            )
+        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+
     def test_wrong_dom_id_does_not_fall_back_to_equal_label(self):
         with self.assertRaises(CandidateSourceError) as caught:
             reconcile_candidates(

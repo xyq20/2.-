@@ -37,7 +37,9 @@ def reconcile_candidates(
         raise CandidateSourceError("api_candidates_unavailable")
 
     api_ids = tuple(value.value_id for value in authoritative)
-    if any(not value_id for value_id in api_ids):
+    if any(not value_id.strip() for value_id in api_ids) or any(
+        not _normalize_label(value.label) for value in authoritative
+    ):
         raise CandidateSourceError("api_candidate_invalid")
     if len(api_ids) != len(set(api_ids)):
         raise CandidateSourceError("api_candidate_duplicate_id")

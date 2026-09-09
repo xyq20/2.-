@@ -197,6 +197,53 @@ def _option_pair(option: Any) -> Tuple[str, str]:
     return (value, value)
 
 
+def _strict_field_option_pair(option: Any) -> Tuple[str, str]:
+    """Read authoritative candidate identity without inventing missing fields.
+
+    ``option_summary`` intentionally keeps its older, permissive parser because it
+    is diagnostic-only.  Full field candidates are later allowed to drive a DOM
+    write, so an API object must provide both an identity and a display label.
+    PDD is the one supported shape where ``vid`` is the identity and ``value`` is
+    the label; in common select payloads ``value`` is an identity only when an
+    explicit label key is also present.
+    """
+    if isinstance(option, Mapping):
+        option_id = None
+        for key in ("value_id", "id", "vid"):
+            if key in option and option.get(key) is not None:
+                option_id = option.get(key)
+                break
+
+        label = None
+        for key in ("label", "name", "displayName", "display_name"):
+            if key in option and option.get(key) is not None:
+                label = option.get(key)
+                break
+
+        if option_id is None and label is not None and option.get("value") is not None:
+            option_id = option.get("value")
+        elif option_id is not None and label is None and option.get("value") is not None:
+            label = option.get("value")
+
+        if option_id is None and label is None and option.get("value") is not None:
+            # A lone ``value`` is ambiguous: retain it for diagnostics as a label,
+            # but leave the authoritative ID absent so reconciliation fails closed.
+            label = option.get("value")
+        return (
+            "" if option_id is None else str(option_id),
+            "" if label is None else str(label),
+        )
+
+    if isinstance(option, (tuple, list)):
+        if len(option) >= 2:
+            return (str(option[0]), str(option[1]))
+        if len(option) == 1:
+            return ("", str(option[0]))
+        return ("", "")
+
+    return ("", str(option))
+
+
 def option_summary(
     options: Iterable[Any],
     include_samples: bool = True,
@@ -231,7 +278,9 @@ def field_options(
         return ()
     return tuple(
         FieldOption(value_id, label, position)
-        for position, (value_id, label) in enumerate(_option_pair(option) for option in options)
+        for position, (value_id, label) in enumerate(
+            _strict_field_option_pair(option) for option in options
+        )
     )
 
 

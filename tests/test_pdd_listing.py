@@ -397,6 +397,13 @@ class PddListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dynamic.generation, generation_at_start)
         by_section = {section.key: section for section in dynamic.sections}
         self.assertEqual(by_section["category_properties"].fields[0].label, "版型")
+        self.assertEqual(
+            tuple(
+                (value.value_id, value.label)
+                for value in by_section["category_properties"].fields[0].option_values
+            ),
+            (("loose", "宽松"),),
+        )
         self.assertEqual(by_section["service_rules"].fields[0].label, "运费险")
         self.assertTrue(by_section["sku_rules"].fields)
         self.assertEqual(by_section["spu_rules"].fields[0].label, "商品型属性")
@@ -405,6 +412,10 @@ class PddListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prediction.option_summary.source, "prediction")
         self.assertEqual(prediction.option_summary.count, 2)
         self.assertEqual(len(prediction.option_values), 2)
+        self.assertEqual(
+            tuple((value.value_id, value.label) for value in prediction.option_values),
+            (("casual", "休闲"), ("workwear", "工装")),
+        )
         self.assertNotIn(
             raw_prediction_default,
             json.dumps(to_dict(dynamic), ensure_ascii=False),

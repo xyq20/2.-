@@ -35,6 +35,46 @@ class PlatformSchemaTests(unittest.TestCase):
             ),
         )
 
+    def test_field_options_preserve_pdd_vid_and_value_shape(self):
+        schema = _load_schema(self)
+
+        values = schema.field_options(
+            (
+                {"vid": "loose", "value": "宽松"},
+                {"vid": "straight", "value": "直筒"},
+            ),
+            source="api",
+        )
+
+        self.assertEqual(
+            values,
+            (
+                schema.FieldOption("loose", "宽松", 0),
+                schema.FieldOption("straight", "直筒", 1),
+            ),
+        )
+
+    def test_field_options_do_not_invent_missing_api_ids_or_labels(self):
+        schema = _load_schema(self)
+
+        values = schema.field_options(
+            (
+                {"label": "只有名称"},
+                {"id": "id-only"},
+                {"value": "ambiguous-value"},
+            ),
+            source="api",
+        )
+
+        self.assertEqual(
+            values,
+            (
+                schema.FieldOption("", "只有名称", 0),
+                schema.FieldOption("id-only", "", 1),
+                schema.FieldOption("", "ambiguous-value", 2),
+            ),
+        )
+
     def test_field_options_hide_sensitive_sources_even_on_direct_field_creation(self):
         schema = _load_schema(self)
         sensitive = (schema.FieldOption("shop-1", "Internal Shop", 0),)
