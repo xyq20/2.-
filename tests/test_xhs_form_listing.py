@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from attribute_runtime import ResolvedAttribute
 from xhs_data import XhsFields, parse_xhs_fields
 from xhs_form_listing import XhsFormListing, title_without_neigborl
 
@@ -253,6 +254,96 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await item.locator("input.el-input__inner").input_value(),
             "常规",
+        )
+
+    async def test_learning_uses_xhs_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-xhs-1",
+                )
+
+        async def fulfill_fields(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "attributeV3s": [
+                        {
+                            "id": "thickness",
+                            "name": "厚薄",
+                            "isRequired": True,
+                            "isMulti": False,
+                            "customizable": False,
+                        }
+                    ]
+                },
+            )
+
+        async def fulfill_values(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "values": [
+                        {"id": "regular", "name": "常规"},
+                        {"id": "thick", "name": "加厚"},
+                    ]
+                },
+            )
+
+        runtime = Runtime()
+        listing = await self._listing()
+        listing.attribute_runtime = runtime
+        await self.page.route("**/xhs/getAttributeList.json*", fulfill_fields)
+        await self.page.route("**/xhs/getAttributeValues.json*", fulfill_values)
+        await self.page.evaluate(
+            "fetch('https://api.test/xhs/getAttributeList.json?leafCategoryId=101')"
+        )
+        await self.page.evaluate(
+            "fetch('https://api.test/xhs/getAttributeValues.json?attributeId=thickness')"
+        )
+        items = await listing._attribute_items()
+        item = items["厚薄"][1]
+        await item.locator("ul").evaluate(
+            """node => {
+              const option = document.createElement('li');
+              option.className = 'el-select-dropdown__item';
+              option.textContent = '加厚';
+              option.onclick = () => choose(option);
+              node.append(option);
+            }"""
+        )
+
+        actual = await listing._fill_attribute(
+            "厚薄",
+            item,
+            "常规",
+            required=True,
+        )
+
+        self.assertEqual(actual, ("常规",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "xhs")
+        self.assertEqual(request.category_leaf_id, "101")
+        self.assertEqual(request.field_id, "thickness")
+        self.assertEqual(request.excel_value, "常规")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("regular", "常规"), ("thick", "加厚")),
         )
 
     async def test_xhs_clicks_one_exact_created_remote_option_before_it_disappears(self):

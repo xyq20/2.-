@@ -20,6 +20,7 @@ class CanonicalFieldTests(unittest.TestCase):
             ("jd", "厚度"): "thickness",
             ("douyin", "厚度"): "thickness",
             ("tm", "厚薄"): "thickness",
+            ("xhs", "厚薄"): "thickness",
             ("wxsph", "面料材质成分含量"): "material_percentage",
             ("wxsph", "材质成分"): "material_composition",
             ("jd", "颜色"): "color",
