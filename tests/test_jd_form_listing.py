@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from attribute_runtime import ResolvedAttribute
 from jd_data import JdFields, parse_jd_fields
 from jd_form_listing import (
     JD_BRAND,
@@ -21,6 +23,7 @@ from jd_form_listing import (
     _material_name,
     _material_percentage,
     _numeric_equal,
+    parse_jd_attribute_fields,
 )
 from taobao_listing import selection_value_groups
 
@@ -135,6 +138,36 @@ class JdFormListingHelperTests(unittest.TestCase):
         self.assertTrue(JdFormListing._json_contains_category(payload, "男士休闲直筒裤"))
         self.assertFalse(
             JdFormListing._json_contains_category(payload, "不存在的类目")
+        )
+
+    def test_parses_strict_jd_attribute_ids_and_option_ids(self):
+        fields = parse_jd_attribute_fields(
+            {
+                "success": True,
+                "data": json.dumps(
+                    {
+                        "properties": [
+                            {
+                                "propId": "pants-length",
+                                "propertyName": "裤长",
+                                "propertyValues": [
+                                    {"valueId": "short", "valueName": "短裤"},
+                                    {"valueId": "long", "valueName": "长裤"},
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].source_id, "pants-length")
+        self.assertEqual(fields[0].label, "裤长")
+        self.assertEqual(
+            tuple((value.value_id, value.label) for value in fields[0].option_values),
+            (("short", "短裤"), ("long", "长裤")),
         )
 
     def test_style_leaf_aliases_map_casual_to_simple(self):
@@ -399,6 +432,118 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.page.locator(".el-cascader input").input_value(),
             "休闲风 / 简约风",
+        )
+
+    async def test_learning_uses_jd_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-jd-1",
+                )
+
+        response_body = json.dumps(
+            {
+                "data": {
+                    "properties": [
+                        {
+                            "propId": "pants-length",
+                            "propertyName": "裤长",
+                            "propertyValues": [
+                                {"valueId": "short", "valueName": "短裤"},
+                                {"valueId": "long", "valueName": "长裤"},
+                            ],
+                        }
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        )
+        await self.page.route(
+            "**/jd/getCategoryProperties.json*",
+            lambda route: route.fulfill(
+                content_type="application/json",
+                body=response_body,
+            ),
+        )
+        await self.page.set_content(
+            """
+            <button role="tab" aria-selected="false" onclick="openTab(this)">京东资料</button>
+            <div role="tabpanel" aria-label="京东资料" style="display:none">
+              <h3>商品属性</h3>
+              <div class="el-form-item is-required" id="pants-length">
+                <label class="el-form-item__label">裤长</label>
+                <div class="el-form-item__content">
+                  <div class="el-select"><input class="el-input__inner" readonly onclick="openSelect(this)">
+                    <div class="el-select-dropdown" style="display:none">
+                      <ul>
+                        <li class="el-select-dropdown__item" onclick="chooseOption(this)">短裤</li>
+                        <li class="el-select-dropdown__item" onclick="chooseOption(this)">长裤</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <h3>销售属性</h3>
+            </div>
+            <script>
+              function openTab(tab) {
+                tab.setAttribute('aria-selected', 'true');
+                document.querySelector('[role=tabpanel]').style.display = 'block';
+                fetch('https://scm.superboss.cc/jd/getCategoryProperties.json?categoryId=97123');
+              }
+              function openSelect(input) {
+                input.closest('.el-select').querySelector('.el-select-dropdown').style.display = 'block';
+              }
+              function chooseOption(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = option.textContent.trim();
+                select.querySelector('.el-select-dropdown').style.display = 'none';
+              }
+              window.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                  document.querySelectorAll('.el-select-dropdown').forEach(
+                    node => node.style.display = 'none'
+                  );
+                }
+              });
+            </script>
+            """
+        )
+        runtime = Runtime()
+        listing = JdFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=runtime,
+        )
+        await listing.open()
+        item = self.page.locator("#pants-length")
+
+        actual = await listing._fill_attribute_item(
+            "裤长", item, "长裤", required=True
+        )
+
+        self.assertEqual(actual, ("长裤",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "jd")
+        self.assertEqual(request.category_leaf_id, "97123")
+        self.assertEqual(request.field_id, "pants-length")
+        self.assertEqual(
+            tuple((value.value_id, value.label) for value in request.candidates),
+            (("short", "短裤"), ("long", "长裤")),
         )
 
     async def test_style_cascader_follows_comma_path(self):

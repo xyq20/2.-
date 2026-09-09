@@ -8,9 +8,17 @@ import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from attribute_runtime import AttributeRequest
 from jd_data import JdFields
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldOption, FieldSchema
 from taobao_listing import (
     TaobaoListingError,
     excel_aliases,
@@ -29,6 +37,7 @@ JD_CATEGORY_PATH = ("服饰内衣", "男装", "男士休闲裤", "男士休闲�
 JD_BRAND = "NEIGBORL"
 JD_DELIVERY_TEMPLATE = "48小时发货"
 JD_SKU_THICKNESS = "常规"
+JD_PROPERTIES_ENDPOINT = "/jd/getCategoryProperties.json"
 JD_BATCH_ORDER = ("京东价", "库存")
 JD_EXACT_OPTION_MAP: Mapping[str, Mapping[str, str]] = {
     normalize_label("面料"): {
@@ -74,6 +83,154 @@ JD_CASCADER_LEAF_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
     (normalize_label("风格"), normalize_option("休闲")): ("简约风",),
     (normalize_label("风格"), normalize_option("时尚都市")): ("简约风",),
 }
+
+
+def _json_values(value: Any) -> Tuple[Any, ...]:
+    return tuple(value) if isinstance(value, (tuple, list)) else ()
+
+
+def _first_mapping_value(value: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        candidate = value.get(key)
+        if candidate not in (None, ""):
+            return candidate
+    return None
+
+
+def _jd_option(option: Any, position: int) -> FieldOption:
+    if not isinstance(option, Mapping):
+        return FieldOption("", str(option), position)
+    value_id = _first_mapping_value(
+        option,
+        (
+            "value_id",
+            "id",
+            "vid",
+            "valueId",
+            "propertyValueId",
+            "propValueId",
+            "attrValueId",
+            "code",
+        ),
+    )
+    label = _first_mapping_value(
+        option,
+        (
+            "label",
+            "name",
+            "valueName",
+            "propertyValueName",
+            "propValueName",
+            "attrValueName",
+            "displayName",
+            "display_name",
+        ),
+    )
+    raw_value = option.get("value")
+    if value_id in (None, "") and label not in (None, "") and raw_value not in (None, ""):
+        value_id = raw_value
+    elif label in (None, "") and value_id not in (None, "") and raw_value not in (None, ""):
+        label = raw_value
+    return FieldOption(
+        "" if value_id is None else str(value_id),
+        "" if label is None else str(label),
+        position,
+    )
+
+
+def parse_jd_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
+    """Extract strict JD field/value identities from the captured JSON body.
+
+    FastMai has returned several envelope and descriptor shapes over time.  The
+    parser therefore walks the decoded response, but only accepts an object as
+    a field when it owns a field ID, a field label and an explicit option list.
+    Missing option IDs or labels remain empty and fail closed during API/DOM
+    reconciliation instead of being invented from page text.
+    """
+
+    matches: Dict[Tuple[str, str], FieldSchema] = {}
+    field_id_keys = (
+        "refPid",
+        "propId",
+        "propertyId",
+        "attrId",
+        "attributeId",
+        "id",
+    )
+    field_label_keys = (
+        "propertyName",
+        "propName",
+        "attrName",
+        "attributeName",
+        "name",
+        "label",
+    )
+    option_keys = (
+        "values",
+        "options",
+        "propertyValues",
+        "propValues",
+        "attributeValues",
+        "attrValues",
+        "valueList",
+    )
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    visit(json.loads(text))
+                except (TypeError, ValueError):
+                    pass
+            return
+        if isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, Mapping):
+            return
+
+        source_id = _first_mapping_value(value, field_id_keys)
+        label = _first_mapping_value(value, field_label_keys)
+        raw_options: Tuple[Any, ...] = ()
+        for key in option_keys:
+            raw_options = _json_values(value.get(key))
+            if raw_options:
+                break
+        if source_id not in (None, "") and label not in (None, "") and raw_options:
+            options = tuple(
+                _jd_option(option, position)
+                for position, option in enumerate(raw_options)
+            )
+            key = (str(source_id), normalize_label(str(label)))
+            matches[key] = FieldSchema(
+                schema_key="jd:attribute:{0}".format(source_id),
+                source_id=str(source_id),
+                label=str(label),
+                section="attributes",
+                control_type="select_many"
+                if value.get("multiple") is True
+                or isinstance(value.get("chooseMaxNum"), int)
+                and value.get("chooseMaxNum") > 1
+                else "select_one",
+                required=value.get("required")
+                if isinstance(value.get("required"), bool)
+                else None,
+                multiple=value.get("multiple")
+                if isinstance(value.get("multiple"), bool)
+                else None,
+                custom_allowed=value.get("canNote")
+                if isinstance(value.get("canNote"), bool)
+                else False,
+                option_values=options,
+                api_paths=(JD_PROPERTIES_ENDPOINT,),
+            )
+        for child in value.values():
+            visit(child)
+
+    visit(payload)
+    return tuple(matches.values())
 
 
 def _expand_cascader_candidates(label: str, candidates: Sequence[str]) -> Tuple[str, ...]:
@@ -306,6 +463,146 @@ class JdFormListing(YouzanFormListing):
     attribute_wait_timeout_seconds = 30.0
     attribute_stable_seconds = 0.75
 
+    def _start_api_capture(self) -> None:
+        previous_handler = getattr(self, "_api_response_handler", None)
+        if previous_handler is not None:
+            try:
+                self.page.remove_listener("response", previous_handler)
+            except Exception:
+                pass
+        self._api_observations: List[Mapping[str, Any]] = []
+        self._api_capture_tasks: List[asyncio.Task[Any]] = []
+
+        def handle_response(response: Any) -> None:
+            try:
+                path = urlsplit(response.url).path
+            except Exception:
+                return
+            if path != JD_PROPERTIES_ENDPOINT:
+                return
+            task = asyncio.create_task(self._capture_api_response(response))
+            self._api_capture_tasks.append(task)
+
+        self._api_response_handler = handle_response
+        self.page.on("response", handle_response)
+
+    async def _capture_api_response(self, response: Any) -> None:
+        observation: Dict[str, Any] = {
+            "path": JD_PROPERTIES_ENDPOINT,
+            "http_status": int(response.status),
+            "body": "unavailable",
+            "attribute_fields": (),
+            "category_id": "",
+        }
+        try:
+            payload = await response.json()
+            observation["body"] = "json"
+            observation["attribute_fields"] = parse_jd_attribute_fields(payload)
+            query = parse_qs(urlsplit(response.url).query)
+            for key in ("categoryId", "leafCategoryId", "cid"):
+                values = tuple(query.get(key, ()))
+                if len(values) == 1 and str(values[0]).strip():
+                    observation["category_id"] = str(values[0]).strip()
+                    break
+        except Exception:
+            pass
+        self._api_observations.append(observation)
+
+    async def _captured_api_field(self, page_label: str) -> Tuple[FieldSchema, str]:
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        wanted = normalize_label(page_label)
+        matches: Dict[Tuple[str, str], FieldSchema] = {}
+        category_ids: List[str] = []
+        for observation in getattr(self, "_api_observations", ()):
+            category_id = str(observation.get("category_id") or "").strip()
+            if category_id and category_id not in category_ids:
+                category_ids.append(category_id)
+            for field in observation.get("attribute_fields", ()):
+                if normalize_label(field.label) == wanted:
+                    matches[(str(field.source_id or ""), field.schema_key)] = field
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东属性“{0}”缺少唯一的接口 JSON 字段定义".format(
+                    page_label
+                )
+            )
+        if len(category_ids) != 1:
+            raise JdFormListingError(
+                "京东属性“{0}”缺少唯一的接口类目 ID".format(page_label)
+            )
+        return next(iter(matches.values())), category_ids[0]
+
+    async def _resolve_learning_select_value(
+        self,
+        page_label: str,
+        select: Any,
+        desired: str,
+    ) -> str:
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return desired
+        field, category_id = await self._captured_api_field(page_label)
+        if not field.source_id:
+            raise JdFormListingError(
+                "京东属性“{0}”的接口字段 ID 为空".format(page_label)
+            )
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        dom_values = tuple(
+            DomCandidate(
+                str(option.get("value") or ""),
+                str(option.get("name") or ""),
+                not bool(option.get("disabled")),
+            )
+            for option in options
+        )
+        try:
+            candidates = reconcile_candidates(field.option_values, dom_values)
+        except CandidateSourceError as exc:
+            raise JdFormListingError(
+                "京东属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label, exc.reason_code
+                )
+            ) from exc
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "jd",
+                "category_leaf_id": category_id,
+                "field_id": str(field.source_id),
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="jd",
+                category_leaf_id=category_id,
+                field_id=str(field.source_id),
+                field_label=page_label,
+                candidates=tuple(
+                    CandidateValue(value.value_id, value.label)
+                    for value in candidates
+                ),
+                excel_value=str(desired).strip(),
+                evidence={"excel": bool(str(desired).strip())},
+                custom_allowed=bool(field.custom_allowed),
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        return resolved.label
+
     async def _raise_as_jd(self, awaitable: Any) -> Any:
         try:
             return await awaitable
@@ -451,6 +748,7 @@ class JdFormListing(YouzanFormListing):
         return tuple(chosen_values)
 
     async def open(self) -> "JdFormListing":
+        self._start_api_capture()
         tab = self.drawer.get_by_role("tab", name="京东资料", exact=True)
         try:
             await tab.wait_for(state="visible", timeout=30_000)
@@ -1135,6 +1433,11 @@ class JdFormListing(YouzanFormListing):
             # Material rows contain a value select plus an optional percentage input.
             value_select = selects.first
             multi = await value_select.locator(".el-select__tags").count() > 0
+            desired = await self._resolve_learning_select_value(
+                page_label,
+                value_select,
+                desired,
+            )
             try:
                 actual = await self._raise_as_jd(
                     self._select_values(
