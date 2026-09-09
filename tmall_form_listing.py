@@ -171,6 +171,8 @@ def _required_source(
 class TmallFormListing(TaobaoListing):
     """填写天猫编辑器资料，不点击底部保存或保存并铺货。"""
 
+    attribute_platform_id = "tm"
+
     def __init__(
         self,
         page: Any,

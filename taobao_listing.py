@@ -10,8 +10,16 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 
+from attribute_runtime import AttributeRequest
 from douyin_data import DouyinDataError, MaterialComponent, parse_materials
+from learning_models import CandidateValue, canonical_sha256
+from platform_candidate_source import (
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
 from sync_validation import split_or_values
+from taobao_api_index import TaobaoApiJsonIndex
 
 
 class TaobaoListingError(RuntimeError):
@@ -205,6 +213,8 @@ def parse_taobao_fabrics(fields: Mapping[str, str]) -> Tuple[MaterialComponent, 
 class TaobaoListing:
     """处理淘宝推荐类目、类目属性和基础销售资料。"""
 
+    attribute_platform_id = "tb"
+
     def __init__(
         self,
         page: Any,
@@ -217,6 +227,7 @@ class TaobaoListing:
         self.drawer = drawer
         self.logger = logger
         self.attribute_runtime = attribute_runtime
+        self.api_index: Any = TaobaoApiJsonIndex(page, logger)
         self.panel: Optional[Any] = None
         self.category_clicked = False
         self.material_validation: Mapping[str, Any] = {}
@@ -234,6 +245,9 @@ class TaobaoListing:
         raise TaobaoListingError("淘宝资料加载遮罩在 30 秒内未消失")
 
     async def open(self) -> "TaobaoListing":
+        # 必须在切换页签前监听，才能取得本次打开页面产生的最新 schema。
+        if isinstance(self.api_index, TaobaoApiJsonIndex):
+            self.api_index.install()
         tab = self.drawer.get_by_role("tab", name="淘宝资料", exact=True)
         try:
             if self.logger is not None:
@@ -1067,6 +1081,104 @@ class TaobaoListing:
         await self._dismiss_select_dropdown(select)
         return actual
 
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise TaobaoListingError("淘宝属性学习运行器未启用")
+        if not isinstance(self.api_index, TaobaoApiJsonIndex):
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”缺少接口 JSON 索引"
+            )
+
+        multi = await select.locator(".el-select__tags").count() > 0
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(select)
+            fields = await self.api_index.wait_for_candidate_field(
+                page_label,
+                timeout_seconds=3.0,
+            )
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        if len(fields) != 1:
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”接口候选字段匹配数为 {len(fields)}"
+            )
+        field = fields[0]
+        field_id = str(field.source_id or "").strip()
+        category_id = str(field.category_leaf_id or "").strip()
+        if not field_id or not category_id:
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”缺少接口字段 ID 或类目 ID"
+            )
+        try:
+            candidates = reconcile_candidates(
+                field.option_values,
+                tuple(
+                    DomCandidate(
+                        str(option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in dom_options
+                ),
+            )
+        except CandidateSourceError as exc:
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”接口候选与页面候选不一致："
+                f"{exc.reason_code}"
+            ) from exc
+
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tb",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_values = []
+        for group in groups:
+            exact = tuple(
+                value.label
+                for value in candidates
+                if any(
+                    normalize_option(value.label) == normalize_option(alias)
+                    for alias in group
+                )
+            )
+            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="tb",
+                    category_leaf_id=category_id,
+                    field_id=field_id,
+                    field_label=page_label,
+                    candidates=tuple(
+                        CandidateValue(value.value_id, value.label)
+                        for value in candidates
+                    ),
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=False,
+                    schema_version=schema_version,
+                    control_type="select",
+                )
+            )
+            resolved_values.append(resolved.label)
+        return tuple(resolved_values)
+
     async def fill_attribute(
         self,
         label: str,
@@ -1135,6 +1247,18 @@ class TaobaoListing:
                 raise TaobaoListingError(
                     f"淘宝属性“{page_label}”是单选，Excel 却提供了"
                     f"多个逗号分组：{rendered}"
+                )
+            if (
+                self.attribute_runtime is not None
+                and self.attribute_platform_id == "tb"
+            ):
+                groups = tuple(
+                    (value,)
+                    for value in await self._resolve_learning_select_groups(
+                        page_label,
+                        select,
+                        groups,
+                    )
                 )
             return await self._select_values(
                 select,
@@ -2461,9 +2585,22 @@ class TaobaoListing:
         selects = item.locator(".el-select")
         if await selects.count() != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”下拉框不唯一")
+        expected_groups: Tuple[Tuple[str, ...], ...] = (tuple(candidates),)
+        if (
+            self.attribute_runtime is not None
+            and self.attribute_platform_id == "tb"
+        ):
+            expected_groups = tuple(
+                (value,)
+                for value in await self._resolve_learning_select_groups(
+                    label,
+                    selects.first,
+                    expected_groups,
+                )
+            )
         actual = await self._select_values(
             selects.first,
-            (tuple(candidates),),
+            expected_groups,
             label=f"SKU批量{label}",
             multi=False,
         )

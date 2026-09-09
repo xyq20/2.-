@@ -2,6 +2,7 @@ import asyncio
 import logging
 import unittest
 
+from attribute_runtime import ResolvedAttribute
 from taobao_data import parse_taobao_fields
 from taobao_listing import (
     TaobaoListing,
@@ -743,6 +744,79 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.fill_attribute("款式细节", "口袋/多口袋")
 
         self.assertEqual(actual, ("口袋",))
+
+    async def test_learning_uses_live_taobao_api_for_sku_batch_select(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-tb-1",
+                )
+
+        async def fulfill_schema(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "fieldDescriptorList": [
+                            {
+                                "name": "p-pants-length",
+                                "label": "裤长",
+                                "component": {
+                                    "props": {
+                                        "dataSource": {
+                                            "options": [
+                                                {"value": "long", "displayName": "长裤"},
+                                                {"value": "nine", "displayName": "九分裤"},
+                                            ]
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.page.route("**/tb/getItemPublishSchema*", fulfill_schema)
+        await self.page.evaluate(
+            "fetch('https://api.test/tb/getItemPublishSchema?catId=5001')"
+        )
+        product_details = await self.listing._wrap_item("商品明细")
+        row = await self.listing._sku_batch_row(product_details)
+
+        actual = await self.listing._fill_batch_select(
+            row,
+            "裤长",
+            ("长裤",),
+        )
+
+        self.assertEqual(actual, "长裤")
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "tb")
+        self.assertEqual(request.category_leaf_id, "5001")
+        self.assertEqual(request.field_id, "p-pants-length")
+        self.assertEqual(request.excel_value, "长裤")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("long", "长裤"), ("nine", "九分裤")),
+        )
 
     async def test_duplicate_page_labels_are_both_filled_and_reported(self):
         fields = parse_taobao_fields(

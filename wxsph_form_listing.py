@@ -168,6 +168,8 @@ def _material_content_text(value: str) -> str:
 class WxsphFormListing(YouzanFormListing):
     """Fill and read back WeChat Store attributes, SKU values and weight."""
 
+    attribute_platform_id = "wxsph"
+
     # 快麦在共享编辑抽屉中连续切换平台时，微信小店的页签和
     # 基础信息会先显示，类目属性则由另一个异步请求稍后渲染。
     attribute_wait_timeout_seconds = 30.0

@@ -131,6 +131,8 @@ def _category_parts(value: object) -> Tuple[str, ...]:
 class YouzanFormListing(TaobaoListing):
     """Fill and verify Youzan category, SKU, inventory and logistics data."""
 
+    attribute_platform_id = "yz"
+
     # FastMai marks remote Youzan candidates as Element UI ``created`` options
     # even though they came from the platform API.  Exact visible text is still
     # required and is read back after the click.
@@ -869,7 +871,10 @@ class YouzanFormListing(TaobaoListing):
             )
             if not groups or (not multi and len(groups) != 1):
                 raise YouzanFormListingError("有赞属性“{0}”候选分组无法用于当前控件".format(page_label))
-            if self.attribute_runtime is not None:
+            if (
+                self.attribute_runtime is not None
+                and self.attribute_platform_id == "yz"
+            ):
                 groups = tuple(
                     (value,)
                     for value in await self._resolve_learning_select_groups(
