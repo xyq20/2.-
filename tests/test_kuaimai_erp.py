@@ -108,6 +108,8 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             store=store,
             run_id="run-1",
             product_version="product-1",
+            device_id="device-1",
+            image_version="images-1",
         )
 
         async def runner(_args, _product, stage_dir, _logger, **_kwargs):
@@ -146,6 +148,8 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             store=store,
             run_id="run-1",
             product_version="product-1",
+            device_id="device-1",
+            image_version="images-1",
         )
 
         async def runner(_args, _product, stage_dir, _logger, **_kwargs):
@@ -178,8 +182,17 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.save_checkpoint.call_args_list[-1].args[0].status, "completed")
         enqueued_types = tuple(call.args[1] for call in store.enqueue.call_args_list)
         self.assertIn("checkpoint.updated", enqueued_types)
-        self.assertIn("readback.recorded", enqueued_types)
+        self.assertNotIn("readback.recorded", enqueued_types)
         self.assertIn("stage.completed", enqueued_types)
+        completed_payload = next(
+            call.args[2]
+            for call in store.enqueue.call_args_list
+            if call.args[1] == "stage.completed"
+        )
+        self.assertIn("expected_json", completed_payload)
+        self.assertIn("readback_json", completed_payload)
+        self.assertNotIn("expected", completed_payload)
+        self.assertNotIn("readback", completed_payload)
 
     async def test_learning_orchestrator_failure_is_unverified_and_stops_later_stages(self):
         args = SimpleNamespace(
@@ -196,6 +209,8 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             store=store,
             run_id="run-1",
             product_version="product-1",
+            device_id="device-1",
+            image_version="images-1",
         )
         runner = AsyncMock(side_effect=RuntimeError("platform failed"))
 
@@ -1884,6 +1899,7 @@ class ExecutionModeTests(unittest.TestCase):
                 str(root / "learning.sqlite3"),
             )
             fake_store = Mock()
+            fake_store.get_or_create_device_id.return_value = "device-1"
             with patch.object(kuaimai_erp, "LearningStore", return_value=fake_store):
                 context = kuaimai_erp.create_learning_context(args, product)
 
@@ -1895,14 +1911,36 @@ class ExecutionModeTests(unittest.TestCase):
         self.assertNotIn("must-not-appear", repr(context))
         fake_store.enqueue.assert_called_once()
         self.assertEqual(fake_store.enqueue.call_args.args[1], "product.upsert")
+        self.assertEqual(context.device_id, "device-1")
+        self.assertEqual(context.image_version, fingerprint.image_version)
+        self.assertEqual(
+            fake_store.enqueue.call_args.args[2],
+            {
+                "product_version": fingerprint.product_version,
+                "style_code": "NGBL-1",
+                "title": "标题",
+                "category_json": {"hints": []},
+            },
+        )
+        self.assertNotIn("assets", fake_store.enqueue.call_args.args[2])
 
     def test_checkpoint_event_uses_committed_store_version(self):
         args = self._args("--platform", "pdd", "--save-only")
         store = Mock()
         store.save_checkpoint.return_value = kuaimai_erp.RunCheckpoint(
-            "run-1", "product-1", "save_only", ("pdd",), 1, "completed", version=3
+            "run-1",
+            "product-1",
+            "save_only",
+            ("pdd",),
+            1,
+            "completed",
+            version=3,
+            device_id="device-1",
+            image_version="images-1",
         )
-        context = kuaimai_erp.LearningRunContext(store, "run-1", "product-1")
+        context = kuaimai_erp.LearningRunContext(
+            store, "run-1", "product-1", "device-1", "images-1"
+        )
 
         kuaimai_erp.save_learning_checkpoint(
             context, args, ("pdd",), 1, "completed"
@@ -1912,6 +1950,8 @@ class ExecutionModeTests(unittest.TestCase):
         self.assertEqual(key, "checkpoint.updated:run-1:3")
         self.assertEqual(event_type, "checkpoint.updated")
         self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["device_id"], "device-1")
+        self.assertEqual(payload["image_version"], "images-1")
 
     def test_parser_uses_registry_platforms_and_accepts_inspect_only(self):
         args = self._args("--platform", "tmall", "--inspect-only", "--no-save")

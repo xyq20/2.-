@@ -59,6 +59,18 @@ class LearningModelTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_image_version_excludes_title_but_covers_image_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "1.jpg"
+            image.write_bytes(b"same")
+            first = ProductFingerprint.from_inputs("NGBL-1", "标题一", [image])
+            renamed = ProductFingerprint.from_inputs("NGBL-1", "标题二", [image])
+            image.write_bytes(b"changed")
+            changed = ProductFingerprint.from_inputs("NGBL-1", "标题二", [image])
+
+        self.assertEqual(first.image_version, renamed.image_version)
+        self.assertNotEqual(first.image_version, changed.image_version)
+
     def test_candidate_snapshot_version_covers_schema_and_candidates(self):
         first = CandidateSnapshot(
             "tmall",

@@ -4,9 +4,11 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Mapping, Optional, Tuple
 import unicodedata
+import uuid
 
 from learning_models import (
     CandidateSnapshot,
@@ -18,7 +20,7 @@ from learning_models import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -26,12 +28,40 @@ def utc_now() -> str:
 
 
 def reject_sensitive_fields(value: Any) -> None:
-    sensitive_names = {"authorization", "cookie", "password", "secret", "token", "key"}
+    sensitive_names = {
+        "authorization",
+        "cookie",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "key",
+        "chromeprofile",
+        "browserprofile",
+    }
+    sensitive_compounds = {
+        "accesstoken",
+        "refreshtoken",
+        "devicetoken",
+        "apikey",
+        "clientsecret",
+        "chromeprofile",
+        "browserprofile",
+    }
     if isinstance(value, Mapping):
         for raw_key, nested in value.items():
-            key = unicodedata.normalize("NFKC", str(raw_key)).casefold().replace("-", "_")
-            parts = tuple(part for part in key.split("_") if part)
-            if any(part in sensitive_names for part in parts):
+            normalized = unicodedata.normalize("NFKC", str(raw_key))
+            snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+            parts = tuple(
+                part.casefold()
+                for part in re.split(r"[^0-9A-Za-z]+", snake)
+                if part
+            )
+            folded = "".join(parts)
+            if (
+                any(part in sensitive_names for part in parts)
+                or folded in sensitive_compounds
+            ):
                 raise ValueError("sensitive field is not allowed in learning storage")
             reject_sensitive_fields(nested)
     elif isinstance(value, (list, tuple)):
@@ -78,6 +108,8 @@ class LearningStore:
               status TEXT NOT NULL,
               pending_review_id TEXT,
               version INTEGER NOT NULL CHECK(version > 0),
+              device_id TEXT NOT NULL DEFAULT '',
+              image_version TEXT NOT NULL DEFAULT '',
               updated_at TEXT NOT NULL
             )
             """,
@@ -120,6 +152,20 @@ class LearningStore:
         try:
             for statement in statements:
                 self.connection.execute(statement)
+            checkpoint_columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(run_checkpoints)"
+                ).fetchall()
+            }
+            if "device_id" not in checkpoint_columns:
+                self.connection.execute(
+                    "ALTER TABLE run_checkpoints ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "image_version" not in checkpoint_columns:
+                self.connection.execute(
+                    "ALTER TABLE run_checkpoints ADD COLUMN image_version TEXT NOT NULL DEFAULT ''"
+                )
             self.connection.execute(
                 "INSERT INTO schema_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -136,6 +182,25 @@ class LearningStore:
             "SELECT value FROM schema_meta WHERE key=?", ("schema_version",)
         ).fetchone()
         return int(row["value"]) if row is not None else 0
+
+    def get_or_create_device_id(self) -> str:
+        row = self.connection.execute(
+            "SELECT value FROM schema_meta WHERE key=?", ("device_id",)
+        ).fetchone()
+        if row is not None:
+            return str(row["value"])
+        device_id = uuid.uuid4().hex
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES(?, ?)",
+                ("device_id", device_id),
+            )
+        row = self.connection.execute(
+            "SELECT value FROM schema_meta WHERE key=?", ("device_id",)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("device identity was not persisted")
+        return str(row["value"])
 
     def upsert_product(self, fingerprint: ProductFingerprint) -> None:
         fingerprint_payload = asdict(fingerprint)
@@ -158,12 +223,22 @@ class LearningStore:
             )
 
     def save_checkpoint(self, checkpoint: RunCheckpoint) -> RunCheckpoint:
+        existing = self.load_checkpoint(checkpoint.run_id)
+        if existing is not None and (
+            existing.product_version != checkpoint.product_version
+            or existing.execution_mode != checkpoint.execution_mode
+            or existing.platform_order != checkpoint.platform_order
+            or existing.device_id != checkpoint.device_id
+            or existing.image_version != checkpoint.image_version
+        ):
+            raise ValueError("checkpoint recovery identity cannot change")
         with self.connection:
             self.connection.execute(
                 "INSERT INTO run_checkpoints("
                 "run_id, product_version, execution_mode, platform_order_json, "
-                "current_index, status, pending_review_id, version, updated_at"
-                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "current_index, status, pending_review_id, version, device_id, "
+                "image_version, updated_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET "
                 "current_index=excluded.current_index, status=excluded.status, "
                 "pending_review_id=excluded.pending_review_id, "
@@ -182,6 +257,8 @@ class LearningStore:
                     checkpoint.status,
                     checkpoint.pending_review_id,
                     1,
+                    checkpoint.device_id,
+                    checkpoint.image_version,
                     utc_now(),
                 ),
             )
@@ -193,26 +270,45 @@ class LearningStore:
     def load_checkpoint(self, run_id: str) -> Optional[RunCheckpoint]:
         row = self.connection.execute(
             "SELECT run_id, product_version, execution_mode, platform_order_json, "
-            "current_index, status, pending_review_id, version "
+            "current_index, status, pending_review_id, version, device_id, image_version "
             "FROM run_checkpoints WHERE run_id=?",
             (run_id,),
         ).fetchone()
         if row is None:
             return None
         return RunCheckpoint(
-            row["run_id"],
-            row["product_version"],
-            row["execution_mode"],
-            tuple(json.loads(row["platform_order_json"])),
-            row["current_index"],
-            row["status"],
-            row["pending_review_id"],
-            row["version"],
+            run_id=row["run_id"],
+            product_version=row["product_version"],
+            execution_mode=row["execution_mode"],
+            platform_order=tuple(json.loads(row["platform_order_json"])),
+            current_index=row["current_index"],
+            status=row["status"],
+            pending_review_id=row["pending_review_id"],
+            version=row["version"],
+            device_id=row["device_id"],
+            image_version=row["image_version"],
         )
 
     def record_stage(self, result: StageResult) -> None:
         reject_sensitive_fields(result.expected)
         reject_sensitive_fields(result.readback)
+        expected_json = canonical_json(result.expected)
+        readback_json = canonical_json(result.readback)
+        existing = self.connection.execute(
+            "SELECT status, expected_json, readback_json, verified FROM stage_results "
+            "WHERE run_id=? AND platform_id=?",
+            (result.run_id, result.platform_id),
+        ).fetchone()
+        if existing is not None and bool(existing["verified"]):
+            unchanged = (
+                existing["status"] == result.status
+                and existing["expected_json"] == expected_json
+                and existing["readback_json"] == readback_json
+                and result.verified
+            )
+            if unchanged:
+                return
+            raise ValueError("verified stage result cannot be rewritten")
         with self.connection:
             self.connection.execute(
                 "INSERT INTO stage_results("
@@ -226,8 +322,8 @@ class LearningStore:
                     result.run_id,
                     result.platform_id,
                     result.status,
-                    canonical_json(result.expected),
-                    canonical_json(result.readback),
+                    expected_json,
+                    readback_json,
                     int(result.verified),
                     utc_now(),
                 ),

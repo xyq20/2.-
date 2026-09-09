@@ -36,6 +36,16 @@ class ProductFingerprint:
     assets: Tuple[AssetFingerprint, ...]
     product_version: str
 
+    @property
+    def image_version(self) -> str:
+        """Hash image identity without exposing local paths or mutable product text."""
+        return canonical_sha256(
+            [
+                {"role": asset.role, "sha256": asset.sha256, "size": asset.size}
+                for asset in self.assets
+            ]
+        )
+
     @classmethod
     def from_inputs(
         cls,
@@ -83,6 +93,8 @@ class RunCheckpoint:
     status: str
     pending_review_id: Optional[str] = None
     version: int = 1
+    device_id: str = ""
+    image_version: str = ""
 
     def __post_init__(self) -> None:
         if self.version < 1:

@@ -29,7 +29,7 @@ class LearningStoreTests(unittest.TestCase):
         self.store.migrate()
         self.store.migrate()
 
-        self.assertEqual(self.store.schema_version(), 1)
+        self.assertEqual(self.store.schema_version(), 2)
         journal_mode = self.store.connection.execute("PRAGMA journal_mode").fetchone()[0]
         foreign_keys = self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0]
         self.assertEqual(journal_mode.casefold(), "wal")
@@ -103,6 +103,45 @@ class LearningStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.load_checkpoint("run-1").version, 3)
 
+    def test_checkpoint_rejects_changed_recovery_identity(self):
+        self.store.migrate()
+        initial = RunCheckpoint(
+            "run-1",
+            "product-1",
+            "save_only",
+            ("base", "pdd"),
+            0,
+            "running",
+            device_id="device-1",
+            image_version="images-1",
+        )
+        self.store.save_checkpoint(initial)
+
+        for changed in (
+            dataclasses.replace(initial, product_version="product-2"),
+            dataclasses.replace(initial, execution_mode="preview"),
+            dataclasses.replace(initial, platform_order=("pdd",)),
+            dataclasses.replace(initial, device_id="device-2"),
+            dataclasses.replace(initial, image_version="images-2"),
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                ValueError, "recovery identity"
+            ):
+                self.store.save_checkpoint(changed)
+
+        self.assertEqual(self.store.load_checkpoint("run-1"), initial)
+
+    def test_device_id_is_opaque_and_stable_across_reopen(self):
+        self.store.migrate()
+        first = self.store.get_or_create_device_id()
+        self.assertRegex(first, r"^[0-9a-f]{32}$")
+
+        self.store.close()
+        self.store = LearningStore(self.path)
+        self.store.migrate()
+
+        self.assertEqual(self.store.get_or_create_device_id(), first)
+
     def test_only_verified_stages_are_completed_in_checkpoint_order(self):
         self.store.migrate()
         self.store.save_checkpoint(
@@ -136,6 +175,32 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(json.loads(row["expected_json"]), {"fabric": "棉"})
         self.assertEqual(json.loads(row["readback_json"]), {"fabric": "棉"})
         self.assertEqual(row["verified"], 1)
+
+    def test_verified_stage_cannot_be_downgraded_or_rewritten(self):
+        self.store.migrate()
+        self.store.save_checkpoint(
+            RunCheckpoint(
+                "run-1", "product-1", "save_only", ("tmall",), 0, "running"
+            )
+        )
+        verified = StageResult(
+            "run-1", "tmall", "readback_verified", {"fabric": "cotton"},
+            {"fabric": "cotton"}, True
+        )
+        self.store.record_stage(verified)
+        self.store.record_stage(verified)
+
+        for changed in (
+            dataclasses.replace(verified, verified=False),
+            dataclasses.replace(verified, readback={"fabric": "polyester"}),
+            dataclasses.replace(verified, status="saved"),
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                ValueError, "cannot be rewritten"
+            ):
+                self.store.record_stage(changed)
+
+        self.assertEqual(self.store.completed_platforms("run-1"), ("tmall",))
 
     def test_candidate_snapshot_is_saved_once_by_stable_version(self):
         self.store.migrate()
@@ -222,6 +287,16 @@ class LearningStoreTests(unittest.TestCase):
             self.store.connection.execute("SELECT COUNT(*) FROM stage_results").fetchone()[0],
             0,
         )
+
+    def test_camel_case_and_fullwidth_sensitive_keys_are_rejected(self):
+        self.store.migrate()
+        for key in ("apiKey", "accessToken", "chromeProfile", "ＴＯＫＥＮ"):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError, "sensitive field"
+            ):
+                self.store.enqueue(
+                    f"unsafe-{key}", "review.created", {key: "must-not-store"}
+                )
 
 
 if __name__ == "__main__":

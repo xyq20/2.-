@@ -78,11 +78,18 @@ class LearningClientTests(unittest.TestCase):
                 client.post_event("key-1", "visual_facts.created", {})
         request.assert_not_called()
 
-    def test_409_is_returned_as_existing_idempotent_result(self):
+    def test_only_marker_only_409_is_an_existing_idempotent_event(self):
         client = CloudLearningClient("https://review.example", "device-secret")
-        with patch.object(client, "_request", return_value=(409, {"task_id": "r-1"})):
+        with patch.object(client, "_request", return_value=(409, {"event_id": "e-1"})):
             result = client.post_event("key-1", "review.created", {"x": 1})
-        self.assertEqual(result["task_id"], "r-1")
+        self.assertEqual(result["event_id"], "e-1")
+
+        for body in ({"error": "product_deleting"}, {"task_id": "r-1"}):
+            with self.subTest(body=body), patch.object(
+                client, "_request", return_value=(409, body)
+            ):
+                with self.assertRaises(PermanentCloudError):
+                    client.post_event("key-1", "review.created", {"x": 1})
 
     def test_retryable_and_permanent_statuses_do_not_leak_secrets(self):
         client = CloudLearningClient("https://review.example", "device-secret")
@@ -118,11 +125,11 @@ class LearningClientTests(unittest.TestCase):
             409,
             "conflict",
             {},
-            io.BytesIO(b'{"task_id":"existing"}'),
+            io.BytesIO(b'{"event_id":"existing"}'),
         )
         with patch("learning_client.request.urlopen", side_effect=error):
             result = client.post_event("key", "review.created", {})
-        self.assertEqual(result, {"task_id": "existing"})
+        self.assertEqual(result, {"event_id": "existing"})
 
     def test_request_sets_device_auth_but_exception_text_never_contains_it(self):
         client = CloudLearningClient("https://review.example", "device-secret")
@@ -210,9 +217,9 @@ class LearningClientTests(unittest.TestCase):
             },
         )
 
-    def test_upload_asset_treats_409_as_success_and_5xx_as_retryable(self):
+    def test_upload_asset_accepts_success_rejects_409_and_retries_5xx(self):
         client = CloudLearningClient("https://review.example", "device-secret")
-        for status in (200, 201, 409):
+        for status in (200, 201):
             with self.subTest(status=status), patch.object(
                 client, "_request", return_value=(status, {"ok": True})
             ):
@@ -220,6 +227,9 @@ class LearningClientTests(unittest.TestCase):
                     client.upload_asset("p", "sha", "original", "image/jpeg", b"x"),
                     {"ok": True},
                 )
+        with patch.object(client, "_request", return_value=(409, {"error": "product_deleting"})):
+            with self.assertRaises(PermanentCloudError):
+                client.upload_asset("p", "sha", "original", "image/jpeg", b"x")
         with patch.object(client, "_request", return_value=(503, {})):
             with self.assertRaises(RetryableCloudError):
                 client.upload_asset("p", "sha", "original", "image/jpeg", b"x")

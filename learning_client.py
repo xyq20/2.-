@@ -74,11 +74,11 @@ class CloudLearningClient:
                 "payload": payload,
             },
         )
-        return self._successful_json(status, body, idempotent_conflict=True)
+        return self._successful_json(status, body, event_duplicate=True)
 
     def decide(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         status, body = self._request("POST", "/api/device/decide", payload)
-        return self._successful_json(status, body, idempotent_conflict=True)
+        return self._successful_json(status, body)
 
     def poll_resume(
         self,
@@ -123,7 +123,7 @@ class CloudLearningClient:
                 "device_id": device_id,
             },
         )
-        return self._successful_json(status, body, idempotent_conflict=True)
+        return self._successful_json(status, body)
 
     def upload_asset(
         self,
@@ -145,19 +145,24 @@ class CloudLearningClient:
                 "X-Asset-Kind": kind,
             },
         )
-        return self._successful_json(status, response, idempotent_conflict=True)
+        return self._successful_json(status, response)
 
     def _successful_json(
         self,
         status: int,
         body: Mapping[str, Any],
         *,
-        idempotent_conflict: bool = False,
+        event_duplicate: bool = False,
     ) -> Mapping[str, Any]:
         successful = {200, 201}
-        if idempotent_conflict:
-            successful.add(409)
         if status in successful:
+            return body
+        if (
+            event_duplicate
+            and status == 409
+            and "event_id" in body
+            and "error" not in body
+        ):
             return body
         if status == 429 or status >= 500:
             raise RetryableCloudError(f"cloud status {status}")

@@ -312,6 +312,8 @@ class LearningRunContext:
     store: LearningStore
     run_id: str
     product_version: str
+    device_id: str
+    image_version: str
 
 
 def create_learning_context(
@@ -333,9 +335,20 @@ def create_learning_context(
     store.enqueue(
         f"product.upsert:{fingerprint.product_version}",
         "product.upsert",
-        asdict(fingerprint),
+        {
+            "product_version": fingerprint.product_version,
+            "style_code": fingerprint.style_code,
+            "title": fingerprint.title,
+            "category_json": {"hints": list(getattr(product, "category_hints", ()))},
+        },
     )
-    return LearningRunContext(store, uuid.uuid4().hex, fingerprint.product_version)
+    return LearningRunContext(
+        store,
+        uuid.uuid4().hex,
+        fingerprint.product_version,
+        store.get_or_create_device_id(),
+        fingerprint.image_version,
+    )
 
 
 def natural_key(path: Path) -> List[Any]:
@@ -4999,6 +5012,8 @@ def save_learning_checkpoint(
         platform_order,
         current_index,
         status,
+        device_id=context.device_id,
+        image_version=context.image_version,
     )
     stored = context.store.save_checkpoint(requested)
     persisted = stored if isinstance(stored, RunCheckpoint) else requested
@@ -5009,12 +5024,14 @@ def save_learning_checkpoint(
             "checkpoint_id": persisted.run_id,
             "run_id": persisted.run_id,
             "product_version": persisted.product_version,
+            "device_id": persisted.device_id,
             "execution_mode": persisted.execution_mode,
             "platform_order": list(persisted.platform_order),
             "current_index": persisted.current_index,
             "status": persisted.status,
             "pending_review_id": persisted.pending_review_id,
             "version": persisted.version,
+            "image_version": persisted.image_version,
         },
     )
 
@@ -5031,16 +5048,11 @@ def record_learning_stage(
         "product_version": context.product_version,
         "platform_id": result.platform_id,
         "status": result.status,
-        "expected": result.expected,
-        "readback": result.readback,
+        "expected_json": result.expected,
+        "readback_json": result.readback,
         "verified": True,
     }
     content_version = canonical_sha256(payload)
-    context.store.enqueue(
-        f"readback.recorded:{result.run_id}:{result.platform_id}:{content_version}",
-        "readback.recorded",
-        payload,
-    )
     context.store.enqueue(
         f"stage.completed:{result.run_id}:{result.platform_id}:{content_version}",
         "stage.completed",
