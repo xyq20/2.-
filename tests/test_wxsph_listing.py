@@ -357,6 +357,7 @@ class WxsphListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(by_label["图案"].required)
         self.assertFalse(by_label["图案"].multiple)
         self.assertEqual(by_label["图案"].option_summary.count, 2)
+        self.assertEqual(len(by_label["图案"].option_values), 2)
         self.assertEqual(by_label["运费险"].source_id, "service-insurance")
         self.assertFalse(by_label["运费险"].required)
         self.assertIn("商品条码", by_label)
@@ -378,6 +379,14 @@ class WxsphListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shop_summaries[0].count, 2)
         self.assertEqual(shop_summaries[0].sample, ())
         self.assertEqual(len(shop_summaries[0].sha256), 64)
+        self.assertTrue(
+            all(
+                field.option_values == ()
+                for field in all_fields(fixed)
+                if field.option_summary is not None
+                and field.option_summary.source == "shop"
+            )
+        )
 
         report_text = json.dumps(
             {

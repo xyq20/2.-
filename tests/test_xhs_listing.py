@@ -371,6 +371,7 @@ class XhsListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(by_label["裤型"].multiple)
         self.assertFalse(by_label["裤型"].custom_allowed)
         self.assertEqual(by_label["裤型"].option_summary.count, 2)
+        self.assertEqual(len(by_label["裤型"].option_values), 2)
         self.assertEqual(by_label["适用场景"].option_summary.count, 1)
         self.assertTrue(by_label["适用场景"].multiple)
         self.assertEqual(by_label["颜色"].source_id, "variation-color")
@@ -397,6 +398,14 @@ class XhsListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(summary.count == 2 for summary in sensitive_summaries))
         self.assertTrue(all(summary.sample == () for summary in sensitive_summaries))
         self.assertTrue(all(len(summary.sha256) == 64 for summary in sensitive_summaries))
+        self.assertTrue(
+            all(
+                field.option_values == ()
+                for field in all_fields(fixed)
+                if field.option_summary is not None
+                and field.option_summary.source in ("logistics", "freight")
+            )
+        )
 
         report_text = json.dumps(
             {

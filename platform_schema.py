@@ -32,6 +32,18 @@ class OptionSummary(_JsonModel):
 
 
 @dataclass(frozen=True)
+class FieldOption(_JsonModel):
+    value_id: str
+    label: str
+    position: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value_id", str(self.value_id))
+        object.__setattr__(self, "label", str(self.label))
+        object.__setattr__(self, "position", int(self.position))
+
+
+@dataclass(frozen=True)
 class EndpointObservation(_JsonModel):
     method: str
     path: str
@@ -87,6 +99,7 @@ class FieldSchema(_JsonModel):
     multiple: Optional[bool] = None
     custom_allowed: Optional[bool] = None
     option_summary: Optional[OptionSummary] = None
+    option_values: Tuple[FieldOption, ...] = ()
     dependencies: Tuple[str, ...] = ()
     api_paths: Tuple[str, ...] = ()
     dom_locator_hint: Optional[DomLocatorHint] = None
@@ -95,6 +108,12 @@ class FieldSchema(_JsonModel):
     def __post_init__(self) -> None:
         if self.source_id is not None:
             object.__setattr__(self, "source_id", str(self.source_id))
+        summary = self.option_summary
+        if (
+            summary is not None
+            and summary.source.strip().lower() in _SAMPLE_HIDDEN_SOURCES
+        ):
+            object.__setattr__(self, "option_values", ())
 
 
 @dataclass(frozen=True)
@@ -201,6 +220,18 @@ def option_summary(
         sample=sample,
         truncated=len(sample) < len(unique),
         sha256=digest,
+    )
+
+
+def field_options(
+    options: Iterable[Any],
+    source: str = "api",
+) -> Tuple[FieldOption, ...]:
+    if str(source).strip().lower() in _SAMPLE_HIDDEN_SOURCES:
+        return ()
+    return tuple(
+        FieldOption(value_id, label, position)
+        for position, (value_id, label) in enumerate(_option_pair(option) for option in options)
     )
 
 

@@ -204,6 +204,8 @@ class TmallListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(season.option_summary.count, 2)
         self.assertEqual(season.option_summary.source, "api")
+        self.assertEqual(len(season.option_values), 2)
+        self.assertEqual(tuple(value.position for value in season.option_values), (0, 1))
         serialized = json.dumps(to_dict(fragment), ensure_ascii=False)
         self.assertNotIn("PRIVATE-COOKIE-MUST-NOT-LEAK", serialized)
         self.assertNotIn("SHOP-ID-ONLY-IN-MEMORY", serialized)

@@ -19,6 +19,7 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
 
@@ -338,6 +339,7 @@ class XhsListing:
                 section="fixed",
                 control_type="select_one",
                 option_summary=option_summary(_items(logistics), source="logistics"),
+                option_values=field_options(_items(logistics), source="logistics"),
                 api_paths=(_LOGISTICS.path,),
             ),
             FieldSchema(
@@ -347,6 +349,7 @@ class XhsListing:
                 section="fixed",
                 control_type="select_one",
                 option_summary=option_summary(_items(freight), source="freight"),
+                option_values=field_options(_items(freight), source="freight"),
                 api_paths=(_FREIGHT.path,),
             ),
         )
@@ -599,6 +602,7 @@ class XhsListing:
                         else None
                     ),
                     option_summary=option_summary(options, source="api"),
+                    option_values=field_options(options, source="api"),
                     api_paths=(_ATTRIBUTES.path, _ATTRIBUTE_VALUES.path),
                 )
             )
@@ -655,6 +659,7 @@ class XhsListing:
                 section="delivery",
                 control_type="select_one",
                 option_summary=option_summary(existing_options, source="api"),
+                option_values=field_options(existing_options, source="api"),
                 api_paths=(_DELIVERY.path,),
             ),
             FieldSchema(
@@ -664,6 +669,7 @@ class XhsListing:
                 section="delivery",
                 control_type="select_one",
                 option_summary=option_summary(presale_options, source="api"),
+                option_values=field_options(presale_options, source="api"),
                 api_paths=(_DELIVERY.path,),
             ),
         )

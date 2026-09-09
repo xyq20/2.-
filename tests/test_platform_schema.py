@@ -15,6 +15,39 @@ def _load_schema(test_case):
 
 
 class PlatformSchemaTests(unittest.TestCase):
+    def test_field_options_preserve_complete_api_order_and_duplicate_ids(self):
+        schema = _load_schema(self)
+        options = [
+            {"id": "long", "label": "长裤"},
+            {"id": "short", "label": "短裤"},
+            {"id": "long", "label": "长裤冲突项"},
+        ] + [(str(index), "候选 {0}".format(index)) for index in range(25)]
+
+        values = schema.field_options(options, source="api")
+
+        self.assertEqual(len(values), 28)
+        self.assertEqual(
+            values[:3],
+            (
+                schema.FieldOption("long", "长裤", 0),
+                schema.FieldOption("short", "短裤", 1),
+                schema.FieldOption("long", "长裤冲突项", 2),
+            ),
+        )
+
+    def test_field_options_hide_sensitive_sources_even_on_direct_field_creation(self):
+        schema = _load_schema(self)
+        sensitive = (schema.FieldOption("shop-1", "Internal Shop", 0),)
+
+        for source in ("shop", "logistics", "freight"):
+            self.assertEqual(schema.field_options((("shop-1", "Internal Shop"),), source=source), ())
+            field = schema.FieldSchema(
+                schema_key="sensitive",
+                option_summary=schema.OptionSummary(source, 1, (), True, "a" * 64),
+                option_values=sensitive,
+            )
+            self.assertEqual(field.option_values, ())
+
     def test_option_summary_is_deterministic_deduplicated_and_limited(self):
         schema = _load_schema(self)
         options = [
@@ -281,6 +314,7 @@ class PlatformSchemaTests(unittest.TestCase):
             multiple=False,
             custom_allowed=False,
             option_summary=option_summary,
+            option_values=(schema.FieldOption("blue", "蓝色", 0),),
             dependencies=("category",),
             api_paths=("/safe/attributes.json",),
             dom_locator_hint=locator,
@@ -339,6 +373,10 @@ class PlatformSchemaTests(unittest.TestCase):
             payload["dynamic_sections"][0]["fields"][0]["option_summary"]["sample"],
             [["blue", "蓝色"]],
         )
+        self.assertEqual(
+            payload["dynamic_sections"][0]["fields"][0]["option_values"],
+            [{"value_id": "blue", "label": "蓝色", "position": 0}],
+        )
         json.dumps(payload, ensure_ascii=False)
 
     def test_schema_types_do_not_define_runtime_identity_fields(self):
@@ -355,6 +393,7 @@ class PlatformSchemaTests(unittest.TestCase):
 
         for model in (
             schema.OptionSummary,
+            schema.FieldOption,
             schema.EndpointObservation,
             schema.CategoryCandidate,
             schema.CategoryResolution,
@@ -370,6 +409,7 @@ class PlatformSchemaTests(unittest.TestCase):
         schema = _load_schema(self)
         instances = (
             schema.OptionSummary("inline", 0, (), False, "0" * 64),
+            schema.FieldOption("blue", "蓝色", 0),
             schema.EndpointObservation("GET", "/detail.json"),
             schema.CategoryCandidate("leaf", ("男装",)),
             schema.CategoryResolution("pending_category"),

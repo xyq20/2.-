@@ -19,6 +19,7 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
 
@@ -234,6 +235,7 @@ def _fields(
                     else True if control_type == "select_many" else False if control_type == "select_one" else None
                 ),
                 option_summary=option_summary(options, source="api") if options else None,
+                option_values=field_options(options, source="api"),
                 api_paths=(path,),
             )
         )
@@ -358,6 +360,7 @@ class WxsphListing:
             section="fixed",
             control_type="select_one",
             option_summary=option_summary(template_values, source="shop"),
+            option_values=field_options(template_values, source="shop"),
             api_paths=(_TEMPLATES.path,),
         )
         fixed_fields = _fields(

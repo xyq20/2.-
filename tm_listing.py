@@ -19,6 +19,7 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
 
@@ -177,6 +178,7 @@ def _descriptor_fields(
                     option_summary=(
                         option_summary(options, source="api") if options else None
                     ),
+                    option_values=field_options(options, source="api"),
                     api_paths=(api_path,),
                 )
             )
@@ -548,6 +550,7 @@ class TmallListing:
             section="brand",
             control_type="select_one",
             option_summary=option_summary(brand_values, source="api"),
+            option_values=field_options(brand_values, source="api"),
             api_paths=(_BRANDS.path,),
         )
         return SchemaFragment(

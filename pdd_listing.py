@@ -21,6 +21,7 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
 
@@ -195,6 +196,7 @@ def _property_fields(
                     else None
                 ),
                 option_summary=option_summary(options, source=source) if options else None,
+                option_values=field_options(options, source=source),
                 api_paths=(api_path,),
             )
         )

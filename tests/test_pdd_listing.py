@@ -404,6 +404,7 @@ class PddListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         prediction = by_section["prediction_properties"].fields[0]
         self.assertEqual(prediction.option_summary.source, "prediction")
         self.assertEqual(prediction.option_summary.count, 2)
+        self.assertEqual(len(prediction.option_values), 2)
         self.assertNotIn(
             raw_prediction_default,
             json.dumps(to_dict(dynamic), ensure_ascii=False),
