@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "kuaimai-review",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kuaimai-review",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    { "binding": "ASSETS", "bucket_name": "kuaimai-review-assets" },
+  ],
+  "triggers": { "crons": ["0 3 * * *"] },
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 },
+}

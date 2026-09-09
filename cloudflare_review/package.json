@@ -1,0 +1,28 @@
+{
+  "name": "kuaimai-review",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "check": "tsc --noEmit",
+    "test:bootstrap": "node --test scripts/hash-password.test.mjs",
+    "dev": "wrangler dev --local",
+    "types": "wrangler types",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply kuaimai-review --local",
+    "db:migrate:remote": "wrangler d1 migrations apply kuaimai-review --remote"
+  },
+  "overrides": {
+    "miniflare": "5.20260908.0-alpha",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.0.0"
+  }
+}
