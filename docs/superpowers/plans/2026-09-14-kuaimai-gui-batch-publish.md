@@ -16,7 +16,7 @@
 - Create: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/tests/test_kuaimai_gui.py`
 - Create: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/kuaimai_gui.py`
 
-- [ ] **Step 1: Write failing tests for valid product discovery and natural ordering**
+- [x] **Step 1: Write failing tests for valid product discovery and natural ordering**
 
 在 `tests/test_kuaimai_gui.py` 中先写入：
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
 Run:
 
@@ -66,7 +66,7 @@ python3 -m unittest tests/test_kuaimai_gui.py -v
 
 Expected: FAIL because `kuaimai_gui.py` and `discover_products` do not exist yet.
 
-- [ ] **Step 3: Define the pure product model and discovery implementation**
+- [x] **Step 3: Define the pure product model and discovery implementation**
 
 在 `kuaimai_gui.py` 顶部实现以下接口，不在模块导入阶段创建 Tkinter 根窗口：
 
@@ -114,7 +114,7 @@ def discover_products(products_root: Path) -> Tuple[ProductChoice, ...]:
     return tuple(choices)
 ```
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [x] **Step 4: Run the focused tests to verify they pass**
 
 Run:
 
@@ -124,7 +124,7 @@ python3 -m unittest tests/test_kuaimai_gui.py -v
 
 Expected: 2 tests PASS.
 
-- [ ] **Step 5: Commit the pure discovery contract**
+- [x] **Step 5: Commit the pure discovery contract**
 
 ```bash
 git add kuaimai_gui.py tests/test_kuaimai_gui.py
@@ -137,7 +137,7 @@ git commit -m "test: define gui product discovery contract"
 - Modify: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/kuaimai_gui.py`
 - Modify: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/tests/test_kuaimai_gui.py`
 
-- [ ] **Step 1: Write failing tests for root candidates, publish command, and batch status**
+- [x] **Step 1: Write failing tests for root candidates, publish command, and batch status**
 
 在测试文件追加以下测试和导入：
 
@@ -240,7 +240,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the focused tests to verify the new tests fail**
+- [x] **Step 2: Run the focused tests to verify the new tests fail**
 
 Run:
 
@@ -250,7 +250,7 @@ python3 -m unittest tests/test_kuaimai_gui.py -v
 
 Expected: FAIL because the root discovery, command builder, status enum, and batch runner are not defined.
 
-- [ ] **Step 3: Implement root discovery, command assembly, and queue execution**
+- [x] **Step 3: Implement root discovery, command assembly, and queue execution**
 
 在 `kuaimai_gui.py` 中加入以下固定接口和实现；候选路径只在 `/Volumes` 的有限深度内检查，不递归扫描整个磁盘：
 
@@ -350,7 +350,7 @@ def run_batch(
 
 实现时保留一个可注入的 `emit` 回调，不在纯队列函数里创建线程或 Tkinter 对象；窗口层再把真实输出传入回调，测试可以继续使用内存列表。
 
-- [ ] **Step 4: 修正 runner 输出回调的队列传递并重新运行测试**
+- [x] **Step 4: 修正 runner 输出回调的队列传递并重新运行测试**
 
 将 `run_batch` 的 runner 类型和调用改为让每个商品收到当前 GUI 的输出回调：
 
@@ -399,7 +399,7 @@ python3 -m unittest tests/test_kuaimai_gui.py -v
 
 Expected: 6 tests PASS.
 
-- [ ] **Step 5: Commit the pure batch execution layer**
+- [x] **Step 5: Commit the pure batch execution layer**
 
 ```bash
 git add kuaimai_gui.py tests/test_kuaimai_gui.py
@@ -411,7 +411,7 @@ git commit -m "feat: add gui product discovery and batch queue"
 **Files:**
 - Modify: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/kuaimai_gui.py`
 
-- [ ] **Step 1: Add the real process runner without importing Tkinter**
+- [x] **Step 1: Add the real process runner without importing Tkinter**
 
 实现以下函数，保证 GUI 子进程使用当前项目目录和当前虚拟环境，输出合并为一条流，保留现有脚本的交互式登录输入：
 
@@ -448,7 +448,7 @@ def run_product_process(
     return process.wait()
 ```
 
-- [ ] **Step 2: Add the Tkinter app with single and batch actions**
+- [x] **Step 2: Add the Tkinter app with single and batch actions**
 
 在 `kuaimai_gui.py` 中实现 `KuaimaiGuiApp`，Tkinter 仅在构造函数内导入。窗口需要包含：共享盘路径、刷新/选择目录、全选/清空、带滚动条的复选框列表、`单个执行`、`批量执行所选`、`停止后续任务`、进度标签和日志框。
 
@@ -517,7 +517,7 @@ class KuaimaiGuiApp:
 
 单个执行按钮只接受一个勾选项；批量执行按钮接受一个或多个勾选项并按列表顺序执行。批量失败继续后续商品；停止按钮只设置 `stop_event`，不杀掉当前子进程。
 
-- [ ] **Step 3: Add safe manual root selection and refresh behavior**
+- [x] **Step 3: Add safe manual root selection and refresh behavior**
 
 为窗口实现配置文件读写、`choose_products_root` 和 `refresh_products`。配置文件只保存共享盘路径，不保存认证信息：
 
@@ -577,7 +577,7 @@ def refresh_products(self):
 
 配置文件只保存 `products_root` 路径，放在 `output/kuaimai/gui-config.json`，不保存任何认证信息；读取损坏或不存在的配置时直接回退到 `/Volumes` 自动发现。选择目录后必须重新发现并只显示包含 `产品信息.xlsx` 的一级文件夹。
 
-- [ ] **Step 4: Add the module entry point and run a headless import check**
+- [x] **Step 4: Add the module entry point and run a headless import check**
 
 实现：
 
@@ -610,7 +610,7 @@ python3 -m unittest tests/test_kuaimai_gui.py -v
 
 Expected: 模块导入成功，纯逻辑测试全部 PASS；有 Tk 支持的 Mac 上手动运行 `python3 kuaimai_gui.py` 会打开窗口。
 
-- [ ] **Step 5: Commit the Tkinter UI and subprocess bridge**
+- [x] **Step 5: Commit the Tkinter UI and subprocess bridge**
 
 ```bash
 git add kuaimai_gui.py
@@ -624,7 +624,7 @@ git commit -m "feat: add tkinter kuaimai publish gui"
 - Create: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/docs/kuaimai-gui-migration.md`
 - Create: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/tests/test_kuaimai_gui_launcher.py`
 
-- [ ] **Step 1: Write the launcher test with fake Python executables**
+- [x] **Step 1: Write the launcher test with fake Python executables**
 
 新建 `tests/test_kuaimai_gui_launcher.py`，通过临时目录复制启动器和 fake `python3`/`.venv/bin/python`，验证它不会进入原有终端菜单：
 
@@ -687,7 +687,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the launcher test to verify it fails**
+- [x] **Step 2: Run the launcher test to verify it fails**
 
 Run:
 
@@ -697,7 +697,7 @@ python3 -m unittest tests/test_kuaimai_gui_launcher.py -v
 
 Expected: FAIL because `run-gui.command` does not exist yet.
 
-- [ ] **Step 3: Implement `run-gui.command`**
+- [x] **Step 3: Implement `run-gui.command`**
 
 写入并设置可执行权限：
 
@@ -730,7 +730,7 @@ export PYTHONUNBUFFERED=1
 exec .venv/bin/python kuaimai_gui.py
 ```
 
-- [ ] **Step 4: Write migration instructions and make the launcher executable**
+- [x] **Step 4: Write migration instructions and make the launcher executable**
 
 `docs/kuaimai-gui-migration.md` 至少包含：
 
@@ -756,7 +756,7 @@ python3 -m unittest tests/test_kuaimai_gui_launcher.py -v
 
 Expected: 启动器测试 PASS，且 `run-gui.command` 具备执行权限。
 
-- [ ] **Step 5: Commit the migration entrypoint and docs**
+- [x] **Step 5: Commit the migration entrypoint and docs**
 
 ```bash
 git add run-gui.command docs/kuaimai-gui-migration.md tests/test_kuaimai_gui_launcher.py
@@ -771,7 +771,7 @@ git commit -m "feat: add portable kuaimai gui launcher"
 - Verify only: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/tests/test_kuaimai_gui.py`
 - Verify only: `/Users/linchaoyang/Desktop/电商自动化/2.快麦一键铺货/tests/test_kuaimai_gui_launcher.py`
 
-- [ ] **Step 1: Run focused GUI tests**
+- [x] **Step 1: Run focused GUI tests**
 
 ```bash
 python3 -m unittest tests/test_kuaimai_gui.py tests/test_kuaimai_gui_launcher.py -v
@@ -779,7 +779,7 @@ python3 -m unittest tests/test_kuaimai_gui.py tests/test_kuaimai_gui_launcher.py
 
 Expected: all focused tests PASS.
 
-- [ ] **Step 2: Run syntax and launcher checks**
+- [x] **Step 2: Run syntax and launcher checks**
 
 ```bash
 python3 -m py_compile kuaimai_gui.py
@@ -789,7 +789,7 @@ git diff --check
 
 Expected: all commands exit 0 and produce no syntax or whitespace errors.
 
-- [ ] **Step 3: Run the existing launcher regression tests**
+- [x] **Step 3: Run the existing launcher regression tests**
 
 ```bash
 python3 -m unittest tests/test_launchers.py -v
@@ -797,11 +797,11 @@ python3 -m unittest tests/test_launchers.py -v
 
 Expected: existing launcher tests remain PASS; `run.command` is unchanged by this feature.
 
-- [ ] **Step 4: Perform a non-publishing GUI smoke check**
+- [x] **Step 4: Perform a non-publishing GUI smoke check**
 
 在临时 `products` 根目录中创建两个带空 `产品信息.xlsx` 的测试商品目录，调用 `discover_products` 和 `run_batch` 的 fake runner，确认单选队列长度为 1，多选队列顺序与界面列表一致；不得运行 `--save` 的真实商品任务。
 
-- [ ] **Step 5: Review the final diff and report migration limits**
+- [x] **Step 5: Review the final diff and report migration limits**
 
 ```bash
 git status --short
