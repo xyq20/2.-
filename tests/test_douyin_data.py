@@ -85,11 +85,29 @@ class DouyinFieldParsingTests(unittest.TestCase):
     def test_parses_supported_material_syntaxes(self):
         self.assertEqual(parse_materials("棉（100%）"), (MaterialComponent("棉", 100),))
         self.assertEqual(parse_materials("棉/100%"), (MaterialComponent("棉", 100),))
+        self.assertEqual(
+            parse_materials("棉100%/棉/棉布"),
+            (MaterialComponent("棉", 100),),
+        )
 
     def test_parses_multiple_materials_in_source_order(self):
         self.assertEqual(
-            parse_materials("棉（70%）/聚酯纤维（30%）"),
-            (MaterialComponent("棉", 70), MaterialComponent("聚酯纤维", 30)),
+            parse_materials("棉（100%）/棉布/纯棉"),
+            (MaterialComponent("棉", 100),),
+        )
+        self.assertEqual(
+            parse_materials("棉94%，氨纶6%"),
+            (MaterialComponent("棉", 94), MaterialComponent("氨纶", 6)),
+        )
+        self.assertEqual(
+            parse_materials("棉（94%）；氨纶（6%）"),
+            (MaterialComponent("棉", 94), MaterialComponent("氨纶", 6)),
+        )
+
+    def test_slash_candidates_do_not_create_extra_material_rows(self):
+        self.assertEqual(
+            parse_materials("棉100%/氨纶6%"),
+            (MaterialComponent("棉", 100),),
         )
 
     def test_rejects_incomplete_or_malformed_material_percentages(self):
@@ -170,6 +188,15 @@ class DouyinFieldParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinDataError, "价格不是有效数字"):
             parse_douyin_fields(fields)
 
+    def test_accepts_trailing_yuan_but_rejects_ambiguous_price_suffix(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        fields["价格/京东价/市场价/售卖价/售价"] = "690元"
+        self.assertEqual(parse_douyin_fields(fields).price, "690")
+
+        fields["价格/京东价/市场价/售卖价/售价"] = "690元起"
+        with self.assertRaisesRegex(DouyinDataError, "价格不是有效数字"):
+            parse_douyin_fields(fields)
+
     def test_rejects_invalid_material_percentages(self):
         with self.assertRaisesRegex(DouyinDataError, "0 到 100"):
             parse_materials("棉（101%）")
@@ -196,6 +223,37 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
             self.assertEqual(result.wash_label_images, (first, tenth, second))
             self.assertEqual(result.size_chart_image, size_chart)
             self.assertEqual(result.height_weight_image, height_weight)
+
+    def test_wash_label_filename_is_not_used_for_matching(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            label = self._write_image(
+                product_dir / "水洗标图片", "吊牌正面-任意名称.jpeg"
+            )
+            size_chart = self._write_image(product_dir / "尺码信息表", "size.jpg")
+            recommendation = self._write_image(
+                product_dir / "身高体重推荐表", "recommendation.jpg"
+            )
+
+            result = read_douyin_assets(product_dir)
+
+            self.assertEqual(result.wash_label_images, (label,))
+            self.assertEqual(result.size_chart_image, size_chart)
+            self.assertEqual(result.height_weight_image, recommendation)
+
+    def test_allows_missing_wash_label_so_page_schema_can_decide_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            size_chart = self._write_image(product_dir / "尺码信息表", "size.jpg")
+            recommendation = self._write_image(
+                product_dir / "身高体重推荐表", "recommendation.jpg"
+            )
+
+            result = read_douyin_assets(product_dir)
+
+            self.assertEqual(result.wash_label_images, ())
+            self.assertEqual(result.size_chart_image, size_chart)
+            self.assertEqual(result.height_weight_image, recommendation)
 
     def test_requires_exactly_one_size_and_recommendation_image(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -224,6 +282,27 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
 
 
 class KuaimaiIntegrationTests(unittest.TestCase):
+    def test_read_excel_fields_uses_named_columns_and_skips_filter_header(self):
+        rows = (
+            ("序号", "内容", "备注", "属性筛选"),
+            (1, "基础商品标题", None, "商品标题/商品名称"),
+            (2, "NGBL-2068", None, "货号/商家外部编码"),
+        )
+
+        self.assertEqual(
+            kuaimai_erp.read_excel_fields(rows),
+            {
+                "商品标题/商品名称": "基础商品标题",
+                "货号/商家外部编码": "NGBL-2068",
+            },
+        )
+
+    def test_read_excel_fields_rejects_duplicate_labels(self):
+        rows = (("属性", "内容"), ("颜色", "绿色"), ("颜色", "蓝色"))
+
+        with self.assertRaisesRegex(kuaimai_erp.AutomationError, "重复字段.*颜色"):
+            kuaimai_erp.read_excel_fields(rows)
+
     def test_read_excel_fields_and_product_summary_keep_douyin_data_serializable(self):
         rows = (("导购短标题", "短标题", None), ("现货库存", 0, None))
         fields = kuaimai_erp.read_excel_fields(rows)
@@ -347,6 +426,21 @@ class ProductDataReadIntegrationTests(unittest.TestCase):
             self.assertIsNone(product.douyin_assets)
             self.assertIsNotNone(product.wxsph_fields)
             self.assertEqual(product.wxsph_fields.fields["吊牌价/价格/基本售价"], "586")
+
+    def test_read_product_data_uses_field_name_after_filter_header(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            excel_path = self._write_excel(
+                product_dir,
+                [("属性", "内容"), *self._base_fields()],
+            )
+
+            product = kuaimai_erp.read_product_data(excel_path)
+
+        self.assertEqual(product.title, "基础商品标题")
+        self.assertEqual(product.style_code, "NGBL-10588")
+        self.assertEqual(product.base_price, "586")
 
     def test_read_product_data_rejects_partial_douyin_signals(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

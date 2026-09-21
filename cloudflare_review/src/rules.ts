@@ -17,6 +17,10 @@ function stableConditions(input: RuleConditions): string {
   });
 }
 
+function candidateLabel(value: string): string {
+  return value.normalize("NFKC").trim();
+}
+
 export async function conditionSignature(input: RuleConditions): Promise<string> {
   const bytes = new TextEncoder().encode(stableConditions(input));
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
@@ -76,6 +80,12 @@ interface RuleRow {
   accepted_count: number;
   total_count: number;
   status: string;
+}
+
+interface CrossCategoryRuleRow extends RuleRow {
+  updated_at: string;
+  created_at: string;
+  options_json: string;
 }
 
 export async function recordVerifiedRuleOutcome(
@@ -168,6 +178,7 @@ export async function findMatureRule(
   canonicalField: string,
   schemaVersion: string,
   candidateIds: readonly string[],
+  candidateOptions: readonly { value_id: string; label: string }[] = candidateIds.map((value_id) => ({ value_id, label: value_id })),
 ): Promise<string | null> {
   const signature = await conditionSignature(
     await conditionsForProduct(db, productVersion),
@@ -177,8 +188,50 @@ export async function findMatureRule(
   )
     .bind(platformId, categoryLeafId, canonicalField, signature, schemaVersion)
     .first<{ target_value_id: string }>();
-  if (!rule || candidateIds.filter((id) => id === rule.target_value_id).length !== 1)
-    return null;
-  return rule.target_value_id;
-}
+  if (rule && candidateIds.filter((id) => id === rule.target_value_id).length === 1)
+    return rule.target_value_id;
 
+  // Category and vendor option IDs are not stable across endpoints.  Search
+  // mature rules from every category on this platform/field, recover the
+  // historical target label from its saved option snapshot, then map that
+  // label to the current category's unique live candidate ID.
+  const rows = await db.prepare(
+    "SELECT cr.target_value_id,cr.schema_version,cr.consecutive_confirmations,"
+    + "cr.accepted_count,cr.total_count,cr.status,cr.updated_at,"
+    + "ro.created_at,os.options_json "
+    + "FROM conditional_rules cr "
+    + "JOIN rule_outcomes ro ON ro.platform_id=cr.platform_id "
+    + "AND ro.category_leaf_id=cr.category_leaf_id "
+    + "AND ro.canonical_field=cr.canonical_field "
+    + "AND ro.condition_signature=cr.condition_signature "
+    + "AND ro.target_value_id=cr.target_value_id "
+    + "JOIN option_snapshots os ON os.snapshot_version=ro.snapshot_version "
+    + "WHERE cr.platform_id=? AND cr.canonical_field=? "
+    + "AND cr.condition_signature=? AND cr.status='active' "
+    + "AND cr.consecutive_confirmations>=3 AND cr.total_count>0 "
+    + "AND (cr.accepted_count*1.0/cr.total_count)>=0.95 "
+    + "ORDER BY cr.updated_at DESC,ro.created_at DESC",
+  )
+    .bind(platformId, canonicalField, signature)
+    .all<CrossCategoryRuleRow>();
+  for (const row of rows.results ?? []) {
+    let historicalOptions: { value_id?: unknown; label?: unknown }[] = [];
+    try {
+      const parsed = JSON.parse(row.options_json) as unknown;
+      historicalOptions = Array.isArray(parsed) ? parsed as typeof historicalOptions : [];
+    } catch {
+      continue;
+    }
+    const targetLabels = historicalOptions
+      .filter((option) => option.value_id === row.target_value_id)
+      .map((option) => option.label)
+      .filter((label): label is string => typeof label === "string");
+    if (targetLabels.length !== 1) continue;
+    const targetLabel = candidateLabel(targetLabels[0]!);
+    const liveMatches = candidateOptions.filter(
+      (option) => candidateLabel(option.label) === targetLabel,
+    );
+    if (liveMatches.length === 1) return liveMatches[0]!.value_id;
+  }
+  return null;
+}

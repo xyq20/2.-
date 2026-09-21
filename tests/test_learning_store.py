@@ -29,7 +29,7 @@ class LearningStoreTests(unittest.TestCase):
         self.store.migrate()
         self.store.migrate()
 
-        self.assertEqual(self.store.schema_version(), 2)
+        self.assertEqual(self.store.schema_version(), 3)
         journal_mode = self.store.connection.execute("PRAGMA journal_mode").fetchone()[0]
         foreign_keys = self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0]
         self.assertEqual(journal_mode.casefold(), "wal")
@@ -227,6 +227,40 @@ class LearningStoreTests(unittest.TestCase):
         payload = json.loads(row["payload_json"])
         self.assertEqual(payload["schema_version"], "schema-1")
         self.assertFalse(payload["custom_allowed"])
+
+    def test_review_resolution_survives_restart_and_can_be_corrected(self):
+        self.store.migrate()
+        values = {
+            "product_version": "product-1",
+            "platform_id": "douyin",
+            "snapshot_version": "snapshot-1",
+            "review_id": "review-1",
+        }
+        self.store.save_review_resolution(**values, final_value_id="95")
+        self.store.close()
+        self.store = LearningStore(self.path)
+        self.store.migrate()
+
+        self.assertEqual(
+            self.store.load_review_resolution(
+                product_version="product-1",
+                platform_id="douyin",
+                snapshot_version="snapshot-1",
+            ),
+            "95",
+        )
+        self.store.save_review_resolution(
+            **{**values, "review_id": "review-2"},
+            final_value_id="95%及以上",
+        )
+        self.assertEqual(
+            self.store.load_review_resolution(
+                product_version="product-1",
+                platform_id="douyin",
+                snapshot_version="snapshot-1",
+            ),
+            "95%及以上",
+        )
 
     def test_outbox_idempotency_survives_reopen(self):
         self.store.migrate()

@@ -601,10 +601,10 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         controls.prepare_taobao_publish_dialog.assert_not_awaited()
         controls.submit_taobao_publish_dialog.assert_not_awaited()
         listing.require_full_form.assert_awaited_once()
-        listing.wait_for_initial_product_images.assert_awaited_once_with(
+        listing.inspect_initial_product_images.assert_awaited_once_with(
             expected_count=len(_product().main_images),
-            timeout_seconds=self._args().upload_timeout
         )
+        listing.wait_for_initial_product_images.assert_not_awaited()
         listing.sync_initial_product_images.assert_awaited_once_with(
             _product().main_images,
             timeout_seconds=self._args().upload_timeout,
@@ -674,23 +674,36 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initial_image_timeout_records_stage_and_never_publishes(self):
         listing = _listing(TmallProductWriteRequired("首次待发布"))
+        listing.inspect_initial_product_images.return_value = {
+            "count": 0,
+            "expected_count": 1,
+            "decoded": False,
+        }
         listing.wait_for_initial_product_images.side_effect = TmallFormListingError(
             "图片同步未完成：1/5"
         )
+        listing.sync_initial_product_images.side_effect = TmallFormListingError(
+            "本地图片上传失败"
+        )
         with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing):
-            with self.assertRaisesRegex(TmallFormListingError, "1/5"):
+            with self.assertRaisesRegex(TmallFormListingError, "上传失败"):
                 await kuaimai_erp.run_browser_automation(
                     self._args(), _product(), Path(directory), LOGGER
                 )
             report = (Path(directory) / "tmall-review-required.json").read_text()
-            self.assertIn("tmall_initial_product_images_ready_review_required", report)
+            self.assertIn("tmall_initial_product_images_review_required", report)
             self.assertIn('"form_mode": "initial"', report)
-        listing.sync_initial_product_images.assert_not_awaited()
+        listing.sync_initial_product_images.assert_awaited_once()
         listing.publish_product_information.assert_not_awaited()
         listing.fill_attributes.assert_not_awaited()
 
     async def test_async_product_match_repairs_images_without_publishing(self):
         listing = _listing(TmallProductWriteRequired("首次待发布"))
+        listing.inspect_initial_product_images.return_value = {
+            "count": 0,
+            "expected_count": 1,
+            "decoded": False,
+        }
         listing.wait_for_initial_product_images.side_effect = [
             {"count": 1, "matched_existing_product": True, "decoded": False},
             {"count": 5, "decoded": True},

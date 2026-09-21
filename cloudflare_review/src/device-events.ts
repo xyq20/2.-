@@ -68,7 +68,7 @@ const fields: Record<
       "pending_review_id",
       "version",
     ],
-    optional: ["image_version"],
+    optional: ["image_version", "checkpoint_id"],
   },
   "stage.completed": {
     required: [
@@ -104,9 +104,10 @@ function safeObject(value: unknown, depth = 0): void {
   if (value && typeof value === "object")
     for (const [key, nested] of Object.entries(value)) {
       requireValue(
-        !/(password|passwd|token|cookie|authorization|secret|api.?key|chrome.?profile)/i.test(
-          key,
-        ),
+        key === "text_tokens" ||
+          !/(password|passwd|token|cookie|authorization|secret|api.?key|chrome.?profile)/i.test(
+            key,
+          ),
         400,
         "sensitive_key_rejected",
       );
@@ -204,8 +205,8 @@ export function validateDeviceEvent(
   if (type === "snapshot.created") {
     requireValue(
       Array.isArray(p.options) &&
-        p.options.length > 0 &&
-        p.options.length <= 500,
+        p.options.length <= 500 &&
+        (p.options.length > 0 || p.custom_allowed === true),
       400,
       "invalid_options",
     );
@@ -233,6 +234,11 @@ export function validateDeviceEvent(
   }
   if (type === "checkpoint.updated") {
     requireValue(
+      !Object.hasOwn(p, "checkpoint_id") || p.checkpoint_id === p.run_id,
+      400,
+      "checkpoint_id_mismatch",
+    );
+    requireValue(
       Array.isArray(p.platform_order) &&
         p.platform_order.length > 0 &&
         p.platform_order.every((x) => typeof x === "string"),
@@ -244,6 +250,7 @@ export function validateDeviceEvent(
       400,
       "invalid_index",
     );
+    delete p.checkpoint_id;
   }
   return {
     idempotency_key: key,

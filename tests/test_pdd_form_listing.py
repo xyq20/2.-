@@ -201,6 +201,72 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             (("slim", "修身"), ("loose", "宽松")),
         )
 
+    async def test_existing_multi_select_value_learns_without_dropdown_open(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-pdd-existing",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        async def fail_open(*_args, **_kwargs):
+            raise AssertionError("当前值已匹配时不应再打开候选下拉框")
+        listing._open_select = fail_open
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('版型')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              element.style.position = 'relative';
+              const tags = document.createElement('div');
+              tags.className = 'el-select__tags el-select-collapsed__tags';
+              tags.style.cssText = 'position:absolute;inset:0;z-index:2;background:white';
+              tags.innerHTML = '<span class="el-tag">宽松</span>';
+              element.prepend(tags);
+            }"""
+        )
+
+        actual = await listing.fill_attribute("版型", "宽松")
+
+        self.assertEqual(actual, ("宽松",))
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(runtime.requests[0].excel_value, "宽松")
+
+    async def test_collapsed_multi_select_opens_when_tag_covers_readonly_input(self):
+        listing = await self._listing()
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('版型')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              element.style.position = 'relative';
+              const tags = document.createElement('div');
+              tags.className = 'el-select__tags el-select-collapsed__tags';
+              tags.style.cssText = 'position:absolute;inset:0;z-index:2;background:white';
+              tags.innerHTML = '<span class="el-select__tags-text">日常</span>';
+              element.prepend(tags);
+            }"""
+        )
+
+        await listing._open_select(select, multi=True)
+
+        self.assertTrue(
+            await select.locator(".el-select-dropdown").is_visible()
+        )
+
     async def test_fills_excel_attributes_skips_only_crotch_and_applies_batch_presale(self):
         listing = await self._listing()
 

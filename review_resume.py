@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from learning_client import CloudLearningClient, flush_outbox_async
-from learning_models import RunCheckpoint
+from learning_models import RunCheckpoint, checkpoint_event_payload
 from learning_store import LearningStore
+from platform_registry import platforms_equivalent
 
 
 class ResumeRejected(RuntimeError):
@@ -62,7 +63,7 @@ def validate_resume(
     if not (0 <= checkpoint.current_index < len(checkpoint.platform_order)):
         raise ResumeRejected("platform_index_invalid")
     platform = checkpoint.platform_order[checkpoint.current_index]
-    if payload.get("platform_id") != platform:
+    if not platforms_equivalent(payload.get("platform_id"), platform):
         raise ResumeRejected("platform_mismatch")
     review_id = str(payload.get("review_id") or "")
     if not review_id or checkpoint.pending_review_id != review_id:
@@ -128,9 +129,48 @@ async def persist_resume_and_ack(
 ) -> RunCheckpoint:
     if checkpoint.run_id != decision.run_id:
         raise ResumeRejected("run_id_mismatch")
+    # Never let the new resume checkpoint overtake queued waiting checkpoints
+    # from another decision in the same batch.
+    while await flush_outbox_async(store, client, datetime.now(timezone.utc)):
+        pass
+    if store.connection.execute(
+        "SELECT 1 FROM sync_outbox WHERE delivered_at IS NULL "
+        "AND event_type='checkpoint.updated' "
+        "AND json_extract(payload_json, '$.run_id')=? LIMIT 1",
+        (checkpoint.run_id,),
+    ).fetchone():
+        raise ResumeRejected("checkpoint_sync_pending")
+    # The confirmed value must survive a browser retry or process restart.
+    # Without this local durable handoff, an unmapped/dynamic field can create
+    # the same review again before a save-readback file exists.
+    store.save_review_resolution(
+        product_version=checkpoint.product_version,
+        platform_id=decision.platform_id,
+        snapshot_version=decision.snapshot_version,
+        review_id=decision.review_id,
+        final_value_id=decision.final_value_id,
+    )
     persisted = store.save_checkpoint(
         replace(checkpoint, status="resume_pending", version=checkpoint.version)
     )
+    # The remote state machine must observe waiting_review -> resume_pending
+    # before the resume event is acknowledged and before the runner advances
+    # to running.  Merely saving this checkpoint in local SQLite used to leave
+    # the cloud at waiting_review, so the following running checkpoint was
+    # correctly rejected with checkpoint_state_conflict.
+    payload = checkpoint_event_payload(persisted)
+    outbox_id = store.enqueue(
+        f"checkpoint.updated:{persisted.run_id}:{persisted.version}",
+        "checkpoint.updated",
+        payload,
+    )
+    await asyncio.to_thread(
+        client.post_event,
+        f"checkpoint.updated:{persisted.run_id}:{persisted.version}",
+        "checkpoint.updated",
+        payload,
+    )
+    store.mark_delivered(outbox_id)
     await asyncio.to_thread(
         client.acknowledge_resume,
         decision.event_id,

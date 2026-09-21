@@ -141,6 +141,19 @@ def get_platform_spec(value: str) -> PlatformSpec:
     raise ValueError("unknown platform: {0}".format(value))
 
 
+def canonical_platform_name(value: object) -> str:
+    """Return the runner name for either a runner name or persisted platform id."""
+    text = str(value or "").strip()
+    try:
+        return get_platform_spec(text).cli_name
+    except ValueError:
+        return text
+
+
+def platforms_equivalent(left: object, right: object) -> bool:
+    return canonical_platform_name(left) == canonical_platform_name(right)
+
+
 def expand_platform_selection(value: str) -> Tuple[PlatformSpec, ...]:
     if value == "all":
         return tuple(spec for spec in PLATFORM_SPECS if spec.enabled_in_all)
@@ -150,7 +163,9 @@ def expand_platform_selection(value: str) -> Tuple[PlatformSpec, ...]:
 __all__ = [
     "PLATFORM_SPECS",
     "PlatformSpec",
+    "canonical_platform_name",
     "expand_platform_selection",
     "get_platform_spec",
     "platform_cli_choices",
+    "platforms_equivalent",
 ]

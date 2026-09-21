@@ -188,6 +188,22 @@ def _descriptor_fields(values: Any) -> Tuple[FieldSchema, ...]:
     return tuple(fields)
 
 
+def normalize_xhs_attribute_options(values: Any) -> Tuple[Any, ...]:
+    """Normalize legacy id/name and current valueId/valueName candidates."""
+    normalized = []
+    for value in _items(values):
+        if not isinstance(value, Mapping):
+            normalized.append(value)
+            continue
+        item = dict(value)
+        if item.get("id") in (None, "") and item.get("valueId") not in (None, ""):
+            item["id"] = item.get("valueId")
+        if item.get("name") in (None, "") and item.get("valueName") not in (None, ""):
+            item["name"] = item.get("valueName")
+        normalized.append(item)
+    return tuple(normalized)
+
+
 def _delivery_rule_options(values: Tuple[Any, ...]) -> Tuple[Any, ...]:
     normalized = []
     for index, value in enumerate(values):
@@ -580,7 +596,12 @@ class XhsListing:
                 },
             )
             observations.append(values_observation)
-            options = _items(_mapping(values).get("values")) or _items(values)
+            values_mapping = _mapping(values)
+            options = (
+                _items(values_mapping.get("values"))
+                or _items(values_mapping.get("attributeValueV3s"))
+                or _items(values)
+            )
             multiple = value.get("isMulti")
             attribute_fields.append(
                 FieldSchema(
@@ -601,8 +622,12 @@ class XhsListing:
                         if isinstance(value.get("customizable"), bool)
                         else None
                     ),
-                    option_summary=option_summary(options, source="api"),
-                    option_values=field_options(options, source="api"),
+                    option_summary=option_summary(
+                        normalize_xhs_attribute_options(options), source="api"
+                    ),
+                    option_values=field_options(
+                        normalize_xhs_attribute_options(options), source="api"
+                    ),
                     api_paths=(_ATTRIBUTES.path, _ATTRIBUTE_VALUES.path),
                 )
             )
@@ -684,4 +709,4 @@ class XhsListing:
         )
 
 
-__all__ = ["XhsListing"]
+__all__ = ["XhsListing", "normalize_xhs_attribute_options"]

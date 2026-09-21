@@ -20,6 +20,7 @@ class SeedTests(unittest.TestCase):
             workbook.active.append(['货号/商家外部编码', 'TEST-7'])
             workbook.active.append(['商品名称', '后续完善的标题'])
             workbook.active.append(['基本售价', 888])
+            workbook.active.append(['颜色', '复古蓝'])
             workbook.save(root / '产品信息.xlsx')
             images = root / '1：1主图'
             images.mkdir()
@@ -29,6 +30,7 @@ class SeedTests(unittest.TestCase):
             self.assertEqual(product.style_code, 'TEST-7')
             self.assertEqual(product.title, '1')
             self.assertEqual(product.base_price, '0')
+            self.assertEqual(product.colors, ('复古蓝',))
             self.assertEqual([p.name for p in product.main_images], ['1.png'])
             self.assertEqual(product.sku_images, [])
 
@@ -83,10 +85,10 @@ class NewProductTests(unittest.IsolatedAsyncioTestCase):
                 args = SimpleNamespace(save=save, timeout=1, sync_erp=False)
                 if save:
                     with self.assertRaises(erp.AutomationError):
-                        await erp.run_new_product(None, args, SimpleNamespace(style_code='TEST'), Path(directory), LOGGER)
+                        await erp.run_new_product(None, args, SimpleNamespace(style_code='TEST', colors=('复古蓝',)), Path(directory), LOGGER)
                     self.assertEqual(saving.await_count, 1)
                 else:
-                    await erp.run_new_product(None, args, SimpleNamespace(style_code='TEST'), Path(directory), LOGGER)
+                    await erp.run_new_product(None, args, SimpleNamespace(style_code='TEST', colors=('复古蓝',)), Path(directory), LOGGER)
                     saving.assert_not_awaited()
                 report = json.loads((Path(directory) / 'create-product-result.json').read_text())
                 self.assertEqual(report['status'], 'verification_required' if save else 'preview')
@@ -98,21 +100,46 @@ class NewProductTests(unittest.IsolatedAsyncioTestCase):
                 await erp.run_new_product(None, SimpleNamespace(save=True, timeout=1), SimpleNamespace(style_code='TEST'), Path(directory), LOGGER)
             saving.assert_not_awaited()
 
-    async def test_success_requires_reopened_form_validation(self):
-        for persisted_ok in (True, False):
-            with tempfile.TemporaryDirectory() as directory, patch.object(erp, 'api_find_product', AsyncMock(side_effect=[None, None, {'baseItemId': 7}])), patch.object(erp, 'open_new_product_drawer', AsyncMock()), patch.object(erp, 'fill_new_product_form', AsyncMock(return_value={})), patch.object(erp, 'validate_new_product_form', AsyncMock(side_effect=[{}, {} if persisted_ok else erp.AutomationError('readback mismatch')])), patch.object(erp, 'safe_screenshot', AsyncMock()), patch.object(erp, 'click_save_and_confirm', AsyncMock(return_value={'confirmed_by': 'creation_dialog'})) as saving, patch.object(erp, 'open_product_editor', AsyncMock()) as reopening:
-                page = SimpleNamespace(reload=AsyncMock())
-                args = SimpleNamespace(save=True, timeout=1, sync_erp=False)
-                if persisted_ok:
-                    await erp.run_new_product(page, args, SimpleNamespace(style_code='TEST'), Path(directory), LOGGER)
-                else:
-                    with self.assertRaises(erp.AutomationError):
-                        await erp.run_new_product(page, args, SimpleNamespace(style_code='TEST'), Path(directory), LOGGER)
-                report = json.loads((Path(directory) / 'create-product-result.json').read_text())
-                self.assertEqual(report['saved'], persisted_ok)
-                self.assertEqual(report['status'], 'created' if persisted_ok else 'verification_required')
-                self.assertEqual(saving.await_count, 1)
-                self.assertEqual(reopening.await_count, 1)
+    async def test_success_stops_after_creation_confirmation_without_reopen(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            erp, 'api_find_product', AsyncMock(side_effect=[None, None])
+        ) as lookup, patch.object(
+            erp, 'open_new_product_drawer', AsyncMock()
+        ), patch.object(
+            erp, 'fill_new_product_form', AsyncMock(return_value={})
+        ), patch.object(
+            erp, 'validate_new_product_form', AsyncMock(return_value={})
+        ) as validate, patch.object(
+            erp, 'safe_screenshot', AsyncMock()
+        ), patch.object(
+            erp,
+            'click_save_and_confirm',
+            AsyncMock(return_value={'confirmed_by': 'creation_dialog'}),
+        ) as saving, patch.object(
+            erp, 'open_product_editor', AsyncMock()
+        ) as reopening:
+            page = SimpleNamespace(reload=AsyncMock())
+            args = SimpleNamespace(save=True, timeout=1, sync_erp=False)
+            await erp.run_new_product(
+                page,
+                args,
+                SimpleNamespace(style_code='TEST', colors=('复古蓝',)),
+                Path(directory),
+                LOGGER,
+            )
+            report = json.loads(
+                (Path(directory) / 'create-product-result.json').read_text()
+            )
+
+        self.assertTrue(report['saved'])
+        self.assertEqual(report['status'], 'created')
+        self.assertEqual(report['confirmed_by'], 'creation_dialog')
+        self.assertNotIn('after_save', report)
+        self.assertEqual(saving.await_count, 1)
+        self.assertEqual(validate.await_count, 1)
+        self.assertEqual(lookup.await_count, 2)
+        reopening.assert_not_awaited()
+        page.reload.assert_not_awaited()
 
 
 if __name__ == '__main__':

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import getpass
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
 
+from category_profile import category_profile
 from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
 from douyin_listing import DouyinListing, DouyinListingError
 from jd_data import JdFields, parse_jd_fields
@@ -38,14 +40,16 @@ from jd_form_listing import JdFormListing, JdFormListingError
 from learning_models import (
     ProductFingerprint,
     RunCheckpoint,
+    checkpoint_event_payload,
     StageResult,
     canonical_sha256,
 )
 from learning_store import LearningStore
 from learning_assets import PreparedLearningAsset, prepare_learning_assets
 from learning_client import CloudLearningClient, flush_outbox_async
-from attribute_runtime import AttributeRuntime, ReviewRequired
-from review_resume import persist_resume_and_ack, wait_for_review
+from attribute_runtime import AttributeRuntime, ReviewBatchRequired, ReviewRequired
+from historical_readbacks import load_verified_attribute_history
+from review_resume import persist_resume_and_ack, validate_resume
 from pdd_data import PddFields, parse_pdd_fields
 from pdd_form_listing import PddFormListing, PddFormListingError
 from platform_discovery import PlatformDiscoveryError
@@ -57,10 +61,13 @@ from platform_registry import (
     platform_cli_choices,
 )
 from size_image_recognition import (
+    ClothingSkuRecommendation,
     RecognitionError,
     SizeLength,
     SkuRecommendation,
+    recognize_clothing_recommendations,
     recognize_recommendations,
+    recognize_size_names,
     recognize_size_lengths,
 )
 from taobao_data import TaobaoFields, parse_taobao_fields
@@ -87,18 +94,27 @@ from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
 
 ERP_ENTRY_URL = "https://erp.superboss.cc/index.html#/index/"
 CENTER_URL = "https://scm.superboss.cc/supplier/prod/center"
-ERP_HOSTS = {"erp.superboss.cc", "erpa.superboss.cc"}
-SCM_HOSTS = {"scm.superboss.cc", "scma.superboss.cc"}
+# 快麦现在会按账号/环境把登录页跳到 erp、erpa 或 viperp，
+# 商品中心则可能使用 scm、scma 或 vipscm。这些都属于同一套快麦会话，
+# 不应因域名切换而把已登录页面误判为仍在登录。
+ERP_HOSTS = {"erp.superboss.cc", "erpa.superboss.cc", "viperp.superboss.cc"}
+SCM_HOSTS = {"scm.superboss.cc", "scma.superboss.cc", "vipscm.superboss.cc"}
 ERP_LOGIN_KEYCHAIN_SERVICE = "kuaimai-erp-auto-login"
 ERP_LOGIN_KEYCHAIN_LABEL = "快麦 ERP 自动登录"
 ERP_LOGIN_CREDENTIAL_RETRY_SECONDS = 30.0
-DEFAULT_EXCEL_URL = "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
+DEFAULT_EXCEL_URL = "smb://gongxiang/共享文件/谭/products/战浮+NGBL-2064/产品信息.xlsx"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 NEW_PRODUCT_SIZES = ("S", "M", "L", "XL", "2XL")
 
 _ERP_LOGIN_KEYCHAIN_PROMPTED_ACCOUNTS: set[str] = set()
 _ERP_LOGIN_CREDENTIAL_RETRY_AT: Dict[str, float] = {}
 _ERP_LOGIN_MISSING_CREDENTIAL_WARNED: set[str] = set()
+_ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS: set[str] = set()
+
+ERP_LOGIN_REJECTION_PATTERN = re.compile(
+    r"账号或密码(?:错误|不正确)|用户名或密码(?:错误|不正确)|"
+    r"密码错误|登录失败|登录名或密码错误|账户或密码错误"
+)
 
 
 def shared_runtime_root(script_dir: Path) -> Path:
@@ -130,11 +146,15 @@ DEFAULT_WXSPH_PUBLISH_SHOPS = (
 )
 DEFAULT_XHS_PUBLISH_SHOPS = (
     "钊叔的店",
-    "啊亮熟NEIGBORL的店",
     "钊叔制NEIGBORL的店",
-    "老朱和NEIGBORL的店",
-    "NEIGBORL钊叔旁伦的店",
+    "NEIGBORL钊叔劳伦的店",
 )
+# These aliases are read-only name normalization.  A shop is selected only
+# when its canonical name is also present in DEFAULT_XHS_PUBLISH_SHOPS.
+XHS_PUBLISH_SHOP_ALIASES = {
+    "啊亮熟NEIGBORL的店": "啊亮製NEIGBORL的店",
+    "NEIGBORL钊叔旁伦的店": "NEIGBORL钊叔劳伦的店",
+}
 DEFAULT_YOUZAN_PUBLISH_SHOPS = ("NEIGBORL官方旗舰店",)
 DEFAULT_JD_PUBLISH_SHOPS = ("NEIGBORL服饰旗舰店",)
 COMMERCE_PUBLISH_TARGETS = {
@@ -282,7 +302,7 @@ def center_navigation_url_for(value: str) -> str:
 
 def is_scm_cookie(cookie: Dict[str, Any]) -> bool:
     domain_label = (cookie.get("domain") or "").lstrip(".").split(".", 1)[0].casefold()
-    return domain_label.startswith("scm") or "scm" in (cookie.get("name") or "").casefold()
+    return "scm" in domain_label or "scm" in (cookie.get("name") or "").casefold()
 
 
 @dataclass(frozen=True)
@@ -306,6 +326,9 @@ class ProductData:
     youzan_fields: Optional[YouzanFields] = None
     jd_fields: Optional[JdFields] = None
     category_hints: Tuple[str, ...] = ()
+    garment_kind: str = "generic"
+    derived_size_names: Tuple[str, ...] = ()
+    colors: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.douyin_fields is None) != (self.douyin_assets is None):
@@ -361,6 +384,9 @@ def create_learning_context(
             run_id,
             fingerprint.product_version,
             device_id=store.get_or_create_device_id(),
+            verified_history=load_verified_attribute_history(
+                SCRIPT_DIR / "output/kuaimai/runs", product.style_code
+            ),
         )
     return LearningRunContext(
         store,
@@ -385,6 +411,14 @@ async def initialize_learning_run(
         or getattr(context, "initialized", False)
     ):
         return
+    verified_history = getattr(
+        getattr(context, "attribute_runtime", None), "verified_history", {}
+    )
+    if verified_history:
+        logger.info(
+            "已加载同款历史保存回读：%s 个平台属性，可直接复用时不再重复审核",
+            len(verified_history),
+        )
     await flush_outbox_async(
         context.store,
         context.client,
@@ -434,7 +468,16 @@ async def initialize_learning_run(
 
 
 def natural_key(path: Path) -> List[Any]:
-    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", path.name)]
+    # 文件名中的连字符和空格经常只是不同软件导出的分组分隔符。
+    # 例如黑朗姆详情图同时存在 ``未标题-1-恢复的_01`` 和
+    # ``未标题 2_01``；若直接比较原始前缀，空格会排在连字符前，
+    # 导致第 2 组跑到第 1 组前面。统一这两类分隔符后再做自然排序，
+    # 可按组号 1、2 以及组内编号 01、02 排列，同时保持普通文件名的
+    # ``1、2、10`` 数字排序行为。
+    # 这些分隔符不参与分组编号本身，直接忽略它们，避免
+    # ``未标题-1-恢复的`` 的连字符/后缀把组 1 排到 ``未标题2`` 后面。
+    name = re.sub(r"[-\s]+", "", path.name)
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", name)]
 
 
 def normalize_cell(value: Any) -> str:
@@ -453,28 +496,98 @@ def parse_category_hints(value: Any) -> Tuple[str, ...]:
     )
 
 
+def parse_spec_values(value: Any) -> Tuple[str, ...]:
+    """Read an ordered Excel specification list without silently deduplicating it."""
+    values = tuple(
+        part.strip()
+        for part in re.split(r"[/／,，、;；]", normalize_cell(value))
+        if part.strip()
+    )
+    normalized = tuple(re.sub(r"\s+", "", item).casefold() for item in values)
+    if len(set(normalized)) != len(normalized):
+        raise AutomationError("Excel 颜色规格存在重复值，无法安全匹配 SKU 图片顺序")
+    return values
+
+
 def normalize_price(value: Any) -> str:
-    text = normalize_cell(value).replace(",", "")
+    raw_text = normalize_cell(value).replace(",", "")
+    # 兼容运营在 Excel 中写成“690元”；仍然拒绝“690元起”等含糊价格。
+    text = raw_text[:-1].strip() if raw_text.endswith("元") else raw_text
     try:
         number = Decimal(text)
     except InvalidOperation as exc:
-        raise AutomationError(f"基本售价不是有效数字：{text!r}") from exc
+        raise AutomationError(f"基本售价不是有效数字：{raw_text!r}") from exc
     if number < 0:
-        raise AutomationError(f"基本售价不能小于 0：{text!r}")
+        raise AutomationError(f"基本售价不能小于 0：{raw_text!r}")
     return format(number.normalize(), "f")
 
 
+EXCEL_FIELD_COLUMN_HEADERS = frozenset(
+    ("属性", "属性筛选", "字段", "字段名", "属性名")
+)
+EXCEL_VALUE_COLUMN_HEADERS = frozenset(("内容", "值", "字段值", "属性值"))
+
+
+def _normalized_excel_header(value: Any) -> str:
+    return re.sub(r"\s+", "", normalize_cell(value)).casefold()
+
+
 def read_excel_fields(rows: Iterable[Sequence[Any]]) -> Dict[str, Any]:
-    """将产品信息 Excel 的键值行提取为可复用的原始字段映射。"""
+    """按表头列名读取字段，并兼容旧版无表头的键值行。"""
+    materialized_rows = [tuple(row) for row in rows]
+    field_column: Optional[int] = None
+    value_column: Optional[int] = None
+    data_start = 0
+
+    for row_index, row in enumerate(materialized_rows):
+        normalized = [_normalized_excel_header(cell) for cell in row]
+        field_matches = [
+            index
+            for index, value in enumerate(normalized)
+            if value in EXCEL_FIELD_COLUMN_HEADERS
+        ]
+        value_matches = [
+            index
+            for index, value in enumerate(normalized)
+            if value in EXCEL_VALUE_COLUMN_HEADERS
+        ]
+        if field_matches and value_matches and field_matches[0] != value_matches[0]:
+            field_column = field_matches[0]
+            value_column = value_matches[0]
+            data_start = row_index + 1
+            break
+
     fields: Dict[str, Any] = {}
-    for row in rows:
+    source_rows: Dict[str, int] = {}
+    for row_index, row in enumerate(materialized_rows[data_start:], start=data_start + 1):
         if not row:
             continue
-        key = normalize_cell(row[0] if len(row) > 0 else None)
+        if field_column is None:
+            key = normalize_cell(row[0] if row else None)
+            value = next(
+                (
+                    cell
+                    for cell in row[1:]
+                    if cell is not None and normalize_cell(cell)
+                ),
+                None,
+            )
+        else:
+            key = normalize_cell(
+                row[field_column] if field_column < len(row) else None
+            )
+            value = row[value_column] if value_column < len(row) else None
         if not key:
             continue
-        value = next((cell for cell in row[1:] if cell is not None and normalize_cell(cell)), None)
+
+        normalized_key = re.sub(r"\s+", "", key).casefold()
+        if normalized_key in source_rows:
+            raise AutomationError(
+                f"Excel 中存在重复字段 {key!r}："
+                f"第 {source_rows[normalized_key]} 行和第 {row_index} 行"
+            )
         fields[key] = value
+        source_rows[normalized_key] = row_index
     return fields
 
 
@@ -537,28 +650,43 @@ def read_product_data(
 
     fields = read_excel_fields(rows)
 
-    def field_containing(*aliases: str) -> Any:
-        for key, value in fields.items():
-            key_parts = [part.strip() for part in key.split("/")]
-            if any(alias == key or alias in key_parts for alias in aliases):
-                return value
-        return None
+    def field_value(*aliases: str) -> Any:
+        found = field_lookup(fields, *aliases)
+        return found[1] if found else None
 
-    # 用户明确指定商品名称使用 Excel 第二行。
-    title = normalize_cell(rows[1][1] if len(rows[1]) > 1 else None)
-    if not title:
-        title = normalize_cell(field_containing("商品名称"))
-    style_code = normalize_cell(field_containing("货号", "商家外部编码", "款式编码"))
-    price_value = field_containing("基本售价")
+    title = normalize_cell(field_value("商品标题", "商品名称", "宝贝标题"))
+    style_code = normalize_cell(field_value("货号", "商家外部编码", "款式编码"))
+    price_value = field_value("基本售价", "吊牌价", "商品价格", "价格")
 
     if not title:
-        raise AutomationError("Excel 第二行没有商品名称")
+        raise AutomationError("Excel 中找不到商品标题/商品名称/宝贝标题")
     if not style_code:
         raise AutomationError("Excel 中找不到货号/款式编码")
     if price_value is None or normalize_cell(price_value) == "":
         raise AutomationError("Excel 中找不到“吊牌价/价格/基本售价”")
 
     product_dir = excel_path.parent
+    category_hints = parse_category_hints(field_value("商品分类"))
+    colors = parse_spec_values(field_value("颜色"))
+    profile = category_profile(category_hints, title)
+    derived_size_names: Tuple[str, ...] = ()
+    size_chart_dir = product_dir / "尺码信息表"
+    if (
+        field_value("尺码") is None
+        and profile.supports_letter_size_chart
+        and size_chart_dir.is_dir()
+    ):
+        size_chart_images = list_images(size_chart_dir, "尺码信息表")
+        if len(size_chart_images) != 1:
+            raise AutomationError(
+                "Excel 缺少尺码时，尺码信息表文件夹必须恰好 1 张图片，"
+                f"当前为 {len(size_chart_images)} 张"
+            )
+        derived_size_names = recognize_size_names(
+            size_chart_images[0], profile.garment_kind
+        )
+        fields = dict(fields)
+        fields["尺码"] = "/".join(derived_size_names)
     main_dir = find_image_dir(
         product_dir,
         ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1"),
@@ -603,12 +731,15 @@ def read_product_data(
         xhs_fields=parse_xhs_fields(fields),
         youzan_fields=parse_youzan_fields(fields),
         jd_fields=parse_jd_fields(fields),
-        category_hints=parse_category_hints(field_containing("商品分类")),
+        category_hints=category_hints,
+        garment_kind=profile.garment_kind,
+        derived_size_names=derived_size_names,
+        colors=colors,
     )
 
 
 def read_new_product_seed(excel_path: Path) -> ProductData:
-    """按视频只建基础链接：名称 1、一张主图、固定规格、价格 0。"""
+    """只建基础链接：名称 1、一张主图、Excel 颜色、固定尺码、价格 0。"""
     from openpyxl import load_workbook
 
     workbook = load_workbook(excel_path, data_only=True, read_only=True)
@@ -620,12 +751,16 @@ def read_new_product_seed(excel_path: Path) -> ProductData:
     style_code = normalize_cell(style_field[1] if style_field else None)
     if not style_code:
         raise AutomationError("新增链接需要 Excel 中的货号/款式编码")
+    color_field = field_lookup(fields, "颜色")
+    colors = parse_spec_values(color_field[1] if color_field else None)
+    if not colors:
+        raise AutomationError("新增链接需要 Excel 中的颜色规格")
     directory = find_image_dir(
         excel_path.parent, ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1", "主图"), "主图"
     )
     return ProductData(
         excel_path, excel_path.parent, "1", style_code, "0",
-        list_images(directory, "主图")[:1], [], [], [],
+        list_images(directory, "主图")[:1], [], [], [], colors=colors,
     )
 
 
@@ -668,15 +803,36 @@ def product_summary(product: ProductData) -> Dict[str, Any]:
 def recognize_product_recommendations(
     product: ProductData,
     artifact_dir: Path,
-) -> tuple[SkuRecommendation, ...]:
+) -> tuple[Any, ...]:
     """在打开浏览器前完成本地尺码识别，失败则不进入页面。"""
     if product.douyin_fields is None or product.douyin_assets is None:
         return ()
-    recommendations = recognize_recommendations(
-        product.douyin_assets.size_chart_image,
-        product.douyin_assets.height_weight_image,
-        product.douyin_fields.sizes,
-    )
+    if product.garment_kind == "pants":
+        recommendations = recognize_recommendations(
+            product.douyin_assets.size_chart_image,
+            product.douyin_assets.height_weight_image,
+            product.douyin_fields.sizes,
+        )
+    elif product.garment_kind == "clothing":
+        recommendations = recognize_clothing_recommendations(
+            product.douyin_assets.size_chart_image,
+            product.douyin_assets.height_weight_image,
+            product.douyin_fields.sizes,
+        )
+    else:
+        (artifact_dir / "ocr-result.json").write_text(
+            json.dumps(
+                {
+                    "status": "skipped",
+                    "reason": "unsupported_garment_kind",
+                    "garment_kind": product.garment_kind,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return ()
     payload = [asdict(item) for item in recommendations]
     (artifact_dir / "ocr-result.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -864,13 +1020,20 @@ async def write_tmall_review_required(
     await safe_screenshot(page, artifact_dir / "tmall-review-required.png")
 
 
+def resolve_taobao_category_mode(product: ProductData, category_mode: str) -> str:
+    if category_mode != "auto":
+        return category_mode
+    return "casual-pants" if product.garment_kind == "pants" else "recommended"
+
+
 def taobao_garment_kind(product: ProductData, category_mode: str) -> str:
     if category_mode == "casual-pants":
         return "pants"
-    category_text = " ".join(product.category_hints)
-    if "裤" in category_text or "裤" in product.title:
-        return "pants"
-    return "clothing"
+    if product.garment_kind in {"pants", "clothing"}:
+        return product.garment_kind
+    raise AutomationError(
+        "当前品类无法确定淘宝尺码表是衣长还是裤长，请进入运营审核"
+    )
 
 
 def recognize_taobao_size_lengths(
@@ -1093,6 +1256,17 @@ async def visible_text_across_frames(page: Any, text: str) -> Optional[Any]:
     for frame in list(page.frames):
         try:
             candidate = await first_visible(frame.get_by_text(text, exact=True))
+            if candidate is None:
+                # 部分账号的 ERP 首页会在文案后附加环境标识（例如“快麦通商品中心”）；
+                # 仅放宽为以菜单名开头，避免用整个 body 的模糊文本误触发。
+                candidate = await first_visible(
+                    frame.get_by_text(
+                        re.compile(
+                            rf"^\s*{re.escape(text)}"
+                            rf"(?:\s|[|｜>/（(]|商品中心|$)"
+                        )
+                    )
+                )
             if candidate is not None:
                 return candidate
         except Exception:
@@ -1127,11 +1301,35 @@ def _read_macos_keychain_password(account: str) -> str:
     return result.stdout.rstrip("\r\n")
 
 
+def _delete_macos_keychain_password(account: str) -> bool:
+    """Delete only this ERP account's saved credential."""
+    if sys.platform != "darwin" or not account:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                account,
+                "-s",
+                ERP_LOGIN_KEYCHAIN_SERVICE,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _prompt_and_store_macos_keychain_password(
     account: str,
     logger: logging.Logger,
 ) -> bool:
-    """首次在运行终端安全录入密码，交由 security 写入钥匙串。"""
+    """Prompt securely and keep the Keychain item only after confirmation."""
     if (
         sys.platform != "darwin"
         or not account
@@ -1141,31 +1339,53 @@ def _prompt_and_store_macos_keychain_password(
         return False
     _ERP_LOGIN_KEYCHAIN_PROMPTED_ACCOUNTS.add(account)
     logger.warning(
-        "首次配置快麦 ERP 自动登录：请在当前运行终端安全输入一次密码；"
-        "密码只保存到 macOS 钥匙串，不写入项目文件和日志"
+        "配置快麦 ERP 自动登录：系统将提示输入密码，随后程序会要求再次输入确认；"
+        "两次一致才保存到 macOS 钥匙串，密码不会写入项目文件或日志"
     )
-    try:
-        result = subprocess.run(
-            [
-                "/usr/bin/security",
-                "add-generic-password",
-                "-U",
-                "-a",
-                account,
-                "-s",
-                ERP_LOGIN_KEYCHAIN_SERVICE,
-                "-l",
-                ERP_LOGIN_KEYCHAIN_LABEL,
-                "-w",
-            ],
-            check=False,
-        )
-    except OSError:
-        return False
-    if result.returncode == 0:
-        logger.info("macOS 钥匙串已保存快麦 ERP 自动登录凭据")
-        return True
-    logger.warning("未完成 macOS 钥匙串密码录入，本次保留手工登录等待")
+    for attempt in range(1, 4):
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/bin/security",
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    account,
+                    "-s",
+                    ERP_LOGIN_KEYCHAIN_SERVICE,
+                    "-l",
+                    ERP_LOGIN_KEYCHAIN_LABEL,
+                    "-w",
+                ],
+                check=False,
+            )
+        except OSError:
+            return False
+        if result.returncode != 0:
+            logger.warning("未完成 macOS 钥匙串密码录入，本次保留手工登录等待")
+            return False
+
+        stored_password = _read_macos_keychain_password(account)
+        if not stored_password:
+            _delete_macos_keychain_password(account)
+            logger.warning("无法回读刚保存的 ERP 凭据，已撤销本次保存")
+            return False
+        try:
+            repeated_password = getpass.getpass("请再次输入快麦 ERP 登录密码以确认: ")
+        except (EOFError, KeyboardInterrupt):
+            repeated_password = ""
+        matches = bool(repeated_password) and repeated_password == stored_password
+        del repeated_password
+        del stored_password
+        if matches:
+            logger.info("两次密码输入一致，macOS 钥匙串已保存快麦 ERP 自动登录凭据")
+            return True
+
+        _delete_macos_keychain_password(account)
+        logger.warning("两次密码输入不一致，已撤销保存（第 %s/3 次）", attempt)
+
+    _ERP_LOGIN_KEYCHAIN_PROMPTED_ACCOUNTS.discard(account)
+    logger.warning("密码连续三次确认不一致，本次保留手工登录等待")
     return False
 
 
@@ -1216,6 +1436,64 @@ async def _erp_login_account(frame: Any) -> str:
     return os.environ.get("KUAIMAI_ERP_ACCOUNT", "").strip()
 
 
+async def invalidate_rejected_erp_keychain_credential(
+    page: Any,
+    logger: logging.Logger,
+) -> bool:
+    """Remove a Keychain password only after the ERP page explicitly rejects it."""
+    if not _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS:
+        return False
+
+    rejection_seen = False
+    rejected_account = ""
+    selectors = (
+        ".el-message--error:visible, .el-form-item__error:visible, "
+        "[role='alert']:visible, .login-error:visible, .error-msg:visible"
+    )
+    for frame in list(page.frames):
+        try:
+            messages = frame.locator(selectors)
+            for index in range(await messages.count()):
+                text = re.sub(r"\s+", "", (await messages.nth(index).inner_text()).strip())
+                if ERP_LOGIN_REJECTION_PATTERN.search(text):
+                    rejection_seen = True
+                    account = await _erp_login_account(frame)
+                    if account in _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS:
+                        rejected_account = account
+                    break
+        except Exception:
+            continue
+        if rejection_seen:
+            break
+
+    if not rejection_seen:
+        return False
+    if not rejected_account and len(_ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS) == 1:
+        rejected_account = next(iter(_ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS))
+    if not rejected_account:
+        logger.warning("ERP 页面拒绝了自动登录凭据，但无法唯一确定对应账号；已停止自动重试")
+        _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS.clear()
+        return True
+
+    deleted = _delete_macos_keychain_password(rejected_account)
+    _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS.discard(rejected_account)
+    _ERP_LOGIN_KEYCHAIN_PROMPTED_ACCOUNTS.discard(rejected_account)
+    _ERP_LOGIN_CREDENTIAL_RETRY_AT.pop(rejected_account, None)
+    _ERP_LOGIN_MISSING_CREDENTIAL_WARNED.discard(rejected_account)
+    if deleted:
+        logger.warning(
+            "快麦 ERP 明确返回账号或密码错误；已删除该账号的错误钥匙串凭据，"
+            "请按终端提示重新输入并确认"
+        )
+    else:
+        _ERP_LOGIN_CREDENTIAL_RETRY_AT[rejected_account] = float("inf")
+        logger.warning(
+            "快麦 ERP 明确返回账号或密码错误，但钥匙串凭据删除失败；"
+            "已停止使用该凭据，请手工登录后重试"
+        )
+    return True
+
+
 async def try_erp_login_with_agreement(page: Any, logger: logging.Logger) -> bool:
     """在已跳转的快麦 ERP 登录页补全密码、勾选协议并提交。
 
@@ -1229,6 +1507,8 @@ async def try_erp_login_with_agreement(page: Any, logger: logging.Logger) -> boo
             if agreement is None:
                 continue
 
+            password_source = ""
+            credential_account = ""
             passwords = frame.locator('input[type="password"]:visible')
             if await passwords.count():
                 if await passwords.count() != 1:
@@ -1251,6 +1531,7 @@ async def try_erp_login_with_agreement(page: Any, logger: logging.Logger) -> boo
                         continue
                     await password_input.fill(password)
                     del password
+                    credential_account = account
                     _ERP_LOGIN_MISSING_CREDENTIAL_WARNED.discard(account)
                     logger.info(
                         "已从%s读取快麦 ERP 自动登录凭据",
@@ -1296,6 +1577,8 @@ async def try_erp_login_with_agreement(page: Any, logger: logging.Logger) -> boo
             if login is None:
                 continue
             await login.click()
+            if password_source == "keychain" and credential_account:
+                _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS.add(credential_account)
             logger.info("检测到快麦 ERP 登录页：已勾选用户协议并点击登录")
             return True
         except Exception as exc:
@@ -1570,9 +1853,33 @@ async def enter_kuaimai_from_erp(
     await page.goto(ERP_ENTRY_URL, wait_until="domcontentloaded", timeout=operation_timeout_ms)
 
     async def erp_home_ready() -> bool:
-        if urlsplit(page.url).hostname not in ERP_HOSTS:
+        parsed = urlsplit(page.url)
+        if parsed.hostname not in ERP_HOSTS:
             return False
-        return await visible_text_across_frames(page, "快麦通") is not None
+        if await visible_text_across_frames(page, "快麦通") is not None:
+            return True
+
+        # 登录成功后首页的菜单文案可能还在异步渲染。只要已离开登录路径且登录表单不再可见，就先认定 ERP 登录阶段已完成；
+        # 后续的“快麦通”入口稳定等待会再负责等待菜单出现。
+        if parsed.path.casefold().startswith("/login"):
+            return False
+        for frame in list(page.frames):
+            try:
+                password_inputs = frame.locator('input[type="password"]:visible')
+                login_buttons = frame.locator(
+                    "#login-btn:visible, button:visible"
+                ).filter(has_text=re.compile(r"^\s*登\s*录\s*$"))
+                if await password_inputs.count() or await login_buttons.count():
+                    return False
+            except Exception:
+                continue
+        return parsed.path.casefold() in {
+            "",
+            "/",
+            "/index.html",
+            "/simple.html",
+            "/index",
+        }
 
     if not await erp_home_ready():
         login_clicked = await try_erp_login_with_agreement(page, logger)
@@ -1591,7 +1898,10 @@ async def enter_kuaimai_from_erp(
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
                 if await erp_home_ready():
+                    _ERP_LOGIN_PENDING_KEYCHAIN_ACCOUNTS.clear()
                     break
+                if await invalidate_rejected_erp_keychain_credential(page, logger):
+                    login_clicked = False
                 if not login_clicked:
                     login_clicked = await try_erp_login_with_agreement(page, logger)
                 await asyncio.sleep(1)
@@ -1821,6 +2131,19 @@ async def first_visible(locator: Any) -> Optional[Any]:
     return None
 
 
+async def blocking_drawer_loading_mask_count(drawer: Any) -> int:
+    """Count only loading masks that can block the editor as a whole.
+
+    The live base form keeps a small loading mask inside every SKU numeric
+    input (``.el-input-digit``) even after the form is usable.  Those local
+    masks must not hold the entire editor readiness gate open.
+    """
+    masks = drawer.locator(".el-loading-mask:visible")
+    return await masks.evaluate_all(
+        "masks => masks.filter(mask => !mask.closest('.el-input-digit')).length"
+    )
+
+
 async def open_product_editor(
     page: Any,
     style_code: str,
@@ -1890,7 +2213,7 @@ async def open_product_editor(
     while time.monotonic() < ready_deadline:
         try:
             last_value = (await style_input_in_drawer.input_value()).strip()
-            loading_masks = await drawer.locator(".el-loading-mask:visible").count()
+            loading_masks = await blocking_drawer_loading_mask_count(drawer)
             if last_value == style_code and loading_masks == 0:
                 break
         except Exception:
@@ -1928,7 +2251,7 @@ async def wait_for_base_form_ready_after_save(
             last_title = (
                 await title_item.locator("input").first.input_value()
             ).strip()
-            loading_masks = await drawer.locator(".el-loading-mask:visible").count()
+            loading_masks = await blocking_drawer_loading_mask_count(drawer)
             if (
                 last_style == style_code
                 and last_title == title
@@ -2027,8 +2350,15 @@ async def wait_for_image_uploads(
     expected: int,
     label: str,
     timeout_seconds: int,
+    *,
+    retry_idle_upload: Any = None,
+    idle_retry_seconds: float = 20,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
+    idle_since = time.monotonic()
+    error_since: Optional[float] = None
+    error_logged = False
+    retried = False
     last_count = -1
     while time.monotonic() < deadline:
         count = await scope.locator(".sc-upload .file-img").count()
@@ -2037,10 +2367,40 @@ async def wait_for_image_uploads(
             last_count = count
         upload_errors = await scope.locator(".file-input.error-warp").count()
         uploading = await scope.get_by_text("上传中", exact=True).count()
-        if upload_errors:
-            raise AutomationError(f"{label}上传失败，页面显示 {upload_errors} 个错误位")
+        # 页面在必填图片为空时就会预先加上 error-warp；它不是本次
+        # 上传失败信号。先判断目标图片是否已经出现，再给前端上传/校验
+        # 回调一个宽限窗口，避免把初始红框误判成接口错误。
         if count == expected and uploading == 0:
             return
+        if upload_errors:
+            if error_since is None:
+                error_since = time.monotonic()
+            if not error_logged:
+                logging.getLogger("kuaimai_erp").info(
+                    "%s检测到页面必填红框，等待上传结果后再判定（当前 %s/%s）",
+                    label,
+                    count,
+                    expected,
+                )
+                error_logged = True
+            if (
+                time.monotonic() - error_since >= min(10.0, max(3.0, timeout_seconds * 0.1))
+                and count == 0
+                and uploading == 0
+            ):
+                raise AutomationError(
+                    f"{label}上传失败，页面显示 {upload_errors} 个错误位"
+                )
+        else:
+            error_since = None
+        if count or uploading:
+            idle_since = time.monotonic()
+        elif retry_idle_upload is not None and not retried and time.monotonic() - idle_since >= idle_retry_seconds:
+            retried = True
+            logging.getLogger("kuaimai_erp").warning(
+                "%s：持续 0/%s 且无上传中状态，重新定位上传控件并重试一次", label, expected
+            )
+            await retry_idle_upload()
         await asyncio.sleep(0.5)
     raise AutomationError(f"{label}上传超时，已完成 {last_count}/{expected}")
 
@@ -2169,6 +2529,7 @@ async def sync_image_group(
     timeout_seconds: int,
     *,
     force_replace: bool = False,
+    normalize_small_images: bool = False,
 ) -> str:
     """Make one image group match the expected local image count and order.
 
@@ -2228,10 +2589,49 @@ async def sync_image_group(
     with tempfile.TemporaryDirectory(prefix="kuaimai-upload-") as temp_dir:
         upload_paths = []
         converted_jfif = 0
+        normalized_small_images = 0
         for index, path in enumerate(paths):
             suffix = path.suffix.casefold()
             if not accepted_suffixes or accepts_any_image or suffix in accepted_suffixes:
-                upload_paths.append(path)
+                upload_path = path
+                if normalize_small_images and suffix in {".jpg", ".jpeg", ".png"}:
+                    # 快麦水洗标控件会在前端先校验最小尺寸；过小的纯白
+                    # 吊牌图会被标红且完全不发上传请求。只对该显式开启
+                    # 的字段生成临时放大副本，不改动共享盘原文件。
+                    try:
+                        import cv2
+
+                        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                        if image is not None and min(image.shape[:2]) < 800:
+                            scale = 800 / min(image.shape[:2])
+                            height = max(800, int(round(image.shape[0] * scale)))
+                            width = max(800, int(round(image.shape[1] * scale)))
+                            resized = cv2.resize(
+                                image,
+                                (width, height),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                            target = Path(temp_dir) / f"normalized-{index + 1}{suffix}"
+                            if cv2.imwrite(str(target), resized):
+                                upload_path = target
+                                normalized_small_images += 1
+                                logging.getLogger("kuaimai_erp").info(
+                                    "%s：第 %s 张图片尺寸 %sx%s 过小，"
+                                    "已生成临时 %sx%s 副本上传（原文件不变）",
+                                    label,
+                                    index + 1,
+                                    image.shape[1],
+                                    image.shape[0],
+                                    width,
+                                    height,
+                                )
+                    except Exception as exc:
+                        logging.getLogger("kuaimai_erp").warning(
+                            "%s：小尺寸图片临时放大失败，继续使用原文件：%s",
+                            label,
+                            exc,
+                        )
+                upload_paths.append(upload_path)
                 continue
             if (
                 suffix == ".jfif"
@@ -2252,9 +2652,389 @@ async def sync_image_group(
                 label,
                 converted_jfif,
             )
-        await file_input.set_input_files([str(path) for path in upload_paths])
-        await wait_for_image_uploads(item, expected_count, label, timeout_seconds)
+        async def trigger_upload() -> None:
+            await item.scroll_into_view_if_needed()
+            # Deleting the last image can recreate the upload component.
+            await item.evaluate("e => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+            current_input = item.locator('input[type="file"]').first
+            # 空上传位不先写入空文件。Element Upload 会把这次清空事件
+            # 当成一次校验失败，导致后续真实文件事件被吞掉且不发请求。
+            # 只有控件本身仍有文件时才清空，再写入新文件。
+            try:
+                current_count = await current_input.evaluate(
+                    "input => input.files ? input.files.length : 0"
+                )
+            except Exception:
+                current_count = 0
+            if current_count:
+                await current_input.set_input_files([])
+            file_values = [str(path) for path in upload_paths]
+            # 快麦当前上传组件的“本地上传”按钮会在点击时注册页面侧
+            # change/upload 处理器。直接给隐藏 input 设置文件虽然能回读
+            # files，但改版后的组件不会因此发起上传请求；优先走和人工
+            # 操作相同的 file chooser 流程，找不到按钮时再回退旧路径。
+            # “本地上传”文字通常只在上传占位图 hover 后显示；人工操作时
+            # 鼠标移到图片区域会先触发这一层，所以脚本也要先 hover。
+            upload_root = item.locator(".file-input:visible").first
+            if not await upload_root.count():
+                upload_root = item.locator(".sc-upload:visible").first
+            if await upload_root.count():
+                try:
+                    logging.getLogger("kuaimai_erp").info(
+                        "%s：准备悬停上传区域",
+                        label,
+                    )
+                    await upload_root.hover(timeout=3000, force=True)
+                    await page.wait_for_timeout(100)
+                    logging.getLogger("kuaimai_erp").info(
+                        "%s：上传区域已悬停",
+                        label,
+                    )
+                except Exception:
+                    logging.getLogger("kuaimai_erp").warning(
+                        "%s：悬停上传区域失败，继续尝试文件控件",
+                        label,
+                    )
+            upload_button = item.locator(".location-upload:visible").first
+            used_file_chooser = False
+            if await upload_button.count():
+                try:
+                    async with page.expect_file_chooser(timeout=5000) as chooser_info:
+                        await upload_button.click()
+                    chooser = await chooser_info.value
+                    await chooser.set_files(file_values)
+                    used_file_chooser = True
+                    logging.getLogger("kuaimai_erp").info(
+                        "%s：已通过“本地上传”按钮触发文件选择器",
+                        label,
+                    )
+                except Exception as exc:
+                    logging.getLogger("kuaimai_erp").warning(
+                        "%s：文件选择器流程失败，回退直接写入控件：%s",
+                        label,
+                        exc,
+                    )
+            if not used_file_chooser:
+                await current_input.set_input_files(file_values)
+            try:
+                file_count = await current_input.evaluate(
+                    "input => input.files ? input.files.length : 0"
+                )
+                logging.getLogger("kuaimai_erp").info(
+                    "%s：已将 %s 个本地文件写入页面上传控件",
+                    label,
+                    file_count,
+                )
+            except Exception as exc:
+                logging.getLogger("kuaimai_erp").warning(
+                    "%s：已调用文件上传，但无法回读控件文件数：%s",
+                    label,
+                    exc,
+                )
+
+        upload_events = []
+
+        def record_upload_response(response: Any) -> None:
+            try:
+                request = response.request
+                if request.resource_type in {"xhr", "fetch"}:
+                    upload_events.append(
+                        f"{request.method} {response.status} {response.url}"
+                    )
+            except Exception:
+                pass
+
+        def record_upload_failure(request: Any) -> None:
+            try:
+                upload_events.append(f"FAILED {request.method} {request.url}")
+            except Exception:
+                pass
+
+        page.on("response", record_upload_response)
+        page.on("requestfailed", record_upload_failure)
+        try:
+            await trigger_upload()
+            await wait_for_image_uploads(
+                item, expected_count, label, timeout_seconds,
+                retry_idle_upload=trigger_upload if label == "小红书3:4主图" else None,
+            )
+        except Exception:
+            if upload_events:
+                logging.getLogger("kuaimai_erp").error(
+                    "%s上传相关请求：%s", label, "；".join(upload_events[-12:])
+                )
+            raise
+        finally:
+            page.remove_listener("response", record_upload_response)
+            page.remove_listener("requestfailed", record_upload_failure)
     return "replaced"
+
+
+async def base_specification_value_group(drawer: Any, spec_name: str) -> Any:
+    """Locate one base-data specification value group by its exact spec name."""
+    result = await drawer.evaluate(
+        """
+        (root, expectedName) => {
+          const marker = 'data-codex-base-spec-values';
+          root.querySelectorAll(`[${marker}]`).forEach(node => node.removeAttribute(marker));
+          const clean = value => String(value || '').replace(/[\\s:：]+/g, '');
+          const visible = element => {
+            const style = getComputedStyle(element);
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && element.getClientRects().length > 0;
+          };
+          const matches = [];
+          const titles = [...root.querySelectorAll('.block-specification .title-bg')]
+            .filter(visible);
+          for (const title of titles) {
+            const nameInput = title.querySelector('input');
+            if (!nameInput || clean(nameInput.value) !== clean(expectedName)) continue;
+            let values = title.parentElement?.querySelector(':scope > .specification-value');
+            if (!values) {
+              const block = title.closest('.block-specification');
+              const blockTitles = block ? [...block.querySelectorAll('.title-bg')] : [];
+              const blockValues = block ? [...block.querySelectorAll('.specification-value')] : [];
+              const index = blockTitles.indexOf(title);
+              values = index >= 0 ? blockValues[index] : null;
+            }
+            if (values && visible(values)) matches.push(values);
+          }
+          const unique = [...new Set(matches)];
+          if (unique.length === 1) unique[0].setAttribute(marker, expectedName);
+          return {titleCount: titles.length, matchCount: unique.length};
+        }
+        """,
+        spec_name,
+    )
+    match_count = int(result.get("matchCount", 0))
+    if match_count != 1:
+        raise AutomationError(
+            f"基础资料规格名“{spec_name}”无法唯一定位：匹配到 {match_count} 组"
+        )
+    return drawer.locator(
+        f'[data-codex-base-spec-values="{spec_name}"]'
+    ).first
+
+
+async def read_base_specification_values(
+    drawer: Any,
+    spec_name: str,
+) -> Tuple[str, ...]:
+    group = await base_specification_value_group(drawer, spec_name)
+    values = await group.locator(
+        ".specification-value-flex_input input:not([type=checkbox])"
+    ).evaluate_all("inputs => inputs.map(input => input.value.trim())")
+    return tuple(str(value).strip() for value in values)
+
+
+async def sync_base_color_spec_values(
+    drawer: Any,
+    expected_colors: Sequence[str],
+    *,
+    timeout_seconds: float = 5.0,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper for the generic specification reconciler."""
+    return await sync_base_specification_values(
+        drawer,
+        "颜色",
+        expected_colors,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _delete_base_specification_value(
+    drawer: Any,
+    spec_name: str,
+    index: int,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Delete exactly one visible specification value and verify the row count."""
+    group = await base_specification_value_group(drawer, spec_name)
+    before = await read_base_specification_values(drawer, spec_name)
+    if not (0 <= index < len(before)):
+        raise AutomationError(
+            f"基础资料{spec_name}规格删除下标越界：{index} / {len(before)}"
+        )
+    marker = "data-codex-base-spec-delete"
+    result = await group.evaluate(
+        """
+        (root, payload) => {
+          root.querySelectorAll(`[${payload.marker}]`).forEach(node =>
+            node.removeAttribute(payload.marker));
+          const inputs = [...root.querySelectorAll(
+            '.specification-value-flex_input input:not([type=checkbox])'
+          )];
+          const input = inputs[payload.index];
+          if (!input) return {inputFound: false, candidateCount: 0};
+          let item = input.closest('.specification-value-flex_item');
+          if (!item) {
+            let node = input.parentElement;
+            while (node && node !== root) {
+              if (node.querySelectorAll(
+                '.specification-value-flex_input input:not([type=checkbox])'
+              ).length === 1) {
+                item = node;
+                if (node.parentElement === root ||
+                    node.parentElement?.classList.contains('specification-value-flex')) break;
+              }
+              node = node.parentElement;
+            }
+          }
+          if (!item) return {inputFound: true, candidateCount: 0};
+          const normalize = value => String(value || '').replace(/\s+/g, '').toLowerCase();
+          const candidates = [...item.querySelectorAll('button,[role=button],i,span,svg')]
+            .filter(node => {
+              if (node.contains(input)) return false;
+              const token = normalize([
+                node.getAttribute('title'),
+                node.getAttribute('aria-label'),
+                node.className && String(node.className),
+                node.textContent,
+              ].join(' '));
+              return /删除|移除|delete|remove|close|shanchu|jian|/.test(token);
+            });
+          const unique = [...new Set(candidates)].filter(node =>
+            !candidates.some(other => other !== node && node.contains(other)));
+          if (unique.length === 1) unique[0].setAttribute(payload.marker, '1');
+          return {inputFound: true, candidateCount: unique.length};
+        }
+        """,
+        {"marker": marker, "index": index},
+    )
+    if not result.get("inputFound") or int(result.get("candidateCount", 0)) != 1:
+        raise AutomationError(
+            f"基础资料{spec_name}第 {index + 1} 个规格值找不到唯一删除控件"
+        )
+    target = group.locator(f'[{marker}="1"]')
+    try:
+        # The close icon is intentionally hidden until hover on some ERP
+        # builds.  Dispatch its native DOM click and use the resulting value
+        # count as the authoritative success signal.
+        await target.evaluate("node => node.click()")
+    except Exception:
+        current = await read_base_specification_values(drawer, spec_name)
+        if len(current) != len(before) - 1:
+            raise
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = await read_base_specification_values(drawer, spec_name)
+        if len(current) == len(before) - 1:
+            return
+        await asyncio.sleep(0.05)
+    raise AutomationError(f"删除基础资料{spec_name}规格值后数量未减少")
+
+
+async def sync_base_specification_values(
+    drawer: Any,
+    spec_name: str,
+    expected_values: Sequence[str],
+    *,
+    timeout_seconds: float = 5.0,
+) -> Dict[str, Any]:
+    """Reconcile one base specification to the ordered current-product values."""
+    expected = tuple(
+        str(value).strip() for value in expected_values if str(value).strip()
+    )
+    if not expected:
+        raise AutomationError(f"当前商品没有可用于基础资料的{spec_name}规格值")
+    if len({re.sub(r"\s+", "", value).casefold() for value in expected}) != len(expected):
+        raise AutomationError(
+            f"当前商品{spec_name}规格存在重复值，无法安全匹配 SKU 顺序"
+        )
+
+    before = await read_base_specification_values(drawer, spec_name)
+    removed = 0
+    # Remove surplus values from the end before rewriting the retained slots.
+    # This makes the final sequence authoritative without depending on a fixed
+    # pants/outerwear size template, while preserving the first-spec image order.
+    while len(await read_base_specification_values(drawer, spec_name)) > len(expected):
+        current = await read_base_specification_values(drawer, spec_name)
+        await _delete_base_specification_value(
+            drawer,
+            spec_name,
+            len(current) - 1,
+            timeout_seconds=timeout_seconds,
+        )
+        removed += 1
+
+    group = await base_specification_value_group(drawer, spec_name)
+    inputs = group.locator(
+        ".specification-value-flex_input input:not([type=checkbox])"
+    )
+    current_editability = await inputs.evaluate_all(
+        "inputs => inputs.map(input => ({disabled: input.disabled, readOnly: input.readOnly}))"
+    )
+    if any(item.get("disabled") or item.get("readOnly") for item in current_editability):
+        raise AutomationError(f"基础资料{spec_name}规格值存在不可编辑输入框，未强制覆盖")
+
+    current_count = len(await read_base_specification_values(drawer, spec_name))
+    missing = len(expected) - current_count
+    if missing:
+        add_buttons = group.get_by_role("button", name="添加规格值", exact=True)
+        if await add_buttons.count() != 1:
+            raise AutomationError(
+                f"基础资料还需新增 {missing} 个{spec_name}，但找不到唯一的“添加规格值”按钮"
+            )
+        for _index in range(missing):
+            previous_count = len(await read_base_specification_values(drawer, spec_name))
+            await add_buttons.click()
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                current = await read_base_specification_values(drawer, spec_name)
+                if len(current) == previous_count + 1:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AutomationError(
+                    f"点击“添加规格值”后，基础资料没有新增{spec_name}输入框"
+                )
+            group = await base_specification_value_group(drawer, spec_name)
+            add_buttons = group.get_by_role("button", name="添加规格值", exact=True)
+
+    changed = 0
+    for index, expected_value in enumerate(expected):
+        group = await base_specification_value_group(drawer, spec_name)
+        inputs = group.locator(
+            ".specification-value-flex_input input:not([type=checkbox])"
+        )
+        if await inputs.count() != len(expected):
+            raise AutomationError(f"基础资料{spec_name}规格在填写过程中数量发生变化")
+        input_box = inputs.nth(index)
+        current_value = (await input_box.input_value()).strip()
+        if current_value == expected_value:
+            continue
+        if await input_box.is_disabled() or await input_box.is_editable() is False:
+            raise AutomationError(
+                f"基础资料第 {index + 1} 个{spec_name}规格值不可编辑"
+            )
+        await input_box.fill(expected_value)
+        await input_box.press("Tab")
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            actual = await read_base_specification_values(drawer, spec_name)
+            if len(actual) == len(expected) and actual[index] == expected_value:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AutomationError(
+                f"基础资料{spec_name}规格值填写后回读失败：期望 {expected_value!r}"
+            )
+        changed += 1
+
+    after = await read_base_specification_values(drawer, spec_name)
+    if after != expected:
+        raise AutomationError(
+            f"基础资料{spec_name}规格与当前商品顺序不一致："
+            f"页面 {after}，目标 {expected}"
+        )
+    return {
+        "before": before,
+        "after": after,
+        "changed": changed,
+        "added": missing,
+        "removed": removed,
+    }
 
 
 async def replace_sku_images(
@@ -2608,13 +3388,7 @@ async def fill_new_product_form(page: Any, drawer: Any, product: ProductData, ar
     if await names.count() != 2 or await names.nth(0).input_value() != "颜色" or await names.nth(1).input_value() != "尺码":
         raise AutomationError("新增页面默认规格不是颜色、尺码，请复核页面")
     values = spec.locator('.specification-value')
-    color = values.nth(0)
-    if await color.locator('.specification-value-flex_input input').count():
-        raise AutomationError("新增页面已有颜色内容，未覆盖未完成的输入")
-    await color.get_by_role("button", name="添加规格值", exact=True).click()
-    color_input = color.locator('.specification-value-flex_input input')
-    await color_input.fill("军绿色")
-    await color_input.press("Tab")
+    color_report = await sync_base_color_spec_values(drawer, product.colors)
 
     # 按用户指定的两个默认模板操作，不逐个录入尺码、不改编码规则。
     await spec.get_by_role("button", name="填充常用规格").nth(1).click()
@@ -2641,7 +3415,12 @@ async def fill_new_product_form(page: Any, drawer: Any, product: ProductData, ar
     )
     await generator.get_by_role("button", name=re.compile(r"^确\s*定$")).click()
     await generator.wait_for(state="hidden", timeout=args.timeout * 1000)
-    return {"size_template": sizes, "code_rule": rule}
+    return {
+        "colors": list(color_report["after"]),
+        "color_specification": color_report,
+        "size_template": sizes,
+        "code_rule": rule,
+    }
 
 
 async def validate_new_product_form(drawer: Any, product: ProductData) -> Dict[str, Any]:
@@ -2670,23 +3449,43 @@ async def validate_new_product_form(drawer: Any, product: ProductData) -> Dict[s
           });
         }"""
     )
-    expected_codes = [product.style_code + "军绿色" + size for size in NEW_PRODUCT_SIZES]
-    if len(rows) != len(NEW_PRODUCT_SIZES):
-        raise AutomationError(f"新增 SKU 行数应为 5，实际 {len(rows)}")
-    for row, size, code in zip(rows, NEW_PRODUCT_SIZES, expected_codes):
-        if row.get("颜色") != "军绿色" or row.get("尺码") != size or row.get("商品编码") != code:
-            raise AutomationError(f"新增 SKU 规格或默认编码与视频不一致：{size}")
+    expected_rows = {
+        (color, size): product.style_code + color + size
+        for color in product.colors
+        for size in NEW_PRODUCT_SIZES
+    }
+    if len(rows) != len(expected_rows):
+        raise AutomationError(
+            f"新增 SKU 行数应为 {len(expected_rows)}，实际 {len(rows)}"
+        )
+    seen = set()
+    for row in rows:
+        color = str(row.get("颜色") or "").strip()
+        size = str(row.get("尺码") or "").strip()
+        key = (color, size)
+        code = expected_rows.get(key)
+        if code is None or key in seen or row.get("商品编码") != code:
+            raise AutomationError(
+                f"新增 SKU 规格或默认编码与 Excel 颜色不一致：{color}/{size}"
+            )
+        seen.add(key)
         for label in ("基本售价", "销售价", "市场价", "成本价", "库存", "重量(kg)"):
             try:
                 matches = Decimal(row.get(label, "")) == 0
             except InvalidOperation:
                 matches = False
             if not matches:
-                raise AutomationError(f"新增 SKU {size} 的{label}未保持视频默认值 0")
+                raise AutomationError(f"新增 SKU {color}/{size} 的{label}未保持视频默认值 0")
     errors = await collect_visible_errors(drawer)
     if errors:
         raise AutomationError("新增页面存在校验错误：" + "；".join(errors))
-    return {"title": "1", "main_image_count": image_count, "sku_count": len(rows), "rows": rows}
+    return {
+        "title": "1",
+        "colors": list(product.colors),
+        "main_image_count": image_count,
+        "sku_count": len(rows),
+        "rows": rows,
+    }
 
 
 async def run_new_product(page: Any, args: Any, product: ProductData, artifact_dir: Path, logger: logging.Logger) -> None:
@@ -2704,24 +3503,27 @@ async def run_new_product(page: Any, args: Any, product: ProductData, artifact_d
         await safe_screenshot(page, artifact_dir / "create-product-preview.png")
         if not args.save:
             report.update(status="preview", confirmed_by="form_readback")
-            logger.info("新增链接预览完成，未保存：名称 1、军绿色、默认尺码、默认商品编码")
+            logger.info(
+                "新增链接预览完成，未保存：名称 1、Excel 颜色 %s、默认尺码、默认商品编码",
+                " / ".join(product.colors),
+            )
             return
         # 上传可能耗时，提交前再次查重。查询失败或重复均不点击保存。
         if await api_find_product(page, product.style_code, logger, strict=True) is not None:
             raise AutomationError("填写期间该款式已被创建，停止保存以避免重复")
         report["save_attempted"] = True
         result = await click_save_and_confirm(page, drawer, args.sync_erp, args.timeout, logger, creation=True)
-        report.update(status="submitted", save_confirmation=result.get("confirmed_by"))
-        result_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        await page.reload(wait_until="domcontentloaded", timeout=args.timeout * 1000)
-        record = await api_find_product(page, product.style_code, logger, strict=True)
-        if record is None:
-            raise AutomationError("保存后尚未查到新商品；本次不重复提交，请查看新增结果报告")
-        persisted = await open_product_editor(page, product.style_code, logger, args.timeout)
-        report["after_save"] = await validate_new_product_form(persisted, product)
-        report.update(status="created", saved=True, confirmed_by="reopened_form", base_item_id=record.get("baseItemId") or record.get("id"))
+        report.update(
+            status="created",
+            saved=True,
+            confirmed_by=result.get("confirmed_by"),
+            save_confirmation=result.get("confirmed_by"),
+        )
         await safe_screenshot(page, artifact_dir / "create-product-after-save.png")
-        logger.info("新增链接成功，已重开验证货号、名称、主图、5 个 SKU 和默认编码")
+        logger.info(
+            "新增链接保存成功，已由创建成功提示确认；按配置不再刷新和重开复核（%s 个 SKU）",
+            len(product.colors) * len(NEW_PRODUCT_SIZES),
+        )
     except Exception as exc:
         report.update(status="verification_required" if report.get("save_attempted") else "failed", error=str(exc))
         raise
@@ -2829,7 +3631,20 @@ async def publish_to_selected_douyin_shops(
             + "；实际 " + "、".join(actual)
         )
     if not pending_expected:
-        raise AutomationError("指定的抖音店铺均已铺货，无需重复提交")
+        await close_publish_preview(dialog)
+        logger.info(
+            "指定的抖音店铺均已铺货，已安全关闭弹窗并跳过重复提交：%s",
+            "、".join(already_published),
+        )
+        return {
+            "platform": "抖音",
+            "shops": list(expected),
+            "submitted_shops": [],
+            "already_published": already_published,
+            "result": 1,
+            "confirmed_by": "already_published",
+            "submitted": False,
+        }
     logger.info(
         "抖音铺货店铺已精确复核：待铺货=%s；已铺货跳过=%s",
         "、".join(actual),
@@ -2861,6 +3676,7 @@ async def publish_to_selected_douyin_shops(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if await visible(completion_dialog.first):
+            await asyncio.sleep(2)
             completion_text = re.sub(
                 r"\s+", " ", (await completion_dialog.first.inner_text()).strip()
             )
@@ -2906,6 +3722,17 @@ async def publish_to_selected_douyin_shops(
         page_errors = page.locator(".el-message--error:visible")
         if await visible(page_errors.first):
             raise AutomationError("铺货提交失败：" + (await page_errors.first.inner_text()).strip())
+        progress = await dismiss_publish_progress_dialog(page, logger, settle_seconds=2)
+        if progress['dismissed'] or not await dialog.is_visible():
+            if not progress['dismissed']:
+                await asyncio.sleep(2)
+            logger.info("抖音铺货已提交，页面稳定 2 秒，继续后续平台；后台结果不在此等待")
+            return {
+                "result": 1, "confirmed_by": "background_task_submitted",
+                "submitted": True, "shops": list(expected),
+                "submitted_shops": list(actual), "already_published": already_published,
+                "responses": [response.url for response in submit_responses],
+            }
         await asyncio.sleep(0.25)
     if continue_button is None:
         raise AutomationError("点击“确定”后未出现“继续铺货”确认弹窗")
@@ -2927,6 +3754,7 @@ async def publish_to_selected_douyin_shops(
                     + str(payload.get("message") or payload.get("errmsg") or payload)
                 )
         if await visible(success.first):
+            await asyncio.sleep(2)
             return {
                 "result": 1,
                 "confirmed_by": "toast",
@@ -2935,11 +3763,13 @@ async def publish_to_selected_douyin_shops(
                 "already_published": already_published,
                 "responses": [response.url for response in submit_responses],
             }
-        if not await dialog.is_visible() and not await continue_button.is_visible():
-            await asyncio.sleep(1)
+        progress = await dismiss_publish_progress_dialog(page, logger, settle_seconds=2)
+        if progress['dismissed'] or (not await dialog.is_visible() and not await continue_button.is_visible()):
+            if not progress['dismissed']:
+                await asyncio.sleep(2)
             return {
                 "result": 1,
-                "confirmed_by": "dialog_closed",
+                "confirmed_by": "background_task_submitted",
                 "shops": list(expected),
                 "submitted_shops": list(actual),
                 "already_published": already_published,
@@ -2967,6 +3797,14 @@ async def prepare_taobao_publish_dialog(
     expected = tuple(dict.fromkeys(shop.strip() for shop in selected_shops if shop.strip()))
     if not expected:
         raise AutomationError(f"没有指定要铺货的{platform_name}店铺")
+
+    def canonical_shop_name(name: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(name).strip())
+        if platform_name == "小红书":
+            return XHS_PUBLISH_SHOP_ALIASES.get(normalized, normalized)
+        return normalized
+
+    expected_canonical = tuple(canonical_shop_name(shop) for shop in expected)
 
     dialog = page.locator('[role="dialog"]:visible').filter(has_text="铺货到店铺").first
     await dialog.wait_for(state="visible", timeout=timeout_seconds * 1000)
@@ -3001,23 +3839,53 @@ async def prepare_taobao_publish_dialog(
 
     controls: List[Tuple[str, Any, Any]] = []
     deadline = time.monotonic() + timeout_seconds
+    last_shop_signature: Optional[Tuple[str, ...]] = None
+    shop_list_stable_since: Optional[float] = None
     while time.monotonic() < deadline:
         controls = await visible_shop_controls()
         loaded_shop_names = {
-            shop_name_from_label(label) for label, _, _ in controls
+            canonical_shop_name(shop_name_from_label(label))
+            for label, _, _ in controls
         }
-        if all(shop in loaded_shop_names for shop in expected):
+        if all(shop in loaded_shop_names for shop in expected_canonical):
             break
+        if controls:
+            signature = tuple(sorted(loaded_shop_names))
+            now = time.monotonic()
+            if signature != last_shop_signature:
+                last_shop_signature = signature
+                shop_list_stable_since = now
+            elif (
+                shop_list_stable_since is not None
+                and now - shop_list_stable_since >= min(3.0, timeout_seconds)
+            ):
+                missing = [
+                    shop
+                    for shop, canonical in zip(expected, expected_canonical)
+                    if canonical not in loaded_shop_names
+                ]
+                actual = [shop_name_from_label(label) for label, _, _ in controls]
+                raise AutomationError(
+                    f"{platform_name}平台店铺列表已加载，但找不到目标店铺："
+                    + "、".join(missing)
+                    + "；页面实际店铺："
+                    + "、".join(actual)
+                )
         await asyncio.sleep(0.25)
     else:
+        actual = [shop_name_from_label(label) for label, _, _ in controls]
         raise AutomationError(
             f"{platform_name}平台店铺列表未加载或找不到："
             + "、".join(expected)
+            + ("；页面实际店铺：" + "、".join(actual) if actual else "")
         )
 
     def matching_expected(label: str) -> Optional[str]:
-        normalized = shop_name_from_label(label)
-        matches = [shop for shop in expected if normalized == shop]
+        normalized = canonical_shop_name(shop_name_from_label(label))
+        matches = [
+            shop for shop, canonical in zip(expected, expected_canonical)
+            if normalized == canonical
+        ]
         if len(matches) > 1:
             raise AutomationError(f"{platform_name}店铺文字匹配不唯一：{label}")
         return matches[0] if matches else None
@@ -3028,7 +3896,7 @@ async def prepare_taobao_publish_dialog(
     available_shops: List[str] = []
     for label, control, checkbox in controls:
         target = matching_expected(label)
-        display_name = target or shop_name_from_label(label)
+        display_name = shop_name_from_label(label)
         available_shops.append(display_name)
         disabled = await checkbox.is_disabled()
         published = "已铺货" in label
@@ -3038,7 +3906,9 @@ async def prepare_taobao_publish_dialog(
                 unavailable_shops.append(target)
                 continue
             if published:
-                already_published.append(target)
+                # Keep the page's current spelling in the report and submit
+                # payload; aliases are only for matching old cached markup.
+                already_published.append(display_name)
                 continue
         if disabled or published:
             continue
@@ -3066,9 +3936,17 @@ async def prepare_taobao_publish_dialog(
         if await checkbox.is_disabled() or "已铺货" in label:
             continue
         if await checkbox.is_checked():
-            actual.append(target or label)
-    pending_expected = [shop for shop in expected if shop not in already_published]
-    if set(actual) != set(pending_expected):
+            actual.append(shop_name_from_label(label))
+    already_published_canonical = {
+        canonical_shop_name(shop) for shop in already_published
+    }
+    pending_expected = [
+        shop for shop, canonical in zip(expected, expected_canonical)
+        if canonical not in already_published_canonical
+    ]
+    if {
+        canonical_shop_name(shop) for shop in actual
+    } != {canonical_shop_name(shop) for shop in pending_expected}:
         raise AutomationError(
             f"{platform_name}待铺货店铺复核失败：期望 " + "、".join(pending_expected)
             + "；实际 " + "、".join(actual)
@@ -3156,10 +4034,12 @@ async def submit_taobao_publish_dialog(
                 f"{platform_name}铺货提交失败："
                 + (await page_errors.first.inner_text()).strip()
             )
-        if not await dialog.is_visible():
+        progress = await dismiss_publish_progress_dialog(page, logger, settle_seconds=2)
+        if progress['dismissed'] or not await dialog.is_visible():
             # 最终“确定”后任务由后台继续执行；
             # 店铺选择弹窗关闭即表示本次提交已被接受。
-            await asyncio.sleep(1)
+            if not progress['dismissed']:
+                await asyncio.sleep(2)
             for response in submit_responses:
                 try:
                     payload = await response.json()
@@ -3201,6 +4081,7 @@ async def submit_taobao_publish_dialog(
                     + str(payload.get("message") or payload.get("errmsg") or payload)
                 )
         if await visible(success.first):
+            await asyncio.sleep(2)
             return {
                 **dict(selection),
                 "result": 1,
@@ -3209,10 +4090,12 @@ async def submit_taobao_publish_dialog(
                 "submitted_shops": list(selected),
                 "responses": [response.url for response in submit_responses],
             }
-        if not await dialog.is_visible() and (
+        progress = await dismiss_publish_progress_dialog(page, logger, settle_seconds=2)
+        if progress['dismissed'] or (not await dialog.is_visible() and (
             continue_button is None or not await continue_button.is_visible()
-        ):
-            await asyncio.sleep(1)
+        )):
+            if not progress['dismissed']:
+                await asyncio.sleep(2)
             return {
                 **dict(selection),
                 "result": 1,
@@ -3257,8 +4140,9 @@ async def dismiss_publish_progress_dialog(
     logger: logging.Logger,
     *,
     appearance_timeout_seconds: float = 0.0,
+    settle_seconds: float = 2.0,
 ) -> Dict[str, Any]:
-    """收起后台铺货进度弹窗，避免它遮挡全平台的下一阶段。"""
+    """页面稳定后收起后台铺货进度弹窗，不等待后台任务完成。"""
     dialogs = page.locator(
         '[role="dialog"]:visible, .el-dialog:visible, .el-message-box:visible'
     ).filter(has_text=re.compile(r"铺货中|铺货进度"))
@@ -3271,6 +4155,11 @@ async def dismiss_publish_progress_dialog(
         if time.monotonic() >= deadline:
             return {"found": False, "dismissed": False, "action": None}
         await asyncio.sleep(0.1)
+
+    # 弹窗刚出现时仍可能在替换进度 DOM。只给前端一个短稳定窗口，
+    # 随后立即收起；后台铺货会继续，这里不轮询它的最终进度。
+    if settle_seconds > 0:
+        await asyncio.sleep(settle_seconds)
 
     dialog_text = re.sub(r"\s+", " ", (await dialog.inner_text()).strip())
     percent_match = re.search(r"(\d{1,3})\s*%", dialog_text)
@@ -3345,7 +4234,13 @@ def resolve_commerce_publish_target(
         args, "allow_taobao_publish_once", False
     ):
         return None
-    return COMMERCE_PUBLISH_TARGETS.get(args.platform)
+    target = COMMERCE_PUBLISH_TARGETS.get(args.platform)
+    if target is None:
+        return None
+    if getattr(args, "all_platform_one_shop_test", False):
+        platform_name, shops = target
+        return platform_name, tuple(shops[:1])
+    return target
 
 
 def resolve_platform_save_action(
@@ -3394,13 +4289,108 @@ async def close_shared_browser_session(shared_session: Dict[str, Any]) -> None:
     playwright = shared_session.get("playwright")
     try:
         if context is not None and shared_session.get("owns_context", False):
-            await context.close()
+            try:
+                await asyncio.wait_for(context.close(), timeout=5.0)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("浏览器上下文清理未完成，继续释放驱动：%s", type(exc).__name__)
     finally:
         try:
             if playwright is not None:
-                await playwright.stop()
+                try:
+                    await asyncio.wait_for(playwright.stop(), timeout=5.0)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("浏览器驱动清理未完成，不阻塞审核恢复：%s", type(exc).__name__)
         finally:
             shared_session.clear()
+
+
+async def ensure_shared_product_editor(
+    page: Any,
+    shared_session: Dict[str, Any],
+    product: ProductData,
+    *,
+    timeout_seconds: int,
+    logger: logging.Logger,
+) -> Tuple[Any, Any, bool]:
+    """Return the live shared drawer, reopening it after publish closes it."""
+    await dismiss_publish_progress_dialog(
+        page,
+        logger,
+        appearance_timeout_seconds=0.5,
+    )
+    drawer = shared_session["drawer"]
+    try:
+        drawer_visible = await drawer.is_visible()
+    except Exception:
+        try:
+            await drawer.wait_for(state="visible", timeout=1_000)
+            drawer_visible = True
+        except Exception:
+            drawer_visible = False
+    if drawer_visible:
+        return drawer, shared_session.get("record"), False
+
+    logger.info(
+        "上一平台完成后商品编辑抽屉已关闭，按款式编码重新打开；已完成平台不重跑"
+    )
+    record = await api_find_product(page, product.style_code, logger)
+    drawer = await open_product_editor(
+        page,
+        product.style_code,
+        logger,
+        timeout_seconds=timeout_seconds,
+    )
+    shared_session.update({"drawer": drawer, "record": record})
+    logger.info("商品编辑抽屉已重新打开，继续当前平台")
+    return drawer, record, True
+
+
+async def product_editor_for_saved_readback(
+    page: Any,
+    drawer: Any,
+    shared_session: Optional[Dict[str, Any]],
+    product: ProductData,
+    *,
+    timeout_seconds: int,
+    logger: logging.Logger,
+    platform_label: str,
+    force_reload: bool = False,
+) -> Tuple[Any, bool]:
+    """Return a live editor for save/publish readback.
+
+    Publishing commonly closes the drawer.  Shared all-platform runs must
+    reopen it before platform-specific validation instead of waiting on a
+    stale hidden locator.
+    """
+    if shared_session is not None and not force_reload:
+        persisted_drawer, _, reopened = await ensure_shared_product_editor(
+            page,
+            shared_session,
+            product,
+            timeout_seconds=timeout_seconds,
+            logger=logger,
+        )
+        logger.info(
+            "保存后正在%s商品编辑页复核%s；不重跑已完成平台",
+            "重开" if reopened else "当前",
+            platform_label,
+        )
+        return persisted_drawer, reopened
+
+    logger.info("保存成功，正在重新打开商品复核%s", platform_label)
+    await page.reload(
+        wait_until="domcontentloaded",
+        timeout=timeout_seconds * 1000,
+    )
+    persisted_drawer = await open_product_editor(
+        page,
+        product.style_code,
+        logger,
+        timeout_seconds=timeout_seconds,
+    )
+    if shared_session is not None:
+        shared_session['drawer'] = persisted_drawer
+    return persisted_drawer, True
 
 
 async def run_browser_automation(
@@ -3426,6 +4416,8 @@ async def run_browser_automation(
     xhs_requested = args.platform == "xhs"
     youzan_requested = args.platform == "youzan"
     jd_requested = args.platform == "jd"
+    if attribute_runtime is not None:
+        attribute_runtime.begin_review_collection(args.platform)
     if args.platform == "douyin" and product.douyin_fields is None:
         raise AutomationError("已选择抖音流程，但 Excel/产品目录中没有抖音资料")
     if taobao_requested and product.taobao_fields is None:
@@ -3459,17 +4451,22 @@ async def run_browser_automation(
     )
     recommendations = (
         recognize_product_recommendations(product, artifact_dir)
-        if douyin_requested and product.douyin_fields is not None
+        if (douyin_requested or taobao_requested)
+        and product.douyin_fields is not None
         else ()
     )
     if recommendations:
         logger.info("本地尺码识别完成：%s", " / ".join(item.size for item in recommendations))
+    taobao_category_mode = "recommended"
     taobao_garment_kind_value = ""
     taobao_size_lengths: tuple[SizeLength, ...] = ()
     if taobao_requested:
+        taobao_category_mode = resolve_taobao_category_mode(
+            product, getattr(args, "taobao_category_mode", "auto")
+        )
         taobao_garment_kind_value, taobao_size_lengths = recognize_taobao_size_lengths(
             product,
-            args.taobao_category_mode,
+            taobao_category_mode,
             artifact_dir,
         )
         logger.info(
@@ -3559,19 +4556,29 @@ async def run_browser_automation(
                 )
 
         page.set_default_timeout(args.timeout * 1000)
+        wxsph_capture: Optional[WxsphFormListing] = None
+        if shared_session is not None and hasattr(page, "locator"):
+            wxsph_capture = shared_session.get("wxsph_api_capture")
+            if wxsph_capture is None:
+                wxsph_capture = WxsphFormListing(
+                    page,
+                    page.locator("body"),
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                )
+                shared_session["wxsph_api_capture"] = wxsph_capture
+        elif wxsph_requested:
+            # Single-platform runs also need the listener before
+            # open_product_editor(), because the drawer can fetch the schema
+            # eagerly while its base tab is being rendered.
+            wxsph_capture = WxsphFormListing(
+                page,
+                page.locator("body"),
+                logger,
+                attribute_runtime=attribute_runtime,
+            )
         try:
             if reuse_editor:
-                drawer = shared_session["drawer"]
-                record = shared_session.get("record")
-                await drawer.wait_for(
-                    state="visible",
-                    timeout=args.timeout * 1000,
-                )
-                await dismiss_publish_progress_dialog(
-                    page,
-                    logger,
-                    appearance_timeout_seconds=0.5,
-                )
                 session_style_code = str(
                     shared_session.get("style_code") or ""
                 ).strip()
@@ -3580,7 +4587,17 @@ async def run_browser_automation(
                         "共享编辑页款式编码不匹配："
                         f"期望 {product.style_code}，实际 {session_style_code or '未记录'}"
                     )
-                logger.info("复用当前商品编辑页，直接切换到 %s 平台", args.platform)
+                drawer, record, reopened = await ensure_shared_product_editor(
+                    page,
+                    shared_session,
+                    product,
+                    timeout_seconds=args.timeout,
+                    logger=logger,
+                )
+                if reopened:
+                    logger.info("重新打开商品编辑页，继续切换到 %s 平台", args.platform)
+                else:
+                    logger.info("复用当前商品编辑页，直接切换到 %s 平台", args.platform)
             else:
                 reused_scm = False
                 if restored_scm_verified or (args.cdp_url and is_scm_url(page.url)):
@@ -3665,6 +4682,44 @@ async def run_browser_automation(
                 )
                 return
 
+            # 独立验证水洗标上传链路：只打开抖音资料页并上传图片，不填写
+            # 其它字段、不保存、不铺货。正常抖音流程复用同一个方法，确保
+            # 这里验证通过后再重跑平台时不会换一套上传逻辑。
+            if getattr(args, "wash_label_upload_test", False):
+                if args.platform != "douyin":
+                    raise AutomationError(
+                        "水洗标单项测试只允许 --platform douyin"
+                    )
+                if product.douyin_assets is None:
+                    raise AutomationError("当前商品没有可读取的水洗标图片")
+                douyin = DouyinListing(
+                    page,
+                    drawer,
+                    logger,
+                    artifact_dir,
+                    attribute_runtime=attribute_runtime,
+                )
+                await douyin.open()
+                # 抖音只有在先应用商品类目后才会渲染水洗标上传组件。
+                # 单项测试也执行这一步，但不填写类目属性。
+                category = await douyin.apply_first_recommended_category()
+                logger.info("水洗标单项测试已应用抖音商品类目：%s", category)
+                upload_result = await douyin.upload_wash_label_images_only(
+                    product.douyin_assets.wash_label_images
+                )
+                # 给页面侧上传回调和缩略图渲染留出稳定时间，再截图作为
+                # 单项测试凭证；此处不会点击保存或铺货。
+                await asyncio.sleep(2)
+                await safe_screenshot(
+                    page,
+                    artifact_dir / "douyin-wash-label-upload-test.png",
+                )
+                logger.info(
+                    "水洗标图片单项上传测试完成：%s；未填写、未保存、未铺货",
+                    upload_result,
+                )
+                return
+
             publish_mode = douyin_requested and product.douyin_fields is not None
             base_save_result = None
             if requires_base_save_before_platform(args.platform):
@@ -3695,6 +4750,31 @@ async def run_browser_automation(
                     "商品详情图",
                     args.upload_timeout,
                 )
+                color_report: Optional[Dict[str, Any]] = None
+                size_report: Optional[Dict[str, Any]] = None
+                if product.colors:
+                    color_report = await sync_base_color_spec_values(
+                        drawer,
+                        product.colors,
+                    )
+                    logger.info(
+                        "基础资料颜色规格已按 Excel 顺序回读：%s",
+                        " / ".join(color_report["after"]),
+                    )
+                else:
+                    logger.info("Excel 未提供颜色字段，基础资料颜色规格保持页面原值")
+                if product.derived_size_names:
+                    size_report = await sync_base_specification_values(
+                        drawer,
+                        "尺码",
+                        product.derived_size_names,
+                    )
+                    logger.info(
+                        "基础资料尺码规格已按当前商品顺序回读：%s",
+                        " / ".join(size_report["after"]),
+                    )
+                else:
+                    logger.info("当前商品未提取到尺码字段，基础资料尺码规格保持页面原值")
                 sku_count = await replace_sku_images(
                     page,
                     await form_item(drawer, "商品规格", timeout_seconds=args.timeout),
@@ -3729,6 +4809,10 @@ async def run_browser_automation(
                     logger,
                     button_text="保存",
                 )
+                if color_report is not None:
+                    base_save_result["color_specification"] = color_report
+                if size_report is not None:
+                    base_save_result["size_specification"] = size_report
                 (artifact_dir / "base-save-result.json").write_text(
                     json.dumps(base_save_result, ensure_ascii=False, indent=2),
                     encoding="utf-8",
@@ -3740,6 +4824,38 @@ async def run_browser_automation(
                     product.title,
                     args.timeout,
                 )
+                if product.colors:
+                    persisted_colors = await read_base_specification_values(
+                        drawer,
+                        "颜色",
+                    )
+                    if persisted_colors != product.colors:
+                        raise AutomationError(
+                            "基础资料保存后颜色规格回读不一致："
+                            f"页面 {persisted_colors}，Excel {product.colors}"
+                        )
+                    base_save_result["color_specification"]["persisted"] = persisted_colors
+                    (artifact_dir / "base-save-result.json").write_text(
+                        json.dumps(base_save_result, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                if product.derived_size_names:
+                    persisted_sizes = await read_base_specification_values(
+                        drawer,
+                        "尺码",
+                    )
+                    if persisted_sizes != product.derived_size_names:
+                        raise AutomationError(
+                            "基础资料保存后尺码规格回读不一致："
+                            f"页面 {persisted_sizes}，目标 {product.derived_size_names}"
+                        )
+                    base_save_result["size_specification"]["persisted"] = (
+                        persisted_sizes
+                    )
+                    (artifact_dir / "base-save-result.json").write_text(
+                        json.dumps(base_save_result, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
                 logger.info("基础资料已保存，当前编辑页加载完成")
             else:
                 logger.info(
@@ -3769,8 +4885,17 @@ async def run_browser_automation(
                 materials = await douyin.apply_materials(
                     product.douyin_fields.materials,
                     product.douyin_assets.wash_label_images,
+                    product.douyin_fields.materials_text,
                 )
-                size_rows = await douyin.fill_size_recommendations(recommendations)
+                size_rows = (
+                    await douyin.fill_size_recommendations(recommendations)
+                    if recommendations
+                    else {
+                        "status": "skipped",
+                        "reason": "non_pants_product",
+                        "garment_kind": product.garment_kind,
+                    }
+                )
                 image_actions = await douyin.sync_douyin_images(
                     product.main_images,
                     product.main_images_34,
@@ -3788,22 +4913,32 @@ async def run_browser_automation(
                     target_shops=DOUYIN_FREIGHT_TEMPLATE_SHOPS,
                     default_untargeted_template="包邮",
                 )
-                douyin_report = await douyin.validate_douyin_form(
-                    {
-                        **category_fields,
-                        "materials": materials,
-                        "sizes": size_rows,
-                        "images": image_actions,
-                        "delivery": delivery,
-                        "sku": {
-                            "rows": sku_rows,
-                            "price": product.douyin_fields.price,
-                            "spot_stock": product.douyin_fields.spot_stock,
-                            "presale_stock": product.douyin_fields.presale_stock,
-                        },
-                        "freight": freight,
+                douyin_expected = {
+                    **category_fields,
+                    "materials": materials,
+                    "sizes": size_rows,
+                    "images": image_actions,
+                    "delivery": delivery,
+                    "sku": {
+                        "rows": sku_rows,
+                        "price": product.douyin_fields.price,
+                        "spot_stock": product.douyin_fields.spot_stock,
+                        "presale_stock": product.douyin_fields.presale_stock,
+                    },
+                    "freight": freight,
+                }
+                if (
+                    attribute_runtime is not None
+                    and attribute_runtime.has_deferred_reviews
+                ):
+                    douyin_report = {
+                        **douyin_expected,
+                        "validation_deferred": True,
                     }
-                )
+                else:
+                    douyin_report = await douyin.validate_douyin_form(
+                        douyin_expected
+                    )
                 (artifact_dir / "douyin-before-publish.json").write_text(
                     json.dumps(douyin_report, ensure_ascii=False, indent=2),
                     encoding="utf-8",
@@ -3820,7 +4955,7 @@ async def run_browser_automation(
                 )
                 await taobao.open()
                 if args.taobao_test_scope == "category-size":
-                    category = await taobao.apply_category(args.taobao_category_mode)
+                    category = await taobao.apply_category(taobao_category_mode)
                     size_chart = await taobao.fill_size_chart_lengths(
                         taobao_size_lengths,
                         garment_kind=taobao_garment_kind_value,
@@ -3834,7 +4969,7 @@ async def run_browser_automation(
                 elif args.taobao_test_scope == "attributes":
                     attribute_report = await taobao.apply_excel_attributes(
                         product.taobao_fields,
-                        category_mode=args.taobao_category_mode,
+                        category_mode=taobao_category_mode,
                     )
                     taobao_report = {
                         **dict(attribute_report),
@@ -3843,7 +4978,7 @@ async def run_browser_automation(
                     }
                     logger.info("淘宝类目属性独立预览完成")
                 elif args.taobao_test_scope == "sku-batch":
-                    category = await taobao.apply_category(args.taobao_category_mode)
+                    category = await taobao.apply_category(taobao_category_mode)
                     sku_batch = await taobao.fill_sku_batch(
                         product.taobao_fields.fields
                     )
@@ -3854,7 +4989,7 @@ async def run_browser_automation(
                     }
                     logger.info("淘宝 SKU 批量字段独立预览完成")
                 elif args.taobao_test_scope == "payment-service":
-                    category = await taobao.apply_category(args.taobao_category_mode)
+                    category = await taobao.apply_category(taobao_category_mode)
                     payment_service = await taobao.apply_payment_and_service(
                         product.taobao_fields.fields
                     )
@@ -3867,13 +5002,14 @@ async def run_browser_automation(
                 else:
                     taobao_report = await taobao.apply_excel_attributes(
                         product.taobao_fields,
-                        category_mode=args.taobao_category_mode,
+                        category_mode=taobao_category_mode,
                     )
                     taobao_report = dict(taobao_report)
                     taobao_report["extended_fields"] = await taobao.apply_extended_fields(
                         product.taobao_fields,
                         size_lengths=taobao_size_lengths,
                         garment_kind=taobao_garment_kind_value,
+                        size_recommendations=recommendations,
                     )
                 extended_fields = taobao_report["extended_fields"]
                 taobao_validation_errors = []
@@ -3901,7 +5037,13 @@ async def run_browser_automation(
                     encoding="utf-8",
                 )
                 await safe_screenshot(page, artifact_dir / "taobao-before-save.png")
-                if taobao_validation_errors:
+                if (
+                    taobao_validation_errors
+                    and not (
+                        attribute_runtime is not None
+                        and attribute_runtime.has_deferred_reviews
+                    )
+                ):
                     raise AutomationError(
                         "淘宝资料保存前校验失败："
                         + "；".join(dict.fromkeys(taobao_validation_errors))
@@ -3937,12 +5079,19 @@ async def run_browser_automation(
                 logger.info("拼多多资料填写与保存前复核完成；%s", next_action)
             elif wxsph_requested:
                 assert product.wxsph_fields is not None
-                wxsph = WxsphFormListing(
-                    page,
-                    drawer,
-                    logger,
-                    attribute_runtime=attribute_runtime,
+                wxsph = wxsph_capture or WxsphFormListing(
+                    page, drawer, logger, attribute_runtime=attribute_runtime
                 )
+                if isinstance(record, dict):
+                    wxsph.base_item_id = str(
+                        record.get("baseItemId")
+                        or record.get("base_item_id")
+                        or record.get("id")
+                        or ""
+                    )
+                wxsph.drawer = drawer
+                wxsph.logger = logger
+                wxsph.attribute_runtime = attribute_runtime
                 await wxsph.open()
                 try:
                     wxsph_report = await wxsph.apply_excel_fields(
@@ -4186,13 +5335,35 @@ async def run_browser_automation(
                             )
                     except TmallProductWriteRequired:
                         tmall_report["form_mode"] = "initial"
-                        logger.info("天猫首次填写：等待产品图片同步完成后才允许发布")
+                        logger.info(
+                            "天猫首次填写：短暂等待基础图片自动继承；"
+                            "仍不完整则直接用本地图片补齐"
+                        )
                         tmall_stage = "initial_product_images_ready"
-                        tmall_report["initial_product_images_ready"] = (
-                            await tmall.wait_for_initial_product_images(
-                                expected_count=len(product.main_images),
-                                timeout_seconds=args.upload_timeout,
+                        initial_image_state = (
+                            await tmall.inspect_initial_product_images(
+                                expected_count=len(product.main_images)
                             )
+                        )
+                        if initial_image_state.get("decoded") is not True:
+                            try:
+                                initial_image_state = (
+                                    await tmall.wait_for_initial_product_images(
+                                        expected_count=len(product.main_images),
+                                        timeout_seconds=min(
+                                            3.0, float(args.upload_timeout)
+                                        ),
+                                        initial_delay_seconds=0,
+                                        stable_seconds=0.5,
+                                    )
+                                )
+                            except TmallFormListingError:
+                                logger.info(
+                                    "天猫首次产品图片未在短暂等待内自动继承；"
+                                    "开始用本地图片强制覆盖"
+                                )
+                        tmall_report["initial_product_images_ready"] = (
+                            initial_image_state
                         )
                         tmall_stage = "initial_product_images"
                         tmall_report["initial_product_images"] = (
@@ -4335,9 +5506,17 @@ async def run_browser_automation(
                     tmall_stage = "size_display_cleanup"
                     await tmall.clean_size_chart_integer_displays()
                     tmall_stage = "remaining_required"
-                    required_validation = (
-                        await tmall.validate_remaining_required_fields()
-                    )
+                    if (
+                        attribute_runtime is not None
+                        and attribute_runtime.has_deferred_reviews
+                    ):
+                        required_validation = {
+                            "status": "deferred_for_operator_review"
+                        }
+                    else:
+                        required_validation = (
+                            await tmall.validate_remaining_required_fields()
+                        )
                 except TmallSizeReviewRequired as exc:
                     tmall_report["api_json_validation"] = (
                         await tmall_api_index.safe_summary(
@@ -4410,6 +5589,9 @@ async def run_browser_automation(
                 logger.info("天猫资料填写与保存前复核完成；%s", next_action)
             else:
                 await safe_screenshot(page, artifact_dir / "before-save.png")
+
+            if attribute_runtime is not None:
+                attribute_runtime.raise_deferred_reviews()
 
             if not args.save:
                 logger.info(
@@ -4538,21 +5720,17 @@ async def run_browser_automation(
                         "confirmed_by", result.get("confirmed_by")
                     )
             if publish_mode and args.save_only:
-                if shared_session is not None:
-                    logger.info("保存成功，正在当前编辑页复核抖音资料；不刷新网页")
-                    persisted_drawer = drawer
-                else:
-                    logger.info("保存成功，正在重新打开商品复核抖音资料持久化结果")
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=args.timeout * 1000,
-                    )
-                    persisted_drawer = await open_product_editor(
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
                         page,
-                        product.style_code,
-                        logger,
+                        drawer,
+                        shared_session,
+                        product,
                         timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="抖音资料持久化结果",
                     )
+                )
                 persisted_douyin = DouyinListing(
                     page,
                     persisted_drawer,
@@ -4575,27 +5753,23 @@ async def run_browser_automation(
                 )
                 logger.info(
                     "保存后%s复核通过：抖音字段与 %s 行 SKU 均已持久化",
-                    "当前页" if shared_session is not None else "重开",
+                    "重开" if persisted_reopened else "当前页",
                     sku_rows,
                 )
 
             if pdd_requested:
                 assert product.pdd_fields is not None
-                if shared_session is not None:
-                    logger.info("保存成功，正在当前编辑页复核拼多多价格库存；不刷新网页")
-                    persisted_drawer = drawer
-                else:
-                    logger.info("保存成功，正在重新打开商品复核拼多多价格库存")
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=args.timeout * 1000,
-                    )
-                    persisted_drawer = await open_product_editor(
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
                         page,
-                        product.style_code,
-                        logger,
+                        drawer,
+                        shared_session,
+                        product,
                         timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="拼多多价格库存",
                     )
+                )
                 persisted_pdd = PddFormListing(
                     page,
                     persisted_drawer,
@@ -4613,27 +5787,23 @@ async def run_browser_automation(
                 )
                 logger.info(
                     "保存后%s复核通过：拼多多拼单价、单买价与 %s 行库存均已持久化",
-                    "当前页" if shared_session is not None else "重开",
+                    "重开" if persisted_reopened else "当前页",
                     persisted_report["row_count"],
                 )
 
             if wxsph_requested:
                 assert product.wxsph_fields is not None
-                if shared_session is not None:
-                    logger.info("保存成功，正在当前编辑页复核微信小店关键字段；不刷新网页")
-                    persisted_drawer = drawer
-                else:
-                    logger.info("保存成功，正在重新打开商品复核微信小店关键字段")
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=args.timeout * 1000,
-                    )
-                    persisted_drawer = await open_product_editor(
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
                         page,
-                        product.style_code,
-                        logger,
+                        drawer,
+                        shared_session,
+                        product,
                         timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="微信小店关键字段",
                     )
+                )
                 persisted_wxsph = WxsphFormListing(
                     page,
                     persisted_drawer,
@@ -4641,7 +5811,9 @@ async def run_browser_automation(
                 )
                 await persisted_wxsph.open()
                 persisted_report = await persisted_wxsph.verify_persisted_values(
-                    product.wxsph_fields
+                    product.wxsph_fields,
+                    expected_attributes=wxsph_report["attributes"]["attributes"],
+                    expected_freight=wxsph_report.get("freight"),
                 )
                 (artifact_dir / "wxsph-after-save-validation.json").write_text(
                     json.dumps(persisted_report, ensure_ascii=False, indent=2),
@@ -4649,27 +5821,58 @@ async def run_browser_automation(
                 )
                 logger.info(
                     "保存后%s复核通过：微信小店类目属性、售卖价、市场价、%s 行库存、全款预售 15 天和重量均已持久化",
-                    "当前页" if shared_session is not None else "重开",
+                    "重开" if persisted_reopened else "当前页",
+                    persisted_report["row_count"],
+                )
+
+            if xhs_requested:
+                assert product.xhs_fields is not None
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
+                        page,
+                        drawer,
+                        shared_session,
+                        product,
+                        timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="小红书关键字段",
+                    )
+                )
+                persisted_xhs = XhsFormListing(page, persisted_drawer, logger)
+                await persisted_xhs.open()
+                persisted_report = await persisted_xhs.verify_persisted_values(
+                    product.xhs_fields,
+                    title=product.title,
+                    style_code=product.style_code,
+                    expected_attributes=xhs_report["attributes"]["attributes"],
+                    expected_freight=xhs_report.get("freight"),
+                )
+                (artifact_dir / "xhs-after-save-validation.json").write_text(
+                    json.dumps(persisted_report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "保存后%s复核通过：小红书标题、货号、类目属性、%s 行 SKU 价格库存和全款预售 15 天均已持久化",
+                    "重开" if persisted_reopened else "当前页",
                     persisted_report["row_count"],
                 )
 
             if youzan_requested:
                 assert product.youzan_fields is not None
-                if shared_session is not None:
-                    logger.info("保存成功，正在当前编辑页复核有赞关键字段；不刷新网页")
-                    persisted_drawer = drawer
-                else:
-                    logger.info("保存成功，正在重新打开商品复核有赞关键字段")
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=args.timeout * 1000,
-                    )
-                    persisted_drawer = await open_product_editor(
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
                         page,
-                        product.style_code,
-                        logger,
+                        drawer,
+                        shared_session,
+                        product,
                         timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="有赞关键字段",
+                        # 有赞保存后旧表格可能暂时把 SKU 重量重置为 0；
+                        # 刷新读取服务器保存值，不用旧 DOM 判断持久化失败。
+                        force_reload=True,
                     )
+                )
                 persisted_youzan = YouzanFormListing(
                     page,
                     persisted_drawer,
@@ -4685,25 +5888,28 @@ async def run_browser_automation(
                 )
                 logger.info(
                     "保存后%s复核通过：有赞类目、SKU、重量、库存扣减、配送和运费模板均已持久化",
-                    "当前页" if shared_session is not None else "重开",
+                    "重开" if persisted_reopened else "当前页",
                 )
 
             if jd_requested:
                 assert product.jd_fields is not None
-                if shared_session is not None:
-                    logger.info("保存成功，正在当前编辑页复核京东关键字段；不刷新网页")
-                    persisted_drawer = drawer
-                else:
-                    logger.info("保存成功，正在重新打开商品复核京东关键字段")
-                    await page.reload(wait_until="domcontentloaded", timeout=args.timeout * 1000)
-                    persisted_drawer = await open_product_editor(
-                        page, product.style_code, logger, timeout_seconds=args.timeout
+                persisted_drawer, persisted_reopened = (
+                    await product_editor_for_saved_readback(
+                        page,
+                        drawer,
+                        shared_session,
+                        product,
+                        timeout_seconds=args.timeout,
+                        logger=logger,
+                        platform_label="京东关键字段",
                     )
+                )
                 persisted_jd = JdFormListing(page, persisted_drawer, logger)
                 await persisted_jd.open()
                 persisted_report = await persisted_jd.verify_persisted_values(
                     product.jd_fields,
                     style_code=product.style_code,
+                    expected_attributes=jd_report["attributes"]["attributes"],
                 )
                 (artifact_dir / "jd-after-save-validation.json").write_text(
                     json.dumps(persisted_report, ensure_ascii=False, indent=2),
@@ -4711,7 +5917,7 @@ async def run_browser_automation(
                 )
                 logger.info(
                     "保存后%s复核通过：京东类目、品牌、SKU 京东价、库存、底部价格和 48 小时发货均已持久化",
-                    "当前页" if shared_session is not None else "重开",
+                    "重开" if persisted_reopened else "当前页",
                 )
 
             result_name = "publish-result.json" if should_publish else "save-result.json"
@@ -4772,6 +5978,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--inspect-only",
         action="store_true",
         help="只发现脚手平台字段结构，不填写、不保存、不铺货",
+    )
+    parser.add_argument(
+        "--wash-label-upload-test",
+        action="store_true",
+        help=(
+            "仅打开抖音资料并测试水洗标/吊牌图上传；不填写其它字段、"
+            "不保存、不铺货，需同时使用 --platform douyin --no-save"
+        ),
     )
     parser.add_argument(
         "--save",
@@ -4853,11 +6067,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--taobao-category-mode",
-        choices=("casual-pants", "recommended"),
-        default="casual-pants",
+        choices=("auto", "casual-pants", "recommended"),
+        default="auto",
         help=(
-            "淘宝类目模式：casual-pants=搜索并选择男装>休闲裤（默认）；"
-            "recommended=保留旧的页面推荐类目逻辑"
+            "淘宝类目模式：auto=按品类选择（默认，裤装沿用已验证休闲裤类目，"
+            "其他品类使用页面唯一推荐）；casual-pants=固定休闲裤；"
+            "recommended=页面唯一推荐类目"
         ),
     )
     parser.add_argument(
@@ -4901,6 +6116,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="要铺货的抖音店铺，可重复传入；不传时使用已配置的 6 个店铺",
     )
     parser.add_argument(
+        "--all-platform-one-shop-test",
+        action="store_true",
+        help=(
+            "仅用于全平台真实铺货测试：每个平台只选当前正式配置的第一家店；"
+            "不传时正式店铺配置完全不变"
+        ),
+    )
+    parser.add_argument(
+        "--all-platform-start-at",
+        choices=("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
+        default=None,
+        help="全平台失败恢复时从指定平台开始，不重跑前面已完成平台",
+    )
+    parser.add_argument(
+        "--all-platform-skip",
+        choices=("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
+        action="append",
+        default=[],
+        help="本次全平台流程跳过指定平台，可重复使用",
+    )
+    parser.add_argument(
         "--learning-enabled",
         action="store_true",
         help="启用 AI 学习检查点和审核服务",
@@ -4921,6 +6157,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...]:
+    if getattr(args, "wash_label_upload_test", False) and (
+        args.platform != "douyin"
+        or args.save
+        or args.save_only
+        or args.dry_run
+        or args.inspect_only
+    ):
+        raise SystemExit(
+            "--wash-label-upload-test 仅允许用于 --platform douyin --no-save，"
+            "且不能与保存、铺货或 inspect/dry-run 组合"
+        )
     if getattr(args, "create_product", False):
         if args.platform != "base" or args.inspect_only:
             raise SystemExit("--create-product 只允许 --platform base，不能与字段发现或平台铺货组合")
@@ -4930,6 +6177,21 @@ def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...
         spec for spec in selected if spec.save_policy == "forbidden"
     )
     blocking_save_forbidden = () if args.platform == "all" else save_forbidden
+
+    if getattr(args, "all_platform_one_shop_test", False) and (
+        args.platform != "all"
+        or not args.save
+        or args.save_only
+        or args.dry_run
+        or args.inspect_only
+    ):
+        raise SystemExit(
+            "--all-platform-one-shop-test 只允许用于 --platform all --save 真实铺货测试"
+        )
+    if getattr(args, "all_platform_start_at", None) and args.platform != "all":
+        raise SystemExit("--all-platform-start-at 只允许用于 --platform all")
+    if getattr(args, "all_platform_skip", None) and args.platform != "all":
+        raise SystemExit("--all-platform-skip 只允许用于 --platform all")
 
     if args.save_only and not args.save:
         raise SystemExit("--save-only 与 --no-save 不能同时使用")
@@ -5143,19 +6405,7 @@ def save_learning_checkpoint(
     context.store.enqueue(
         f"checkpoint.updated:{persisted.run_id}:{persisted.version}",
         "checkpoint.updated",
-        {
-            "checkpoint_id": persisted.run_id,
-            "run_id": persisted.run_id,
-            "product_version": persisted.product_version,
-            "device_id": persisted.device_id,
-            "execution_mode": persisted.execution_mode,
-            "platform_order": list(persisted.platform_order),
-            "current_index": persisted.current_index,
-            "status": persisted.status,
-            "pending_review_id": persisted.pending_review_id,
-            "version": persisted.version,
-            "image_version": persisted.image_version,
-        },
+        checkpoint_event_payload(persisted),
     )
     return persisted
 
@@ -5167,6 +6417,14 @@ def record_learning_stage(
     context.store.record_stage(result)
     if not result.verified:
         return
+    runtime = getattr(context, "attribute_runtime", None)
+    attributes = (
+        result.readback.get("attributes")
+        if isinstance(result.readback, Mapping)
+        else None
+    )
+    if runtime is not None and isinstance(attributes, Mapping):
+        runtime.record_verified_readbacks(result.platform_id, attributes)
     payload = {
         "run_id": result.run_id,
         "product_version": context.product_version,
@@ -5181,6 +6439,110 @@ def record_learning_stage(
         f"stage.completed:{result.run_id}:{result.platform_id}:{content_version}",
         "stage.completed",
         payload,
+    )
+
+
+async def drain_learning_events(
+    context: Optional[LearningRunContext],
+) -> None:
+    """Drain background learning events at a durable platform boundary."""
+    runtime = (
+        getattr(context, "attribute_runtime", None)
+        if context is not None
+        else None
+    )
+    if runtime is not None:
+        await runtime.drain()
+
+
+def review_requirements(
+    error: ReviewRequired | ReviewBatchRequired,
+) -> Tuple[ReviewRequired, ...]:
+    if isinstance(error, ReviewBatchRequired):
+        return error.reviews
+    return (error,)
+
+
+async def wait_for_platform_review_batch(
+    learning_context: LearningRunContext,
+    args: argparse.Namespace,
+    platform_order: Sequence[str],
+    platform_index: int,
+    reviews: Sequence[ReviewRequired],
+    logger: logging.Logger,
+) -> RunCheckpoint:
+    """Consume a platform's review decisions in any operator-confirmed order."""
+    if learning_context.client is None or not reviews:
+        raise AutomationError("人工审核批次缺少审核服务或审核项")
+    pending = {review.review_id: review for review in reviews}
+    checkpoint = save_learning_checkpoint(
+        learning_context,
+        args,
+        platform_order,
+        platform_index,
+        "waiting_review",
+        pending_review_id=next(iter(pending)),
+    )
+    await drain_learning_events(learning_context)
+    while pending:
+        response = await asyncio.to_thread(
+            learning_context.client.poll_resume,
+            learning_context.device_id,
+            30,
+        )
+        events = response.get("events", ())
+        if not isinstance(events, (list, tuple)):
+            raise AutomationError("人工审核恢复响应格式无效")
+        matched = False
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                payload = event
+            review_id = str(payload.get("review_id") or "")
+            review = pending.get(review_id)
+            if review is None:
+                continue
+            checkpoint = save_learning_checkpoint(
+                learning_context,
+                args,
+                platform_order,
+                platform_index,
+                "waiting_review",
+                pending_review_id=review_id,
+            )
+            decision = validate_resume(
+                checkpoint,
+                event,
+                learning_context.product_version,
+                learning_context.image_version,
+                learning_execution_mode(args),
+            )
+            await drain_learning_events(learning_context)
+            checkpoint = await persist_resume_and_ack(
+                learning_context.store,
+                learning_context.client,
+                checkpoint,
+                decision,
+            )
+            pending.pop(review_id, None)
+            matched = True
+            logger.info(
+                "运营审核已确认：%s（本批次剩余 %s 项）",
+                review.request.field_label,
+                len(pending),
+            )
+        if not matched and events:
+            # Another run can share the same device event queue. Avoid a tight
+            # loop while this batch's operator decisions are still pending.
+            await asyncio.sleep(0.25)
+    return save_learning_checkpoint(
+        learning_context,
+        args,
+        platform_order,
+        platform_index,
+        "running",
     )
 
 
@@ -5204,25 +6566,54 @@ async def run_single_platform_with_learning(
         return
     platform_order = (args.platform,)
     await initialize_learning_run(learning_context, product, logger)
-    save_learning_checkpoint(
+    checkpoint = save_learning_checkpoint(
         learning_context, args, platform_order, 0, "running"
     )
-    try:
-        await run_browser_automation(
-            args,
-            product,
-            artifact_dir,
-            logger,
-            attribute_runtime=getattr(
-                learning_context, "attribute_runtime", None
-            ),
-            **browser_kwargs,
-        )
-    except Exception:
-        save_learning_checkpoint(
-            learning_context, args, platform_order, 0, "failed"
-        )
-        raise
+    while True:
+        try:
+            await run_browser_automation(
+                args,
+                product,
+                artifact_dir,
+                logger,
+                attribute_runtime=getattr(
+                    learning_context, "attribute_runtime", None
+                ),
+                **browser_kwargs,
+            )
+            break
+        except (ReviewRequired, ReviewBatchRequired) as exc:
+            if learning_context.client is None:
+                save_learning_checkpoint(
+                    learning_context, args, platform_order, 0, "failed"
+                )
+                raise
+            reviews = review_requirements(exc)
+            logger.info(
+                "平台 %s 已完成可确定字段，共 %s 项等待人工审核：%s；"
+                "全部确认后将自动重开同一平台",
+                args.platform,
+                len(reviews),
+                "、".join(review.request.field_label for review in reviews),
+            )
+            checkpoint = await wait_for_platform_review_batch(
+                learning_context,
+                args,
+                platform_order,
+                0,
+                reviews,
+                logger,
+            )
+            logger.info(
+                "本平台全部审核项已确认，正在重新打开 %s 并重新获取候选",
+                args.platform,
+            )
+            continue
+        except Exception:
+            save_learning_checkpoint(
+                learning_context, args, platform_order, 0, "failed"
+            )
+            raise
     record_learning_stage(
         learning_context,
         learning_stage_result(
@@ -5235,6 +6626,7 @@ async def run_single_platform_with_learning(
     save_learning_checkpoint(
         learning_context, args, platform_order, 1, "completed"
     )
+    await drain_learning_events(learning_context)
 
 
 async def run_all_implemented_platforms(
@@ -5250,9 +6642,28 @@ async def run_all_implemented_platforms(
         if product.douyin_fields is not None
         else ("taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
     )
+    start_at = getattr(args, "all_platform_start_at", None)
+    if start_at is not None:
+        if start_at not in commerce_stages:
+            raise AutomationError(f"全平台恢复起点不可用：{start_at}")
+        commerce_stages = commerce_stages[commerce_stages.index(start_at) :]
+        logger.info(
+            "全平台恢复模式：从 %s 开始，不重跑之前已完成平台",
+            start_at,
+        )
+    skipped_platforms = set(getattr(args, "all_platform_skip", ()) or ())
+    if skipped_platforms:
+        logger.info("本次全平台流程跳过：%s", "、".join(sorted(skipped_platforms)))
+        commerce_stages = tuple(name for name in commerce_stages if name not in skipped_platforms)
+    if not commerce_stages:
+        raise AutomationError("本次全平台流程没有可运行的平台")
     # 预览模式承诺不保存，因此不运行会强制保存的基础资料阶段。
     # 只有全平台的两种保存模式会把它作为第一阶段。
-    stages = (("base",) + commerce_stages) if args.save else commerce_stages
+    stages = (
+        (("base",) + commerce_stages)
+        if args.save and start_at is None
+        else commerce_stages
+    )
     stage_results: List[Dict[str, Any]] = []
     shared_session: Dict[str, Any] = {}
 
@@ -5312,23 +6723,18 @@ async def run_all_implemented_platforms(
                         else None
                     ),
                 )
-            except ReviewRequired as exc:
+            except (ReviewRequired, ReviewBatchRequired) as exc:
                 if learning_context is None or learning_context.client is None:
                     raise
-                checkpoint = save_learning_checkpoint(
-                    learning_context,
-                    args,
-                    stages,
-                    stage_index,
-                    "waiting_review",
-                    pending_review_id=exc.review_id,
-                )
+                reviews = review_requirements(exc)
                 stage_results.append(
                     {
                         "platform": platform_name,
                         "status": "waiting_review",
-                        "review_id": exc.review_id,
-                        "field": exc.request.field_label,
+                        "review_ids": [review.review_id for review in reviews],
+                        "fields": [
+                            review.request.field_label for review in reviews
+                        ],
                     }
                 )
                 (artifact_dir / "all-platform-result.json").write_text(
@@ -5336,43 +6742,25 @@ async def run_all_implemented_platforms(
                     encoding="utf-8",
                 )
                 logger.info(
-                    "平台 %s 等待人工审核：%s；关闭当前浏览器会话",
+                    "平台 %s 已完成可确定字段，共 %s 项等待人工审核：%s；"
+                    "关闭当前浏览器会话",
                     platform_name,
-                    exc.request.field_label,
+                    len(reviews),
+                    "、".join(review.request.field_label for review in reviews),
                 )
                 await close_shared_browser_session(shared_session)
                 shared_session = {}
-                decision = await wait_for_review(
-                    learning_context.store,
-                    learning_context.client,
-                    checkpoint,
-                    current_product_version=learning_context.product_version,
-                    current_image_version=learning_context.image_version,
-                    execution_mode=learning_execution_mode(args),
-                )
-                await persist_resume_and_ack(
-                    learning_context.store,
-                    learning_context.client,
-                    checkpoint,
-                    decision,
-                )
-                save_learning_checkpoint(
+                await wait_for_platform_review_batch(
                     learning_context,
                     args,
                     stages,
                     stage_index,
-                    "resume_pending",
-                    pending_review_id=exc.review_id,
-                )
-                save_learning_checkpoint(
-                    learning_context,
-                    args,
-                    stages,
-                    stage_index,
-                    "running",
+                    reviews,
+                    logger,
                 )
                 logger.info(
-                    "审核已确认，重新打开 %s 并重新获取候选；此前平台不重跑",
+                    "本平台全部审核项已确认，重新打开 %s 并重新获取候选；"
+                    "此前平台不重跑",
                     platform_name,
                 )
                 continue
@@ -5415,7 +6803,12 @@ async def run_all_implemented_platforms(
                     stage_index + 1,
                     "completed" if stage_index + 1 == len(stages) else "running",
                 )
-            logger.info("全平台流程完成：%s；当前编辑页保留给下一平台", platform_name)
+                await drain_learning_events(learning_context)
+            logger.info(
+                "全平台流程完成：%s；下一平台将复用当前编辑页，"
+                "如抽屉已关闭则自动重开",
+                platform_name,
+            )
             stage_index += 1
     finally:
         await close_shared_browser_session(shared_session)
@@ -5426,6 +6819,8 @@ def main() -> int:
     validate_execution_mode(args)
     if args.publish_shop is None:
         args.publish_shop = list(DEFAULT_DOUYIN_PUBLISH_SHOPS)
+    if args.all_platform_one_shop_test:
+        args.publish_shop = args.publish_shop[:1]
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     if args.inspect_only:
         artifact_dir = SCRIPT_DIR / "output/platform-schema" / timestamp
@@ -5435,6 +6830,10 @@ def main() -> int:
         artifact_dir = SCRIPT_DIR / "output/kuaimai/runs" / timestamp
         redactor = None
         logger = setup_logging(artifact_dir)
+    if args.all_platform_one_shop_test:
+        logger.info(
+            "已启用全平台单店测试：每平台仅使用正式配置的第一家店，默认配置未修改"
+        )
     learning_context: Optional[LearningRunContext] = None
     try:
         if args.create_product:
@@ -5442,7 +6841,7 @@ def main() -> int:
         else:
             product = read_product_data(
                 resolve_excel_path(args.excel_url),
-                include_douyin=args.platform in {"all", "douyin"},
+                include_douyin=args.platform in {"all", "douyin", "taobao"},
             )
         learning_context = create_learning_context(args, product)
         if redactor is not None:
@@ -5453,8 +6852,9 @@ def main() -> int:
             summary = product_summary(product)
             if args.create_product:
                 summary["new_product"] = {
-                    "title": "1", "colors": ["军绿色"], "sizes": list(NEW_PRODUCT_SIZES),
-                    "main_image": str(product.main_images[0]), "sku_count": 5,
+                    "title": "1", "colors": list(product.colors), "sizes": list(NEW_PRODUCT_SIZES),
+                    "main_image": str(product.main_images[0]),
+                    "sku_count": len(product.colors) * len(NEW_PRODUCT_SIZES),
                     "price": "0", "sku_images_uploaded": False,
                     "code_rule": "款式编码+规格值", "publish": False,
                 }

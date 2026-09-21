@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 import os
+import re
 from typing import Any, Mapping, Optional, Tuple
 from urllib import error, parse, request
 
@@ -173,7 +174,15 @@ class CloudLearningClient:
             return body
         if status == 429 or status >= 500:
             raise RetryableCloudError(f"cloud status {status}")
-        raise PermanentCloudError(f"cloud status {status}")
+        reason = body.get("error")
+        safe_reason = (
+            reason
+            if isinstance(reason, str)
+            and re.fullmatch(r"[a-z0-9_:-]{1,80}", reason)
+            else ""
+        )
+        suffix = f" ({safe_reason})" if safe_reason else ""
+        raise PermanentCloudError(f"cloud status {status}{suffix}")
 
     def _request(
         self,

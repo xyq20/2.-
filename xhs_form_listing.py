@@ -6,14 +6,23 @@ no save or publish method; the common runner owns the final write gate.
 
 from __future__ import annotations
 
+from field_policies import without_color_attributes
+
+from store_freight import sync_store_freight
+
 import asyncio
+import json
 import re
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
+from category_profile import category_search_terms
+from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
     CandidateSourceError,
     DomCandidate,
@@ -29,8 +38,10 @@ from taobao_listing import (
     parse_taobao_fabrics,
     parse_taobao_materials,
     selection_value_groups,
+    selection_value_groups_for_control,
 )
 from xhs_data import XhsFields
+from xhs_listing import normalize_xhs_attribute_options
 
 
 class XhsFormListingError(RuntimeError):
@@ -87,7 +98,7 @@ def _is_nonnegative_decimal(value: str) -> bool:
 
 
 def _required_excel_value(
-    fields: Mapping[str, str], aliases: Sequence[str], label: str
+    fields: Mapping[str, str], aliases: Sequence[str], label: str, *, money: bool = False
 ) -> str:
     wanted = {normalize_label(alias) for alias in aliases}
     matches = [
@@ -101,6 +112,13 @@ def _required_excel_value(
                 label, "/".join(aliases)
             )
         )
+    if money:
+        try:
+            matches = [
+                (key, normalize_money_value(value)) for key, value in matches
+            ]
+        except MoneyValueError as exc:
+            raise XhsFormListingError(f"Excel 小红书{label}{exc}") from exc
     distinct = {value for _key, value in matches}
     if len(distinct) != 1:
         raise XhsFormListingError(
@@ -152,6 +170,8 @@ def _contains_ordered_parts(
 class XhsFormListing(TaobaoListing):
     """Fill Xiaohongshu category data, presale, batch fields and 3:4 main art."""
 
+    freight_platform_id = "xhs"
+
     # XHS remote selects render an exact server-search result as an Element
     # ``created`` option even though the control is not free-form.  It is safe
     # to click only because the inherited matcher still requires one exact,
@@ -174,8 +194,10 @@ class XhsFormListing(TaobaoListing):
         )
         self._xhs_api_generation = 0
         self._xhs_api_category_id = ""
+        self._xhs_api_shop_id = ""
         self._xhs_api_fields: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
         self._xhs_api_options: Dict[Tuple[int, str], Tuple[FieldOption, ...]] = {}
+        self._xhs_active_option_attempts: set[Tuple[int, str]] = set()
         self._xhs_request_contexts: Dict[int, Tuple[str, int, str]] = {}
         self._xhs_response_tasks: set[asyncio.Task[Any]] = set()
         self._install_xhs_attribute_listener()
@@ -192,6 +214,28 @@ class XhsFormListing(TaobaoListing):
         try:
             form = parse_qs(str(request.post_data or ""), keep_blank_values=True)
             values = [str(value).strip() for value in form.get(name, ()) if str(value).strip()]
+        except Exception:
+            values = []
+        if len(values) == 1:
+            return values[0]
+        try:
+            payload = getattr(request, "post_data_json", None)
+            if callable(payload):
+                payload = payload()
+            if not isinstance(payload, Mapping):
+                payload = json.loads(str(request.post_data or "{}"))
+            candidates = []
+            if isinstance(payload, Mapping):
+                candidates.append(payload.get(name))
+                for container_name in ("params", "data", "body"):
+                    container = payload.get(container_name)
+                    if isinstance(container, Mapping):
+                        candidates.append(container.get(name))
+            values = [
+                str(value).strip()
+                for value in candidates
+                if value not in (None, "") and str(value).strip()
+            ]
         except Exception:
             values = []
         return values[0] if len(values) == 1 else ""
@@ -211,20 +255,52 @@ class XhsFormListing(TaobaoListing):
                     return
                 self._xhs_api_generation += 1
                 self._xhs_api_category_id = category_id
+                self._xhs_api_shop_id = self._request_parameter(request, "shopId")
                 self._xhs_api_fields = {}
                 self._xhs_api_options = {}
+                self._xhs_active_option_attempts = set()
                 self._xhs_request_contexts[id(request)] = (
                     "fields",
                     self._xhs_api_generation,
                     category_id,
                 )
             elif path == XHS_ATTRIBUTE_VALUES_PATH:
-                attribute_id = self._request_parameter(request, "attributeId")
+                attribute_id = next(
+                    (
+                        self._request_parameter(request, key)
+                        for key in ("attributeId", "attributeV3Id", "attrId", "id")
+                        if self._request_parameter(request, key)
+                    ),
+                    "",
+                )
                 if self._xhs_api_generation and attribute_id:
                     self._xhs_request_contexts[id(request)] = (
                         "values",
                         self._xhs_api_generation,
                         attribute_id,
+                    )
+                elif self.logger is not None:
+                    try:
+                        query_keys = sorted(
+                            parse_qs(
+                                urlsplit(str(request.url)).query,
+                                keep_blank_values=True,
+                            ).keys()
+                        )
+                    except Exception:
+                        query_keys = []
+                    try:
+                        body = getattr(request, "post_data_json", None)
+                        if callable(body):
+                            body = body()
+                        body_keys = sorted(body.keys()) if isinstance(body, Mapping) else []
+                    except Exception:
+                        body_keys = []
+                    self.logger.warning(
+                        "小红书候选接口请求未识别字段 ID：method=%s，query_keys=%s，body_keys=%s",
+                        getattr(request, "method", ""),
+                        query_keys,
+                        body_keys,
                     )
 
         def on_response(response: Any) -> None:
@@ -257,7 +333,7 @@ class XhsFormListing(TaobaoListing):
             return
         if generation != self._xhs_api_generation:
             return
-        data = payload.get("data", payload) if isinstance(payload, Mapping) else {}
+        data = self._xhs_payload_data(payload)
         if not isinstance(data, Mapping):
             return
         if kind == "fields":
@@ -279,18 +355,120 @@ class XhsFormListing(TaobaoListing):
                         "custom_allowed": raw_field.get("customizable") is True,
                     }
                 )
+                inline_values = raw_field.get("values")
+                if isinstance(inline_values, Sequence) and not isinstance(
+                    inline_values, (str, bytes)
+                ):
+                    self._xhs_api_options[(generation, field_id)] = field_options(
+                        normalize_xhs_attribute_options(inline_values),
+                        source="api",
+                    )
             self._xhs_api_fields = {
                 key: tuple(value) for key, value in records.items()
             }
             return
 
         raw_values = data.get("values")
+        if not isinstance(raw_values, Sequence) or isinstance(
+            raw_values, (str, bytes)
+        ):
+            raw_values = data.get("attributeValueV3s")
         if not isinstance(raw_values, Sequence) or isinstance(raw_values, (str, bytes)):
             raw_values = ()
-        self._xhs_api_options[(generation, identity)] = field_options(
-            raw_values,
+        options = field_options(
+            normalize_xhs_attribute_options(raw_values),
             source="api",
         )
+        self._xhs_api_options[(generation, identity)] = options
+        if not options and self.logger is not None:
+            self.logger.warning(
+                "小红书候选接口返回未含候选数组：字段 %s，data_keys=%s",
+                identity,
+                sorted(data.keys()),
+            )
+
+    @staticmethod
+    def _xhs_payload_data(payload: Any) -> Mapping[str, Any]:
+        current = payload
+        for _attempt in range(4):
+            if not isinstance(current, Mapping):
+                return {}
+            if "result" in current and "data" in current:
+                if current.get("result") is True or str(current.get("result")) == "1":
+                    current = current.get("data")
+                    continue
+                return {}
+            if isinstance(current.get("success"), bool) and "data" in current:
+                if current.get("success"):
+                    current = current.get("data")
+                    continue
+                return {}
+            if "code" in current and "data" in current:
+                if str(current.get("code")).upper() in {
+                    "0", "1", "200", "OK", "SUCCESS"
+                }:
+                    current = current.get("data")
+                    continue
+                return {}
+            if "data" in current and isinstance(current.get("data"), Mapping):
+                current = current.get("data")
+                continue
+            return current
+        return current if isinstance(current, Mapping) else {}
+
+    async def _request_xhs_attribute_options(
+        self, field_id: str
+    ) -> Tuple[FieldOption, ...]:
+        """Read one missing option list without depending on a UI refetch."""
+        try:
+            payload = await self.page.evaluate(
+                """async ({shopId, attributeId}) => {
+                  const url = new URL('/xhs/getAttributeValues.json', window.location.origin);
+                  url.searchParams.set('shopId', shopId || '');
+                  url.searchParams.set('attributeId', attributeId);
+                  url.searchParams.set('api_name', 'xhs_getAttributeValues');
+                  const response = await fetch(url.toString(), {
+                    credentials: 'same-origin',
+                    headers: {'Accept': 'application/json'}
+                  });
+                  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                  return await response.json();
+                }""",
+                {
+                    "shopId": self._xhs_api_shop_id,
+                    "attributeId": field_id,
+                },
+            )
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "小红书属性候选主动读取失败（字段 %s）：%s",
+                    field_id,
+                    exc,
+                )
+            return ()
+        data = self._xhs_payload_data(payload)
+        raw_values = data.get("values")
+        if not isinstance(raw_values, Sequence) or isinstance(
+            raw_values, (str, bytes)
+        ):
+            raw_values = data.get("attributeValueV3s")
+        if not isinstance(raw_values, Sequence) or isinstance(
+            raw_values, (str, bytes)
+        ):
+            raw_values = ()
+        options = field_options(
+            normalize_xhs_attribute_options(raw_values), source="api"
+        )
+        if options:
+            self._xhs_api_options[(self._xhs_api_generation, field_id)] = options
+        elif self.logger is not None:
+            self.logger.warning(
+                "小红书候选主动读取未含候选数组：字段 %s，data_keys=%s",
+                field_id,
+                sorted(data.keys()),
+            )
+        return options
 
     async def _drain_xhs_attribute_tasks(self) -> None:
         await asyncio.sleep(0)
@@ -313,6 +491,15 @@ class XhsFormListing(TaobaoListing):
                     (self._xhs_api_generation, field_id),
                     (),
                 )
+                attempt_key = (self._xhs_api_generation, field_id)
+                if (
+                    not options
+                    and field_id
+                    and self._xhs_api_category_id
+                    and attempt_key not in self._xhs_active_option_attempts
+                ):
+                    self._xhs_active_option_attempts.add(attempt_key)
+                    options = await self._request_xhs_attribute_options(field_id)
                 if options and self._xhs_api_category_id:
                     return records[0], options, self._xhs_api_category_id
             await asyncio.sleep(0.05)
@@ -445,7 +632,42 @@ class XhsFormListing(TaobaoListing):
                         len(root_leaf)
                     )
                 )
-        raise XhsFormListingError("小红书类目搜索结果中没有 Excel 的完整或唯一首末级路径")
+
+        # New-category workbooks may list cross-platform category hints rather
+        # than one marketplace path.  Try the most specific exact leaf first;
+        # every accepted leaf must still be unique in the platform JSON.
+        for hint in category_search_terms(category_path):
+            wanted = normalize_label(hint)
+            leaf_matches = [
+                text
+                for text in result_texts
+                if _category_parts(text) and _category_parts(text)[-1] == wanted
+            ]
+            # Excel 类目有时携带“男士/女士”等供应商层级，而平台结果
+            # 只保留“男装/女装”根类目。用人群根类目消除同名末级项，
+            # 例如“卫衣”同时出现在女装、童装、运动和男装下。
+            gender_roots = ()
+            expected_text = " ".join(expected)
+            if "男士" in expected_text or "男装" in expected_text:
+                gender_roots = ("男装",)
+            elif "女士" in expected_text or "女装" in expected_text:
+                gender_roots = ("女装",)
+            if len(leaf_matches) > 1 and gender_roots:
+                narrowed = [
+                    text for text in leaf_matches
+                    if any(root in _category_parts(text) for root in gender_roots)
+                ]
+                if len(narrowed) == 1:
+                    return narrowed[0], "gender_root_exact_hint_leaf"
+            if len(leaf_matches) == 1:
+                return leaf_matches[0], "unique_exact_hint_leaf"
+            if len(leaf_matches) > 1:
+                raise XhsFormListingError(
+                    "小红书类目提示词末级不是唯一精确项：{0}={1}".format(
+                        hint, len(leaf_matches)
+                    )
+                )
+        raise XhsFormListingError("小红书类目搜索结果中没有 Excel 的完整路径或唯一精确提示词")
 
     @staticmethod
     def _category_paths_from_json(payload: Any) -> Tuple[str, ...]:
@@ -619,11 +841,27 @@ class XhsFormListing(TaobaoListing):
         selected_parts = _category_parts(selected)
         expected_parts = tuple(normalize_label(segment) for segment in path)
         selected_ok = _contains_ordered_parts(selected_parts, expected_parts)
-        if strategy == "first_and_leaf_exact":
+        if strategy in {"first_and_leaf_exact", "gender_root_exact_hint_leaf"}:
             selected_ok = (
-                expected_parts[0] in selected_parts
+                (
+                    expected_parts[0] in selected_parts
+                    or (
+                        strategy == "gender_root_exact_hint_leaf"
+                        and any(root in selected_parts for root in ("男装", "女装"))
+                    )
+                )
                 and bool(selected_parts)
-                and selected_parts[-1] == expected_parts[-1]
+                and (
+                    selected_parts[-1] == expected_parts[-1]
+                    or (
+                        strategy == "gender_root_exact_hint_leaf"
+                        and selected_parts[-1] in expected_parts
+                    )
+                )
+            )
+        elif strategy == "unique_exact_hint_leaf":
+            selected_ok = bool(selected_parts) and selected_parts[-1] in set(
+                expected_parts
             )
         if not selected_ok:
             raise XhsFormListingError(
@@ -740,6 +978,7 @@ class XhsFormListing(TaobaoListing):
         # Xiaohongshu's field is ``厚薄`` and must use the latter rather than
         # treating the two source concepts as conflicting values.
         direct_sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         alias_sources: Dict[str, List[Tuple[str, str]]] = {}
         for excel_key, raw_value in fields.items():
             aliases = set(excel_aliases(excel_key))
@@ -796,17 +1035,28 @@ class XhsFormListing(TaobaoListing):
         page_label: str,
         select: Any,
         groups: Sequence[Sequence[str]],
-    ) -> Tuple[str, ...]:
+    ) -> Optional[Tuple[str, ...]]:
         runtime = self.attribute_runtime
+        managed = is_learning_managed_field("xhs", page_label)
         if runtime is None:
             raise XhsFormListingError("小红书属性学习运行器未启用")
         multi = await select.locator(".el-select__tags").count() > 0
         await self._open_select(select, multi=multi)
         try:
             _dropdown, dom_options = await self._visible_dom_options(select)
-            field, api_options, category_id = await self._captured_xhs_field(
-                page_label
-            )
+            try:
+                field, api_options, category_id = await self._captured_xhs_field(
+                    page_label
+                )
+            except XhsFormListingError as exc:
+                if self.logger is not None:
+                    self.logger.info(
+                        "小红书属性“%s”：接口字段或候选未定位，"
+                        "改用当前 DOM 匹配/直接输入与回读：%s",
+                        page_label,
+                        exc,
+                    )
+                return None
         finally:
             try:
                 await self._dismiss_select_dropdown(select)
@@ -817,7 +1067,12 @@ class XhsFormListing(TaobaoListing):
                 api_options,
                 tuple(
                     DomCandidate(
-                        str(option.get("value") or ""),
+                        (
+                            ""
+                            if normalize_option(option.get("value") or "")
+                            == normalize_option(option.get("name") or "")
+                            else str(option.get("value") or "")
+                        ),
                         str(option.get("name") or ""),
                         not bool(option.get("disabled")),
                     )
@@ -825,6 +1080,25 @@ class XhsFormListing(TaobaoListing):
                 ),
             )
         except CandidateSourceError as exc:
+            if not managed:
+                return None
+            if self.logger is not None:
+                self.logger.error(
+                    "小红书属性“%s”候选校验明细：API=%s，DOM=%s",
+                    page_label,
+                    [
+                        (value.value_id, value.label)
+                        for value in api_options
+                    ],
+                    [
+                        (
+                            str(option.get("value") or ""),
+                            str(option.get("name") or ""),
+                            not bool(option.get("disabled")),
+                        )
+                        for option in dom_options
+                    ],
+                )
             raise XhsFormListingError(
                 "小红书属性“{0}”接口候选与页面候选不一致：{1}".format(
                     page_label,
@@ -832,6 +1106,14 @@ class XhsFormListing(TaobaoListing):
                 )
             ) from exc
         field_id = str(field.get("id") or "").strip()
+        if not field_id or not str(category_id).strip():
+            if self.logger is not None:
+                self.logger.info(
+                    "小红书属性“%s”：接口字段 ID 或类目 ID 不完整，"
+                    "改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return None
         schema_version = canonical_sha256(
             {
                 "platform_id": "xhs",
@@ -845,25 +1127,23 @@ class XhsFormListing(TaobaoListing):
         )
         resolved_values = []
         for group in groups:
-            exact = tuple(
-                value.label
-                for value in candidates
-                if any(
-                    normalize_option(value.label) == normalize_option(alias)
-                    for alias in group
-                )
+            request_candidates, excel_value = await self._excel_before_review(
+                select, candidates, group, label=page_label,
+                preflight_request=AttributeRequest(
+                    platform_id="xhs", category_leaf_id=category_id,
+                    field_id=field_id, field_label=page_label,
+                    candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                    excel_value="/".join(group), evidence={},
+                    custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                ),
             )
-            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
             resolved = await runtime.resolve(
                 AttributeRequest(
                     platform_id="xhs",
                     category_leaf_id=category_id,
                     field_id=field_id,
                     field_label=page_label,
-                    candidates=tuple(
-                        CandidateValue(value.value_id, value.label)
-                        for value in candidates
-                    ),
+                    candidates=request_candidates,
                     excel_value=excel_value,
                     evidence={"excel": bool(excel_value.strip())},
                     custom_allowed=bool(field.get("custom_allowed")),
@@ -871,6 +1151,8 @@ class XhsFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
+            if resolved is None:
+                return ()
             resolved_values.append(resolved.label)
         return tuple(resolved_values)
 
@@ -896,23 +1178,31 @@ class XhsFormListing(TaobaoListing):
         groups = (
             tuple((str(value),) for value in exact_values)
             if exact_values is not None
-            else selection_value_groups(page_label, expected)
+            else selection_value_groups_for_control(
+                page_label, expected, multi=multi
+            )
         )
         if not groups:
             raise XhsFormListingError("小红书属性“{0}”期望值为空".format(page_label))
-        if not multi and len(groups) != 1:
-            raise XhsFormListingError(
-                "小红书属性“{0}”是单选，Excel 却提供多个逗号分组".format(page_label)
-            )
+        # 小红书页面部分控件带有多选外观，但保存接口的
+        # XhsGoodsProperty.value 实际声明为 String；发送数组会直接触发
+        # Jackson START_ARRAY 反序列化错误。提交前保留第一个精确值，
+        # 确保请求与接口协议一致。
         if self.attribute_runtime is not None:
-            groups = tuple(
-                (value,)
-                for value in await self._resolve_learning_select_groups(
-                    page_label,
-                    select,
-                    groups,
-                )
+            resolved_values = await self._resolve_learning_select_groups(
+                page_label,
+                select,
+                groups,
             )
+            if resolved_values == ():
+                if self.logger is not None:
+                    self.logger.info(
+                        "小红书属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                        page_label,
+                    )
+                return None
+            if resolved_values is not None:
+                groups = tuple((value,) for value in resolved_values)
         try:
             actual = await self._select_values(select, groups, label=page_label, multi=multi)
         except TaobaoListingError as exc:
@@ -1010,7 +1300,7 @@ class XhsFormListing(TaobaoListing):
         return None
 
     async def fill_category_attributes(self, fields: XhsFields) -> Mapping[str, Any]:
-        page_items = await self._attribute_items()
+        page_items = without_color_attributes(await self._attribute_items())
         assignments = await self._attribute_assignments(fields.fields, page_items)
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped: Dict[str, str] = {}
@@ -1019,13 +1309,47 @@ class XhsFormListing(TaobaoListing):
             if assignment is None:
                 continue
             _source_label, expected = assignment
-            actual = await self._fill_attribute(
-                page_label,
-                item,
-                expected,
-                exact_values=self._special_attribute_values(fields.fields, page_label, expected),
-                required=await self._attribute_is_required(item),
+            exact_values = self._special_attribute_values(
+                fields.fields, page_label, expected
             )
+            required = await self._attribute_is_required(item)
+            fabric_label = normalize_label(page_label)
+            fabric_values = exact_values
+            if fabric_label in {
+                normalize_label("面料分类"),
+            } and (not fabric_values or len(fabric_values) < 2):
+                fabric_values = self._special_attribute_values(
+                    fields.fields, "材质成分", expected
+                )
+            if (
+                fabric_label in {
+                    normalize_label("面料"),
+                    normalize_label("面料分类"),
+                }
+                and fabric_values is not None
+                and len(fabric_values) >= 2
+            ):
+                actual = await self._fill_fabric_attribute(
+                    page_label,
+                    fabric_values,
+                    item=item,
+                    raw_value=expected,
+                    writer=lambda value, values: self._fill_attribute(
+                        page_label,
+                        item,
+                        value,
+                        exact_values=values,
+                        required=required,
+                    ),
+                )
+            else:
+                actual = await self._fill_attribute(
+                    page_label,
+                    item,
+                    expected,
+                    exact_values=exact_values,
+                    required=required,
+                )
             if actual is None:
                 skipped[page_label] = expected
             else:
@@ -1043,9 +1367,37 @@ class XhsFormListing(TaobaoListing):
         }
 
     async def _find_named_input(self, label: str) -> Any:
+        """Re-query after category rendering and scroll only the editor for lazy fields."""
+        deadline = asyncio.get_running_loop().time() + 12
+        step = 0
+        while True:
+            control = await self._find_named_input_once(label)
+            if control is not None:
+                await control.scroll_into_view_if_needed(timeout=5000)
+                return control
+            if asyncio.get_running_loop().time() >= deadline:
+                raise XhsFormListingError(
+                    "小红书字段“{0}”等待渲染并滚动查找后仍未找到输入框".format(label)
+                )
+            if step == 0 and self.logger is not None:
+                self.logger.info("小红书字段“%s”暂未出现，等待渲染并在编辑区域滚动查找", label)
+            await self.panel.evaluate('''(panel, step) => {
+              const roots = [panel, ...panel.querySelectorAll('*')];
+              for (let p = panel.parentElement; p && !['BODY','HTML'].includes(p.tagName); p = p.parentElement) roots.push(p);
+              for (const el of roots) {
+                if (!/(auto|scroll)/.test(getComputedStyle(el).overflowY) || el.clientHeight <= 0 || el.scrollHeight <= el.clientHeight) continue;
+                const bottom = el.scrollHeight - el.clientHeight;
+                const next = step === 0 || el.scrollTop >= bottom - 2 ? 0 : Math.min(bottom, el.scrollTop + el.clientHeight * 0.75);
+                el.scrollTo({top: next, behavior: 'instant'});
+              }
+            }''', step)
+            step += 1
+            await asyncio.sleep(0.4)
+
+    async def _find_named_input_once(self, label: str) -> Any:
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
-        direct = self.panel.locator('[data-xhs-field="{0}"] input:visible'.format(label))
+        direct = self.panel.locator('[data-xhs-field="{0}"]'.format(label)).locator('input:not([type="hidden"]):visible, textarea:visible')
         if await direct.count() == 1:
             return direct.first
         label_nodes = self.panel.get_by_text(
@@ -1058,16 +1410,18 @@ class XhsFormListing(TaobaoListing):
                 continue
             root = node
             for _depth in range(5):
-                inputs = root.locator('input:not([type="hidden"]):visible')
+                inputs = root.locator('input:not([type="hidden"]):visible, textarea:visible')
                 if await inputs.count() == 1:
                     matches.append(inputs.first)
                     break
+                if await root.evaluate("e => e.classList.contains('el-form-item')"):
+                    break
                 root = root.locator("xpath=..")
-        if len(matches) != 1:
+        if len(matches) > 1:
             raise XhsFormListingError(
                 "小红书字段“{0}”输入框不是唯一项：{1}".format(label, len(matches))
             )
-        return matches[0]
+        return matches[0] if matches else None
 
     async def fill_identity(self, title: str, style_code: str) -> Mapping[str, str]:
         expected_title = title_without_neigborl(title)
@@ -1289,7 +1643,9 @@ class XhsFormListing(TaobaoListing):
 
     async def fill_price_inventory_batch(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
         expected = {
-            "售价": _required_excel_value(fields, ("售价", "售卖价", "价格", "基本售价"), "售价"),
+            "售价": _required_excel_value(
+                fields, ("售价", "售卖价", "价格", "基本售价"), "售价", money=True
+            ),
             "库存": _required_excel_value(fields, ("数量", "库存"), "库存"),
         }
         inventory = Decimal(expected["库存"])
@@ -1363,6 +1719,158 @@ class XhsFormListing(TaobaoListing):
         )
         return {"source": "3:4主图", "count": len(paths), "action": action}
 
+    async def _verify_persisted_identity(
+        self, title: str, style_code: str
+    ) -> Mapping[str, str]:
+        expected = {
+            "商品标题": title_without_neigborl(title),
+            "货号": str(style_code).strip(),
+        }
+        actual: Dict[str, str] = {}
+        errors: List[str] = []
+        for label, expected_value in expected.items():
+            control = await self._find_named_input(label)
+            current = (await control.input_value()).strip()
+            actual[label] = current
+            if current != expected_value:
+                errors.append(
+                    "{0}=期望 {1!r}，页面为 {2!r}".format(
+                        label, expected_value, current
+                    )
+                )
+        if errors:
+            raise XhsFormListingError(
+                "小红书保存后身份字段回读失败：" + "；".join(errors)
+            )
+        return actual
+
+    async def _verify_persisted_attributes(
+        self, expected_attributes: Mapping[str, Sequence[str]]
+    ) -> Mapping[str, Tuple[str, ...]]:
+        page_items = await self._attribute_items()
+        persisted: Dict[str, Tuple[str, ...]] = {}
+        errors: List[str] = []
+        for expected_label, expected_values in expected_attributes.items():
+            matches = [
+                (page_label, item)
+                for page_label, item in page_items.values()
+                if normalize_label(page_label) == normalize_label(expected_label)
+            ]
+            if len(matches) != 1:
+                errors.append(
+                    "{0}=页面字段不唯一({1})".format(expected_label, len(matches))
+                )
+                continue
+            page_label, item = matches[0]
+            selects = item.locator(".el-select:visible")
+            if await selects.count() != 1:
+                errors.append("{0}=下拉控件不唯一".format(page_label))
+                continue
+            select = selects.first
+            multi = await select.locator(".el-select__tags").count() > 0
+            actual = await self._read_select_values(select, multi=multi)
+            expected_counter = Counter(
+                normalize_option(value)
+                for value in expected_values
+                if normalize_option(value)
+            )
+            actual_counter = Counter(
+                normalize_option(value) for value in actual if normalize_option(value)
+            )
+            if actual_counter != expected_counter:
+                errors.append(
+                    "{0}=期望 {1}，页面为 {2}".format(
+                        page_label, tuple(expected_values), actual
+                    )
+                )
+                continue
+            persisted[page_label] = tuple(actual)
+        if errors:
+            raise XhsFormListingError(
+                "小红书保存后类目属性回读失败：" + "；".join(errors[:12])
+            )
+        return persisted
+
+    async def _persisted_radio_is_checked(self, option_text: str) -> bool:
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        matches = []
+        options = self.panel.locator("label.el-radio:visible")
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if normalize_label(await option.inner_text()) == normalize_label(option_text):
+                matches.append(option)
+        if len(matches) != 1:
+            raise XhsFormListingError(
+                "小红书保存后单选项“{0}”不唯一：{1}".format(
+                    option_text, len(matches)
+                )
+            )
+        option = matches[0]
+        control = option.locator('input[type="radio"]').first
+        return await control.is_checked() or "is-checked" in set(
+            (await option.get_attribute("class") or "").split()
+        )
+
+    async def verify_persisted_values(
+        self,
+        fields: XhsFields,
+        *,
+        title: str,
+        style_code: str,
+        expected_attributes: Mapping[str, Sequence[str]],
+        expected_freight: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """Read critical Xiaohongshu values after save without changing them."""
+        identity = await self._verify_persisted_identity(title, style_code)
+        attributes = await self._verify_persisted_attributes(expected_attributes)
+        freight = await sync_store_freight(self, fields.fields, read_only=True, expected=expected_freight)
+
+        full_mode = await self._persisted_radio_is_checked("全款预售模式")
+        timed_mode = await self._persisted_radio_is_checked("时段预售")
+        if not full_mode or not timed_mode:
+            raise XhsFormListingError("小红书保存后全款时段预售没有持久化")
+        day_control, is_select = await self._presale_day_control()
+        if is_select:
+            days_values = await self._read_select_values(day_control, multi=False)
+            days = days_values[0] if len(days_values) == 1 else ""
+        else:
+            days = (await day_control.input_value()).strip()
+        if normalize_option(days) not in {
+            normalize_option("15"),
+            normalize_option("15天"),
+        }:
+            raise XhsFormListingError(
+                "小红书保存后预售天数回读失败：{0!r}".format(days)
+            )
+
+        expected_sku = {
+            "售价": _required_excel_value(
+                fields.fields, ("售价", "售卖价", "价格", "基本售价"), "售价", money=True
+            ),
+            "库存": _required_excel_value(fields.fields, ("数量", "库存"), "库存"),
+        }
+        rows = self._validate_sku_snapshot(
+            await self._sku_table_snapshot(), expected_sku
+        )
+        errors = await self._visible_validation_errors()
+        if errors:
+            raise XhsFormListingError(
+                "小红书保存后仍有页面校验错误：" + "；".join(errors)
+            )
+        return {
+            "identity": identity,
+            "attributes": attributes,
+            "presale": {
+                "发货模式": "全款预售模式",
+                "预售类型": "时段预售",
+                "付款后": days,
+            },
+            "sku_values": expected_sku,
+            "row_count": len(rows),
+            "freight": freight,
+        }
+
     async def apply_excel_fields(
         self,
         fields: XhsFields,
@@ -1378,6 +1886,7 @@ class XhsFormListing(TaobaoListing):
         attributes = await self.fill_category_attributes(fields)
         presale = await self.apply_full_payment_presale()
         batch = await self.fill_price_inventory_batch(fields.fields)
+        freight = await sync_store_freight(self, fields.fields)
         images = await self.sync_main_images(
             portrait_paths, timeout_seconds=timeout_seconds, uploader=uploader
         )
@@ -1385,7 +1894,15 @@ class XhsFormListing(TaobaoListing):
             errors = await self._visible_validation_errors()
         except TaobaoListingError as exc:
             raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
-        if errors:
+        if (
+            errors
+            and not (
+                self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+            )
+        ):
             raise XhsFormListingError("小红书页面校验错误：" + "；".join(errors))
         return {
             "category": category,
@@ -1394,4 +1911,13 @@ class XhsFormListing(TaobaoListing):
             "presale": presale,
             "sku_batch": batch,
             "main_images": images,
+            "freight": freight,
+            "deferred_validation_errors": (
+                errors
+                if self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+                else ()
+            ),
         }

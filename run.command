@@ -6,9 +6,69 @@ cd "$SCRIPT_DIR"
 
 typeset -a PYTHON_ARGS
 
+select_product_excel() {
+  local products_root="${KUAIMAI_PRODUCTS_ROOT:-/Volumes/共享文件/谭/products}"
+  local last_product_file="${KUAIMAI_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-product-path}"
+  local last_product=""
+  local selected_excel=""
+  local default_index=""
+  local choice=""
+  local index=1
+  typeset -a product_files
+
+  if [[ "${KUAIMAI_SKIP_PRODUCT_SELECTION:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$products_root" ]]; then
+    print "未找到共享盘商品目录：$products_root"
+    print "请先在 Finder 中挂载共享文件夹，再重新启动。"
+    return 1
+  fi
+  product_files=("${(@f)$(find "$products_root" -mindepth 2 -maxdepth 2 -type f -name '产品信息.xlsx' -print 2>/dev/null | LC_ALL=C sort)}")
+  product_files=("${(@)product_files:#}")
+  if (( ${#product_files[@]} == 0 )); then
+    print "共享盘中没有找到产品信息.xlsx：$products_root"
+    return 1
+  fi
+  if [[ -f "$last_product_file" ]]; then
+    IFS= read -r last_product < "$last_product_file" || true
+  fi
+
+  print ""
+  print "请选择本次商品资料："
+  for file in "${product_files[@]}"; do
+    local folder="${file:h:t}"
+    if [[ "$file" == "$last_product" ]]; then
+      default_index="$index"
+      print "  $index) $folder  [上次选择]"
+    else
+      print "  $index) $folder"
+    fi
+    (( index++ ))
+  done
+  while true; do
+    if [[ -n "$default_index" ]]; then
+      read "choice?商品编号 [回车继续使用 $default_index]: "
+      [[ -z "$choice" ]] && choice="$default_index"
+    else
+      read "choice?商品编号 [1-${#product_files[@]}]: "
+    fi
+    if [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= ${#product_files[@]} )); then
+      selected_excel="${product_files[$choice]}"
+      break
+    fi
+    print "请输入 1-${#product_files[@]} 的编号。"
+  done
+  mkdir -p "${last_product_file:h}"
+  print -r -- "$selected_excel" > "$last_product_file"
+  PYTHON_ARGS+=(--excel-url "$selected_excel")
+  print "本次商品：${selected_excel:h:t}"
+}
+
 # 双击本脚本时统一在当前终端选择平台和执行模式；带参数调用时保留
 # 命令行入口，便于测试、定时任务和已有自动化调用。
 if (( $# == 0 )); then
+  select_product_excel
   print ""
   print "快麦一键铺货｜统一启动器"
   print "========================================"
@@ -24,8 +84,9 @@ if (( $# == 0 )); then
   print "  8) 有赞（填写、保存、铺货）"
   print "  9) 京东（填写、保存、铺货）"
   print " 10) 一键新增链接（按视频固定填法，仅创建快麦商品）"
+  print " 11) 全平台（有赞除外：基础资料 + 抖音 + 淘宝 + 天猫 + 拼多多 + 微信小店 + 小红书 + 京东）"
   while true; do
-    read "platform_choice?平台编号 [0-10]: "
+    read "platform_choice?平台编号 [0-11]: "
     case "$platform_choice" in
       0) selected_platform="all"; break ;;
       1) selected_platform="base"; break ;;
@@ -38,7 +99,8 @@ if (( $# == 0 )); then
       8) selected_platform="youzan"; break ;;
       9) selected_platform="jd"; break ;;
       10) selected_platform="create"; break ;;
-      *) print "请输入 0-10 的编号。" ;;
+      11) selected_platform="all"; PYTHON_ARGS+=(--all-platform-skip youzan); break ;;
+      *) print "请输入 0-11 的编号。" ;;
     esac
   done
 
@@ -82,73 +144,73 @@ if (( $# == 0 )); then
   done
 
   case "$selected_platform:$selected_mode" in
-    create:preview) PYTHON_ARGS=(--platform base --create-product --no-save) ;;
-    create:save_only) PYTHON_ARGS=(--platform base --create-product --save-only) ;;
+    create:preview) PYTHON_ARGS+=(--platform base --create-product --no-save) ;;
+    create:save_only) PYTHON_ARGS+=(--platform base --create-product --save-only) ;;
     wxsph:preview)
-      PYTHON_ARGS=(--platform wxsph --no-save)
+      PYTHON_ARGS+=(--platform wxsph --no-save)
       ;;
     wxsph:save_only)
-      PYTHON_ARGS=(--platform wxsph --save-only)
+      PYTHON_ARGS+=(--platform wxsph --save-only)
       ;;
     wxsph:publish)
-      PYTHON_ARGS=(--platform wxsph --save)
+      PYTHON_ARGS+=(--platform wxsph --save)
       ;;
     xhs:preview)
-      PYTHON_ARGS=(--platform xhs --no-save)
+      PYTHON_ARGS+=(--platform xhs --no-save)
       ;;
     xhs:save_only)
-      PYTHON_ARGS=(--platform xhs --save-only)
+      PYTHON_ARGS+=(--platform xhs --save-only)
       ;;
     xhs:publish)
-      PYTHON_ARGS=(--platform xhs --save)
+      PYTHON_ARGS+=(--platform xhs --save)
       ;;
     youzan:preview)
-      PYTHON_ARGS=(--platform youzan --no-save)
+      PYTHON_ARGS+=(--platform youzan --no-save)
       ;;
     youzan:save_only)
-      PYTHON_ARGS=(--platform youzan --save-only)
+      PYTHON_ARGS+=(--platform youzan --save-only)
       ;;
     youzan:publish)
-      PYTHON_ARGS=(--platform youzan --save)
+      PYTHON_ARGS+=(--platform youzan --save)
       ;;
     jd:preview)
-      PYTHON_ARGS=(--platform jd --no-save)
+      PYTHON_ARGS+=(--platform jd --no-save)
       ;;
     jd:save_only)
-      PYTHON_ARGS=(--platform jd --save-only)
+      PYTHON_ARGS+=(--platform jd --save-only)
       ;;
     jd:publish)
-      PYTHON_ARGS=(--platform jd --save)
+      PYTHON_ARGS+=(--platform jd --save)
       ;;
     pdd:preview)
-      PYTHON_ARGS=(--platform pdd --no-save)
+      PYTHON_ARGS+=(--platform pdd --no-save)
       ;;
     pdd:save_only)
-      PYTHON_ARGS=(--platform pdd --save-only)
+      PYTHON_ARGS+=(--platform pdd --save-only)
       ;;
     pdd:publish)
-      PYTHON_ARGS=(--platform pdd --save)
+      PYTHON_ARGS+=(--platform pdd --save)
       ;;
     tmall:preview)
-      PYTHON_ARGS=(--platform tmall --no-save)
+      PYTHON_ARGS+=(--platform tmall --no-save)
       ;;
     tmall:save_only)
-      PYTHON_ARGS=(--platform tmall --save-only)
+      PYTHON_ARGS+=(--platform tmall --save-only)
       ;;
     tmall:publish)
-      PYTHON_ARGS=(--platform tmall --save)
+      PYTHON_ARGS+=(--platform tmall --save)
       ;;
     taobao:preview)
-      PYTHON_ARGS=(--platform taobao --no-save)
+      PYTHON_ARGS+=(--platform taobao --no-save)
       ;;
     taobao:save_only)
-      PYTHON_ARGS=(--platform taobao --save-only --allow-taobao-save-once)
+      PYTHON_ARGS+=(--platform taobao --save-only --allow-taobao-save-once)
       ;;
     taobao:publish)
-      PYTHON_ARGS=(--platform taobao --save --allow-taobao-publish-once)
+      PYTHON_ARGS+=(--platform taobao --save --allow-taobao-publish-once)
       ;;
     all:preview|all:save_only|all:publish|base:preview|base:save_only|base:publish|douyin:preview|douyin:save_only|douyin:publish)
-      PYTHON_ARGS=(--platform "$selected_platform")
+      PYTHON_ARGS+=(--platform "$selected_platform")
       case "$selected_mode" in
         preview) PYTHON_ARGS+=(--no-save) ;;
         save_only) PYTHON_ARGS+=(--save-only) ;;
@@ -173,6 +235,16 @@ else
     else
       PYTHON_ARGS=(--platform all "${PYTHON_ARGS[@]}")
     fi
+  fi
+fi
+
+if [[ "${KUAIMAI_LEARNING_AUTO_ENABLE:-0}" == "1" ]]; then
+  has_learning_argument=0
+  for argument in "${PYTHON_ARGS[@]}"; do
+    if [[ "$argument" == "--learning-enabled" ]]; then has_learning_argument=1; fi
+  done
+  if (( ! has_learning_argument )); then
+    PYTHON_ARGS+=(--learning-enabled)
   fi
 fi
 

@@ -300,6 +300,11 @@ class TaobaoApiJsonIndex:
             if field.source_id and field.option_values
         )
 
+    @property
+    def active_category_id(self) -> str:
+        """Return the category bound to the latest captured schema."""
+        return self._active_category_id
+
     async def wait_for_candidate_field(
         self,
         label: object,

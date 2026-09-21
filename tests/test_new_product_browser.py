@@ -49,10 +49,14 @@ function showTemplate(){
 function applyTemplate(){
  document.querySelector('#sizes').innerHTML=sizes.map(s=>`<div class="specification-value-flex_input"><input value="${s}"></div>`).join('');
  document.querySelector('#template').style.display='none';
- document.querySelector('#rows').innerHTML=sizes.map(s=>`<tr><td>军绿色</td><td>${s}</td><td><input type="text"></td>${Array(6).fill('<td><input type="text" value="0"></td>').join('')}</tr>`).join('');
+ const colors=[...document.querySelectorAll('#colors .specification-value-flex_input input')].map(input=>input.value);
+ document.querySelector('#rows').innerHTML=colors.flatMap(color=>sizes.map(s=>`<tr><td>${color}</td><td>${s}</td><td><input type="text"></td>${Array(6).fill('<td><input type="text" value="0"></td>').join('')}</tr>`)).join('');
 }
 function generate(){
- [...document.querySelectorAll('#rows tr')].forEach((row,i)=>row.querySelector('input').value=document.querySelector('#style-code').value+'军绿色'+sizes[i]);
+ [...document.querySelectorAll('#rows tr')].forEach(row=>{
+   const cells=row.querySelectorAll('td');
+   row.querySelector('input').value=document.querySelector('#style-code').value+cells[0].innerText+cells[1].innerText;
+ });
  document.querySelector('#generator').style.display='none';
 }
 </script>
@@ -68,7 +72,11 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
                 await page.set_content(HTML)
                 # 新增按钮展开后，真实页面会出现“手工新增商品”菜单项；此处标题兼作该菜单项。
                 drawer = await erp.open_new_product_drawer(page, 3)
-                product = SimpleNamespace(style_code='TEST-7', main_images=[Path('/tmp/product.png')])
+                product = SimpleNamespace(
+                    style_code='TEST-7',
+                    main_images=[Path('/tmp/product.png')],
+                    colors=('复古蓝',),
+                )
                 args = SimpleNamespace(timeout=3, upload_timeout=3)
                 with patch.object(erp, 'sync_image_group', AsyncMock()) as uploading:
                     result = await erp.fill_new_product_form(page, drawer, product, args)
@@ -77,7 +85,7 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(uploading.call_args.args[2], product.main_images)
                 report = await erp.validate_new_product_form(drawer, product)
                 self.assertEqual(report['sku_count'], 5)
-                self.assertEqual(report['rows'][-1]['商品编码'], 'TEST-7军绿色2XL')
+                self.assertEqual(report['rows'][-1]['商品编码'], 'TEST-7复古蓝2XL')
                 await page.locator('#rows tr').last.locator('input').first.fill('WRONG')
                 with self.assertRaises(erp.AutomationError):
                     await erp.validate_new_product_form(drawer, product)

@@ -3,14 +3,20 @@ import type { ReviewEnv, ReviewTask, User } from "./types";
 const leaseMs = 10 * 60 * 1000;
 export async function listReviews(env: ReviewEnv, user: User) {
   const rows = await env.DB.prepare(
-    "SELECT r.*,p.title,s.options_json FROM review_tasks r JOIN products p USING(product_version) JOIN option_snapshots s USING(snapshot_version) WHERE p.deleting=0 AND r.status IN ('pending','claimed') AND (r.claimed_by IS NULL OR r.claimed_by=? OR r.lease_until<=?) ORDER BY r.created_at,r.id LIMIT 50",
+    "SELECT r.*,p.title,s.options_json,s.custom_allowed FROM review_tasks r JOIN products p USING(product_version) JOIN option_snapshots s USING(snapshot_version) WHERE p.deleting=0 AND r.status IN ('pending','claimed') AND NOT EXISTS(SELECT 1 FROM run_checkpoints c WHERE c.run_id=r.run_id AND c.status IN ('failed','completed')) AND (r.claimed_by IS NULL OR r.claimed_by=? OR r.lease_until<=?) ORDER BY r.created_at,r.id LIMIT 50",
   )
     .bind(user.id, new Date().toISOString())
-    .all<ReviewTask & { title: string; options_json: string }>();
+    .all<
+      ReviewTask & {
+        title: string;
+        options_json: string;
+        custom_allowed: number;
+      }
+    >();
   const tasks = [];
   for (const row of rows.results) {
     const assets = await env.DB.prepare(
-      "SELECT id FROM assets WHERE product_version=? ORDER BY kind LIMIT 8",
+      "SELECT id FROM assets WHERE product_version=? ORDER BY CASE WHEN kind='learning_thumbnail' THEN 0 ELSE 1 END,created_at,id LIMIT 8",
     )
       .bind(row.product_version)
       .all<{ id: string }>();
@@ -80,12 +86,16 @@ export async function mutateReview(
     409,
     "task_locked_or_updated",
   );
-  const count = await q(
-    "SELECT count(*) n FROM option_snapshots s,json_each(s.options_json) o WHERE s.snapshot_version=? AND json_extract(o.value,'$.value_id')=?",
-    task.snapshot_version,
+  const selection = await q(
+    "SELECT s.custom_allowed,(SELECT count(*) FROM json_each(s.options_json) o WHERE json_extract(o.value,'$.value_id')=?) candidate_count FROM option_snapshots s WHERE s.snapshot_version=?",
     final,
-  ).first<number>("n");
-  requireValue(count === 1, 422, "candidate_not_unique");
+    task.snapshot_version,
+  ).first<{ custom_allowed: number; candidate_count: number }>();
+  requireValue(
+    Boolean(selection?.custom_allowed) || selection?.candidate_count === 1,
+    422,
+    "candidate_not_unique",
+  );
   requireValue(
     final === task.suggested_value_id || reason,
     422,
@@ -107,7 +117,7 @@ export async function mutateReview(
   };
   const results = await env.DB.batch([
     q(
-      "UPDATE review_tasks SET status='confirmed',version=version+1,updated_at=? WHERE id=? AND version=? AND status='claimed' AND claimed_by=? AND lease_until>? AND EXISTS(SELECT 1 FROM products WHERE product_version=review_tasks.product_version AND deleting=0) AND (SELECT count(*) FROM option_snapshots s,json_each(s.options_json) o WHERE s.snapshot_version=review_tasks.snapshot_version AND json_extract(o.value,'$.value_id')=?)=1",
+      "UPDATE review_tasks SET status='confirmed',version=version+1,updated_at=? WHERE id=? AND version=? AND status='claimed' AND claimed_by=? AND lease_until>? AND EXISTS(SELECT 1 FROM products WHERE product_version=review_tasks.product_version AND deleting=0) AND EXISTS(SELECT 1 FROM option_snapshots s WHERE s.snapshot_version=review_tasks.snapshot_version AND (s.custom_allowed=1 OR (SELECT count(*) FROM json_each(s.options_json) o WHERE json_extract(o.value,'$.value_id')=?)=1))",
       now,
       id,
       v,

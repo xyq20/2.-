@@ -153,6 +153,9 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             settle=AsyncMock(),
             source_ids=Mock(return_value=("thickness",)),
             resolve_option=Mock(return_value="常规"),
+            fields_for_label=Mock(
+                return_value=(SimpleNamespace(source_id="thickness"),)
+            ),
             candidate_fields=Mock(
                 return_value=(
                     SimpleNamespace(
@@ -213,6 +216,81 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tuple((item.value_id, item.label) for item in request.candidates),
             (("regular", "常规"), ("thick", "加厚")),
+        )
+
+    async def test_learning_uses_api_category_and_dom_prop_candidates_when_saved_detail_omits_options(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return ResolvedAttribute(
+                    "straight",
+                    "直筒裤",
+                    "explicit_text",
+                    "snapshot-tmall-dom-1",
+                )
+
+        runtime = Runtime()
+        api_index = SimpleNamespace(
+            settle=AsyncMock(),
+            source_ids=Mock(return_value=()),
+            resolve_option=Mock(return_value=None),
+            fields_for_label=Mock(return_value=()),
+            candidate_fields=Mock(return_value=()),
+            category_leaf_ids=Mock(return_value=("3035",)),
+        )
+        listing = await self._listing(
+            """
+            <div class="conf"><div class="complex-wrap">
+              <div class="complex-item" id="pants-item">
+                <div class="el-form-item is-required">
+                  <label class="el-form-item__label">裤型</label>
+                  <div class="el-form-item__content"><div class="el-select">
+                    <input name="prop_344943689" class="el-input__inner" readonly
+                      onclick="openTmallPropSelect(this)">
+                    <div class="el-select-dropdown" style="display:none"><ul>
+                      <li id="straight" class="el-select-dropdown__item"
+                        onclick="chooseTmallPropOption(this)">直筒裤</li>
+                      <li id="cargo" class="el-select-dropdown__item"
+                        onclick="chooseTmallPropOption(this)">工装裤</li>
+                    </ul></div>
+                  </div></div>
+                </div>
+              </div>
+            </div></div>
+            <script>
+              document.querySelector('#straight').__vue__ = {value: 'straight'};
+              document.querySelector('#cargo').__vue__ = {value: 'cargo'};
+              function openTmallPropSelect(input) {
+                input.closest('.el-select').querySelector('.el-select-dropdown').style.display='block';
+              }
+              function chooseTmallPropOption(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = option.textContent.trim();
+                select.querySelector('.el-select-dropdown').style.display='none';
+              }
+            </script>
+            """,
+            api_index=api_index,
+            attribute_runtime=runtime,
+        )
+
+        actual = await listing.fill_attribute(
+            "裤型",
+            "直筒裤",
+            item=self.page.locator("#pants-item"),
+        )
+
+        self.assertEqual(actual, ("直筒裤",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.category_leaf_id, "3035")
+        self.assertEqual(request.field_id, "344943689")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("straight", "直筒裤"), ("cargo", "工装裤")),
         )
 
     async def test_open_refreshes_stale_shop_authorization_once(self):
@@ -2037,6 +2115,84 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             await self.page.locator("#size-preflight input[type=checkbox]").is_checked()
         )
 
+    async def test_size_chart_fills_known_cells_and_defers_all_unknown_required_cells(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        runtime = Runtime()
+        listing = await self._listing(
+            """
+            <div class="wrap-item" id="future-category-size-chart">
+              <div class="wrap-item_label">尺码表</div>
+              <table class="tmall-size-table">
+                <thead><tr><th>尺码</th><th>*身高（cm）</th><th>*胸围（cm）</th></tr></thead>
+                <tbody>
+                  <tr><td>S</td><td><input></td><td><input></td></tr>
+                  <tr><td>M</td><td><input></td><td><input></td></tr>
+                </tbody>
+              </table>
+            </div>
+            """,
+            attribute_runtime=runtime,
+        )
+
+        report = await listing.fill_size_chart(
+            (
+                {"尺码": "S", "胸围(cm)": 125},
+                {"尺码": "M", "胸围(cm)": 129},
+            )
+        )
+
+        values = await self.page.locator(
+            "#future-category-size-chart tbody tr"
+        ).evaluate_all(
+            "rows => rows.map(row => Array.from(row.querySelectorAll('input')).map(input => input.value))"
+        )
+        self.assertEqual(values, [["", "125"], ["", "129"]])
+        self.assertEqual(
+            tuple(request.field_label for request in runtime.requests),
+            ("尺码表 S 身高（cm）", "尺码表 M 身高（cm）"),
+        )
+        self.assertTrue(all(request.custom_allowed for request in runtime.requests))
+        self.assertEqual(
+            report["deferred_required"],
+            ("S 身高（cm）", "M 身高（cm）"),
+        )
+
+    async def test_size_chart_reuses_operator_custom_value_on_rerun(self):
+        class Runtime:
+            async def resolve(self, request):
+                return ResolvedAttribute(
+                    request.field_id,
+                    "170",
+                    "human_override",
+                    request.schema_version,
+                )
+
+        listing = await self._listing(
+            """
+            <div class="wrap-item"><div class="wrap-item_label">尺码表</div>
+              <table class="tmall-size-table">
+                <thead><tr><th>尺码</th><th>*身高（cm）</th></tr></thead>
+                <tbody><tr><td>S</td><td><input id="reviewed-height"></td></tr></tbody>
+              </table>
+            </div>
+            """,
+            attribute_runtime=Runtime(),
+        )
+
+        report = await listing.fill_size_chart(({"尺码": "S"},))
+
+        self.assertEqual(
+            await self.page.locator("#reviewed-height").input_value(), "170"
+        )
+        self.assertEqual(report["deferred_required"], ())
+
     async def test_size_chart_switches_range_columns_and_fills_tuple_and_tilde_values(self):
         listing = await self._listing(
             """
@@ -2536,6 +2692,81 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await listing.validate_remaining_required_fields(),
             {"valid": True, "missing": ()},
+        )
+
+    async def test_final_required_validation_fills_only_live_select_candidate(self):
+        class Runtime:
+            async def resolve(self, _request):
+                raise AssertionError("唯一页面候选不应该提交审核")
+
+        listing = await self._listing(
+            """
+            <div class="el-form-item is-required" id="publish-type-required">
+              <label class="el-form-item__label">*发布类型</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="openRequiredSelect(this)">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item" onclick="chooseRequiredOption(this)">一口价</li>
+                </ul></div>
+              </div></div>
+            </div>
+            <script>
+              function openRequiredSelect(input) {
+                input.closest('.el-select').querySelector('.el-select-dropdown').style.display='block';
+              }
+              function chooseRequiredOption(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = option.textContent.trim();
+                select.querySelector('.el-select-dropdown').style.display='none';
+              }
+            </script>
+            """,
+            attribute_runtime=Runtime(),
+        )
+
+        report = await listing.validate_remaining_required_fields()
+
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["filled"], {"发布类型": "一口价"})
+        self.assertEqual(
+            await self.page.locator("#publish-type-required input").input_value(),
+            "一口价",
+        )
+
+    async def test_final_required_validation_defers_ambiguous_select_and_continues(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        runtime = Runtime()
+        listing = await self._listing(
+            """
+            <div class="el-form-item is-required" id="future-required-select">
+              <label class="el-form-item__label">*新类目字段</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="this.nextElementSibling.style.display='block'">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item">候选A</li>
+                  <li class="el-select-dropdown__item">候选B</li>
+                </ul></div>
+              </div></div>
+            </div>
+            """,
+            attribute_runtime=runtime,
+        )
+
+        report = await listing.validate_remaining_required_fields()
+
+        self.assertFalse(report["valid"])
+        self.assertEqual(report["deferred"], ("新类目字段",))
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(
+            tuple(value.label for value in runtime.requests[0].candidates),
+            ("候选A", "候选B"),
         )
 
     async def test_new_product_declaration_is_yes_only_when_field_exists(self):

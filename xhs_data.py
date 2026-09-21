@@ -1,9 +1,9 @@
 """Excel inputs for the FastMai Xiaohongshu product-information form.
 
 The form adapter owns page-specific matching.  This module keeps every
-non-empty Excel input intact and, separately, preserves the ordered category
-route from ``商品分类``.  A slash in that cell is a hierarchy separator here,
-not a group of interchangeable values.
+non-empty Excel input intact and preserves the ``商品分类`` segments as
+category hints.  The adapter first supports the historic ordered route and can
+also prove one exact marketplace leaf from cross-platform hints.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _category_path(value: str) -> Tuple[str, ...]:
 
 
 def parse_xhs_fields(fields: Mapping[str, Any]) -> XhsFields:
-    """Normalize Excel values and retain one exact ordered category route."""
+    """Normalize Excel values and retain one deterministic category hint set."""
     normalized = {
         str(key).strip(): _cell_text(value)
         for key, value in fields.items()

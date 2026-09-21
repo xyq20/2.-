@@ -108,6 +108,18 @@ class LearningClientTests(unittest.TestCase):
                 client.post_event("key", "review.created", {"token": "payload-secret"})
         self.assertEqual(str(caught.exception), "cloud status 422")
 
+        with patch.object(
+            client,
+            "_request",
+            return_value=(400, {"error": "invalid_payload_keys"}),
+        ):
+            with self.assertRaises(PermanentCloudError) as caught:
+                client.post_event("key", "review.created", {})
+        self.assertEqual(
+            str(caught.exception),
+            "cloud status 400 (invalid_payload_keys)",
+        )
+
     def test_network_error_is_retryable_without_leaking_url_error_reason(self):
         client = CloudLearningClient("https://review.example", "device-secret")
         with patch(

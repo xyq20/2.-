@@ -104,6 +104,23 @@ class RunCheckpoint:
             raise ValueError("checkpoint version must be positive")
 
 
+def checkpoint_event_payload(checkpoint: RunCheckpoint) -> Mapping[str, Any]:
+    """Return the canonical cloud event body for one durable checkpoint."""
+
+    return {
+        "run_id": checkpoint.run_id,
+        "product_version": checkpoint.product_version,
+        "device_id": checkpoint.device_id,
+        "execution_mode": checkpoint.execution_mode,
+        "platform_order": list(checkpoint.platform_order),
+        "current_index": checkpoint.current_index,
+        "status": checkpoint.status,
+        "pending_review_id": checkpoint.pending_review_id,
+        "version": checkpoint.version,
+        "image_version": checkpoint.image_version,
+    }
+
+
 @dataclass(frozen=True)
 class StageResult:
     run_id: str

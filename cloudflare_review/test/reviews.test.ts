@@ -6,6 +6,37 @@ const dheaders = {
   authorization: "Device test-only-device-token",
   "content-type": "application/json",
 };
+it("lists review thumbnails in upload order", async () => {
+  const cookie = await user();
+  await seedReview();
+  const now = new Date().toISOString();
+  await testEnv.DB.batch([
+    testEnv.DB.prepare(
+      "INSERT INTO assets(id,product_version,r2_key,sha256,kind,content_type,byte_size,created_at) VALUES('first','pv1','first','z','learning_thumbnail','image/png',1,?)",
+    ).bind(now),
+    testEnv.DB.prepare(
+      "INSERT INTO assets(id,product_version,r2_key,sha256,kind,content_type,byte_size,created_at) VALUES('second','pv1','second','a','learning_thumbnail','image/png',1,?)",
+    ).bind(new Date(Date.parse(now) + 1).toISOString()),
+  ]);
+  const response = await api("/api/reviews", undefined, cookie);
+  expect(response.status).toBe(200);
+  const data = (await response.json()) as {
+    tasks: { asset_ids: string[] }[];
+  };
+  expect(data.tasks[0]!.asset_ids.slice(0, 2)).toEqual(["first", "second"]);
+});
+it("hides pending reviews that belong to a failed run", async () => {
+  const cookie = await user();
+  await seedReview();
+  await testEnv.DB.prepare(
+    "INSERT INTO run_checkpoints(run_id,product_version,device_id,execution_mode,platform_order_json,current_index,status,pending_review_id,version,image_version,updated_at) VALUES('run1','pv1','device1','save_only','[\"pdd\"]',0,'failed',NULL,2,'images1',?)",
+  )
+    .bind(new Date().toISOString())
+    .run();
+  const response = await api("/api/reviews", undefined, cookie);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ tasks: [] });
+});
 it("serializes claims and confirmation into one action and one durable resume event", async () => {
   const cookie = await user();
   const other = await user("other");
@@ -133,6 +164,34 @@ it("validates candidate membership and requires a correction reason for changes"
       )
     ).status,
   ).toBe(422);
+});
+it("accepts operator input for a custom field with no candidates", async () => {
+  const cookie = await user();
+  await seedReview();
+  await testEnv.DB.prepare(
+    "UPDATE option_snapshots SET custom_allowed=1,options_json='[]' WHERE snapshot_version='sv1'",
+  ).run();
+  const claimed = await api(
+    "/api/reviews/review1/claim",
+    { version: 1 },
+    cookie,
+  );
+  const version = ((await claimed.json()) as { version: number }).version;
+  const confirmed = await api(
+    "/api/reviews/review1/confirm",
+    {
+      version,
+      final_value_id: "170",
+      correction_reason: "尺码表人工填写",
+    },
+    cookie,
+  );
+  expect(confirmed.status).toBe(200);
+  expect(
+    await testEnv.DB.prepare(
+      "SELECT final_value_id FROM review_actions WHERE review_id='review1'",
+    ).first("final_value_id"),
+  ).toBe("170");
 });
 it("renews only live owned leases and expired leases can be reclaimed", async () => {
   const cookie = await user();

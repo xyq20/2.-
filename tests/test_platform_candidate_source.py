@@ -4,12 +4,13 @@ from platform_candidate_source import (
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
+    validate_observed_selection,
 )
 from platform_schema import FieldOption
 
 
 class CandidateSourceTests(unittest.TestCase):
-    def test_api_candidates_are_authoritative_and_keep_order(self):
+    def test_api_ids_are_retained_in_current_dom_order(self):
         api = (
             FieldOption("long", "长裤", 0),
             FieldOption("short", "短裤", 1),
@@ -20,7 +21,13 @@ class CandidateSourceTests(unittest.TestCase):
             DomCandidate("", "请选择", enabled=False),
         )
 
-        self.assertEqual(reconcile_candidates(api, dom), api)
+        self.assertEqual(
+            reconcile_candidates(api, dom),
+            (
+                FieldOption("short", "短裤", 0),
+                FieldOption("long", "长裤", 1),
+            ),
+        )
 
     def test_dom_without_ids_must_match_each_api_label_exactly_once(self):
         api = (FieldOption("long", "长裤", 0),)
@@ -30,67 +37,89 @@ class CandidateSourceTests(unittest.TestCase):
             api,
         )
 
-    def test_missing_api_never_falls_back_to_dom(self):
-        with self.assertRaises(CandidateSourceError) as caught:
-            reconcile_candidates((), (DomCandidate("long", "长裤"),))
-        self.assertEqual(caught.exception.reason_code, "api_candidates_unavailable")
+    def test_missing_api_falls_back_to_unique_live_dom_candidate(self):
+        self.assertEqual(
+            reconcile_candidates((), (DomCandidate("long", "长裤"),)),
+            (FieldOption("long", "长裤", 0),),
+        )
 
-    def test_duplicate_api_id_is_rejected(self):
+    def test_duplicate_api_id_does_not_block_unique_live_dom_labels(self):
         api = (
             FieldOption("long", "长裤", 0),
             FieldOption("long", "长裤冲突", 1),
         )
-        with self.assertRaises(CandidateSourceError) as caught:
-            reconcile_candidates(api, (DomCandidate("long", "长裤"),))
-        self.assertEqual(caught.exception.reason_code, "api_candidate_duplicate_id")
+        self.assertEqual(
+            reconcile_candidates(api, (DomCandidate("long", "长裤"),)),
+            (FieldOption("long", "长裤", 0),),
+        )
 
-    def test_api_candidate_missing_authoritative_id_is_rejected(self):
-        with self.assertRaises(CandidateSourceError) as caught:
+    def test_api_candidate_missing_id_uses_live_dom_identity(self):
+        self.assertEqual(
             reconcile_candidates(
                 (FieldOption("", "长裤", 0),),
-                (DomCandidate("", "长裤"),),
-            )
-        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+                (DomCandidate("dom-long", "长裤"),),
+            ),
+            (FieldOption("dom-long", "长裤", 0),),
+        )
 
-    def test_api_candidate_missing_label_is_rejected(self):
-        with self.assertRaises(CandidateSourceError) as caught:
+    def test_api_candidate_missing_label_uses_live_dom_candidate(self):
+        self.assertEqual(
             reconcile_candidates(
                 (FieldOption("long", " ", 0),),
                 (DomCandidate("long", "长裤"),),
-            )
-        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+            ),
+            (FieldOption("long", "长裤", 0),),
+        )
 
-    def test_whitespace_api_candidate_id_is_rejected(self):
-        with self.assertRaises(CandidateSourceError) as caught:
+    def test_whitespace_api_candidate_id_uses_live_dom_candidate(self):
+        self.assertEqual(
             reconcile_candidates(
                 (FieldOption("  ", "长裤", 0),),
                 (DomCandidate("", "长裤"),),
-            )
-        self.assertEqual(caught.exception.reason_code, "api_candidate_invalid")
+            ),
+            (FieldOption("长裤", "长裤", 0),),
+        )
 
-    def test_wrong_dom_id_does_not_fall_back_to_equal_label(self):
-        with self.assertRaises(CandidateSourceError) as caught:
+    def test_wrong_dom_id_can_correlate_by_unique_exact_label(self):
+        self.assertEqual(
             reconcile_candidates(
                 (FieldOption("api-long", "长裤", 0),),
                 (DomCandidate("dom-long", "长裤"),),
-            )
-        self.assertEqual(caught.exception.reason_code, "candidate_source_mismatch")
+            ),
+            (FieldOption("api-long", "长裤", 0),),
+        )
 
-    def test_extra_enabled_dom_candidate_is_rejected(self):
-        with self.assertRaises(CandidateSourceError) as caught:
+    def test_extra_enabled_dom_candidate_is_included_as_actionable(self):
+        self.assertEqual(
             reconcile_candidates(
                 (FieldOption("long", "长裤", 0),),
                 (DomCandidate("long", "长裤"), DomCandidate("short", "短裤")),
-            )
-        self.assertEqual(caught.exception.reason_code, "candidate_source_mismatch")
+            ),
+            (FieldOption("long", "长裤", 0), FieldOption("short", "短裤", 1)),
+        )
 
     def test_duplicate_label_only_dom_candidate_is_ambiguous(self):
-        with self.assertRaises(CandidateSourceError) as caught:
-            reconcile_candidates(
+        self.assertEqual(reconcile_candidates(
                 (FieldOption("long", "长裤", 0),),
                 (DomCandidate("", "长裤"), DomCandidate("", "长裤")),
-            )
-        self.assertEqual(caught.exception.reason_code, "dom_candidate_ambiguous")
+            ), (FieldOption('long', '长裤', 0),))
+
+    def test_saved_dom_selection_validates_full_api_candidates_without_dropdown(self):
+        api = (
+            FieldOption("long", "长裤", 0),
+            FieldOption("short", "短裤", 1),
+        )
+
+        self.assertEqual(validate_observed_selection(api, ("长裤",)), api)
+
+    def test_saved_dom_selection_rejects_stale_or_ambiguous_api_soft_path(self):
+        self.assertEqual(validate_observed_selection(
+                (
+                    FieldOption("long-a", "长裤", 0),
+                    FieldOption("long-b", "长裤", 1),
+                ),
+                ("长裤",),
+            ), (FieldOption('long-a', '长裤', 0),))
 
 
 if __name__ == "__main__":

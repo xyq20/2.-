@@ -282,7 +282,7 @@ class XhsListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             if path == "/xhs/getAttributeValues.json":
                 if parameters["attributeId"] == "attribute-fit":
                     return {
-                        "values": [
+                        "attributeValueV3s": [
                             {"id": "fit-straight", "name": "直筒"},
                             {"id": "fit-loose", "name": "宽松"},
                         ],

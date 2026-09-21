@@ -258,6 +258,7 @@ export async function decideAttribute(
     input.canonical_field,
     snapshot.schema_version,
     candidateIds,
+    options,
   );
   if (mature) {
     const response = ready(input, options, "mature_rule", mature, ["visual"]);
@@ -312,4 +313,3 @@ export async function decideAttribute(
   await persistDecision(env.DB, input, response, { condition_signature: signature });
   return response;
 }
-

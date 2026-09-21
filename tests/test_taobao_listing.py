@@ -1,6 +1,8 @@
 import asyncio
 import logging
+from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock
 
 from attribute_runtime import ResolvedAttribute
 from taobao_data import parse_taobao_fields
@@ -10,7 +12,9 @@ from taobao_listing import (
     normalize_label,
     parse_taobao_fabrics,
     parse_taobao_materials,
+    preferred_exact_candidate_label,
     selection_value_groups,
+    selection_value_groups_for_control,
     value_candidates,
 )
 from size_image_recognition import SizeLength
@@ -396,15 +400,42 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_single_select_preserves_comma_inside_one_candidate(self):
+        self.assertEqual(
+            selection_value_groups_for_control("功能", "防风，保暖", multi=False),
+            (("防风，保暖",),),
+        )
+        self.assertEqual(
+            selection_value_groups_for_control("功能", "防风，保暖", multi=True),
+            (("防风",), ("保暖",)),
+        )
+
+    def test_learning_select_uses_first_matching_excel_alternative(self):
+        self.assertEqual(
+            preferred_exact_candidate_label(
+                ("休闲", "时尚都市"),
+                value_candidates("风格", "休闲风/时尚都市"),
+            ),
+            "休闲",
+        )
+
     def test_garment_fit_alias_is_bidirectional(self):
         self.assertIn(normalize_label("服饰版型"), excel_aliases("服装版型"))
         self.assertIn(normalize_label("服装版型"), excel_aliases("服饰版型"))
+
+    def test_security_level_heading_aliases_are_bidirectional(self):
+        self.assertIn(normalize_label("安全等级"), excel_aliases("安全级别"))
+        self.assertIn(normalize_label("安全类别"), excel_aliases("安全等级"))
 
     def test_value_aliases_are_explicit_and_keep_original_first(self):
         self.assertEqual(value_candidates("风格", "休闲风"), ("休闲风", "休闲"))
         self.assertEqual(
             value_candidates("风格", "休闲风/时尚都市"),
             ("休闲风", "休闲", "时尚都市"),
+        )
+        self.assertEqual(
+            value_candidates("安全等级", "B（接触皮肤）"),
+            ("B（接触皮肤）", "B类"),
         )
         self.assertEqual(
             value_candidates("细分风格", "休闲风/时尚都市"),
@@ -420,7 +451,7 @@ class TaobaoPureFunctionTests(unittest.TestCase):
         )
         self.assertEqual(
             value_candidates("弹力", "无弹"),
-            ("无弹", "无弹力"),
+            ("无弹", "无弹力", "无弹性"),
         )
 
     def test_fabric_and_material_composition_use_separate_excel_fields(self):
@@ -472,11 +503,110 @@ class TaobaoPureFunctionTests(unittest.TestCase):
         }
 
         self.assertTrue(TaobaoListing._material_validation_is_confirmed(valid))
+        for stale_message in (
+            "材质成分子项请勿留空",
+            "材质成分必填一份数据",
+        ):
+            with self.subTest(stale_message=stale_message):
+                self.assertTrue(
+                    TaobaoListing._material_dom_errors_are_stale(
+                        "材质成分", (stale_message,), valid
+                    )
+                )
+        self.assertFalse(
+            TaobaoListing._material_dom_errors_are_stale(
+                "材质成分", ("材质比例合计必须为100%",), valid
+            )
+        )
         valid["form"]["fields"][0]["validateMessage"] = "材质成分子项请勿留空"
         self.assertFalse(TaobaoListing._material_validation_is_confirmed(valid))
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hidden_loaded_dropdown_reopens_before_selecting(self):
+        await self.page.set_content('''
+          <div class="el-select"><input class="el-input__inner" readonly></div>
+          <div class="el-select-dropdown" style="display:none">
+            <li class="el-select-dropdown__item">直筒</li>
+          </div><script>
+            const select=document.querySelector('.el-select');
+            const popper=document.querySelector('.el-select-dropdown');
+            const input=select.querySelector('input');
+            select.__vue__={visible:false,options:[{}],popperElm:popper};
+            window.opens=0;
+            input.onclick=()=>{select.__vue__.visible=true;
+              if(++window.opens>1) popper.style.display='block';};
+            input.onkeydown=e=>{if(e.key==='Escape'){
+              select.__vue__.visible=false;popper.style.display='none';}};
+            popper.querySelector('li').onclick=()=>{input.value='直筒';
+              popper.style.display='none';select.__vue__.visible=false;};
+          </script>''')
+        listing=TaobaoListing(self.page,self.page.locator('body'),LOGGER)
+        result=await listing._select_values(self.page.locator('.el-select'),
+            (('直筒',),),label='裤脚款式',multi=False)
+        self.assertEqual(result,('直筒',))
+        self.assertEqual(await self.page.evaluate('window.opens'),2)
+
+    async def test_select_keeps_existing_equivalent_alias_without_reselection(self):
+        await self.page.set_content(
+            '<div class="el-select"><input class="el-input__inner" '
+            'readonly value="无弹力"></div>'
+        )
+        listing = TaobaoListing(
+            self.page, self.page.locator("body"), LOGGER
+        )
+        listing._choose_one_option = AsyncMock(
+            side_effect=AssertionError("等价已有值不应重新选择")
+        )
+
+        actual = await listing._select_values(
+            self.page.locator(".el-select"),
+            (("无弹", "无弹力"),),
+            label="弹力",
+            multi=False,
+        )
+
+        self.assertEqual(actual, ("无弹力",))
+        listing._choose_one_option.assert_not_awaited()
+
+    async def test_cascader_disappearing_nodes_do_not_wait_on_old_indices(self):
+        await self.page.set_content('''<div class="el-cascader"><div class="el-cascader__dropdown">
+          <div class="el-cascader-node"><span class="el-cascader-node__label" id="first-label">夹克</span></div>
+          <div class="el-cascader-node" id="vanishing"><span class="el-cascader-node__label">外套</span></div>
+        </div></div>''')
+        await self.page.evaluate('''() => Object.defineProperty(document.querySelector('#first-label'), 'innerText',
+            {get() {document.querySelector('#vanishing')?.remove(); return '夹克';}})''')
+        self.page.set_default_timeout(500)
+        values = await self.listing._visible_cascader_nodes(self.page.locator('.el-cascader'))
+        self.assertEqual([text for text, _node in values], ['夹克'])
+
+    async def test_cascader_locator_keeps_exact_label_after_reorder(self):
+        await self.page.set_content('''<div class="el-cascader"><div class="el-cascader__dropdown">
+          <div class="el-cascader-node"><span class="el-cascader-node__label">夹克</span></div>
+          <div class="el-cascader-node"><span class="el-cascader-node__label">外套</span></div>
+        </div></div>''')
+        values = await self.listing._visible_cascader_nodes(self.page.locator('.el-cascader'))
+        await self.page.locator('.el-cascader__dropdown').evaluate('root => root.prepend(root.lastElementChild)')
+        for text, node in values:
+            self.assertEqual(await node.inner_text(), text)
+
+    async def test_validation_errors_can_disappear_while_reading(self):
+        await self.page.set_content('''<div id="panel">
+          <div class="el-form-item"><label class="el-form-item__label" id="label">材质</label>
+            <div class="el-form-item__error">请选择材质</div></div>
+          <div class="el-form-item" id="vanishing"><label class="el-form-item__label">图片</label>
+            <div class="el-form-item__error">请上传图片</div></div>
+          <div class="el-form-item__error" style="display:none">隐藏提示</div>
+        </div>''')
+        await self.page.evaluate("""() => Object.defineProperty(
+          document.querySelector('#label'), 'innerText', {get() {
+            document.querySelector('#vanishing')?.remove(); return '材质';
+          }})""")
+        listing = object.__new__(TaobaoListing)
+        listing.panel = self.page.locator('#panel')
+        self.page.set_default_timeout(500)
+        self.assertEqual(await listing._visible_validation_errors(), ('材质：请选择材质',))
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -618,6 +748,81 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["rows"]["S"], "104")
         self.assertEqual(actual["rows"]["2XL"], "112")
 
+    async def test_size_chart_fills_structured_ocr_and_collects_only_unknown_cells(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        await self.page.locator(".size-chart-table").evaluate(
+            """table => {
+              window.enableRange = column => {
+                table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row => {
+                  row.children[column].innerHTML = '<input><input>';
+                });
+              };
+              table.querySelector('.el-table__header-wrapper tr').innerHTML = `
+                <th>尺码</th><th>* 身高（cm） <a onclick="enableRange(1)">↔ 区间</a></th>
+                <th>* 体重（kg） <a onclick="enableRange(2)">↔ 区间</a></th>
+                <th>* 胸围（cm）</th><th>衣长（cm） 区间</th><th>* 未知量</th><th>操作</th>`;
+              table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row => {
+                const size = row.querySelector('td').textContent;
+                row.innerHTML = `<td>${size}</td><td><input></td><td><input></td>
+                  <td><input></td><td><input></td><td><input></td><td>清空</td>`;
+              });
+            }"""
+        )
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        self.listing.attribute_platform_id = "tb"
+        sizes = ("S", "M", "L", "XL", "2XL")
+
+        report = await self.listing.fill_size_chart_lengths(
+            tuple(SizeLength(size, 60 + index) for index, size in enumerate(sizes)),
+            "clothing",
+            recommendations=tuple(
+                SimpleNamespace(
+                    size=size,
+                    height_min=155 + index * 5,
+                    height_max=160 + index * 5,
+                    weight_min=50 + index * 5,
+                    weight_max=55 + index * 5,
+                    chest=120 + index * 4,
+                    length=60 + index,
+                )
+                for index, size in enumerate(sizes)
+            ),
+        )
+
+        self.assertEqual(len(runtime.requests), 5)
+        self.assertEqual(len(report["unresolved_required"]), 5)
+        self.assertIn("尺码表 S 未知量", report["unresolved_required"])
+        self.assertIn("尺码表 2XL 未知量", report["unresolved_required"])
+        self.assertTrue(all(request.custom_allowed for request in runtime.requests))
+        self.assertTrue(all(request.candidates == () for request in runtime.requests))
+        first_row = self.page.locator(
+            ".size-chart-table .el-table__body-wrapper tbody tr"
+        ).first
+        self.assertEqual(
+            await first_row.locator("td").nth(1).locator("input").evaluate_all(
+                "nodes => nodes.map(node => node.value)"
+            ),
+            ["155", "160"],
+        )
+        self.assertEqual(
+            await first_row.locator("td").nth(2).locator("input").evaluate_all(
+                "nodes => nodes.map(node => node.value)"
+            ),
+            ["50", "55"],
+        )
+        self.assertEqual(
+            await first_row.locator("td").nth(3).locator("input").input_value(),
+            "120",
+        )
+
     async def test_excel_matching_fills_exact_and_explicit_alias_values(self):
         fields = parse_taobao_fields(
             {
@@ -714,17 +919,17 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.2,
             )
 
-    async def test_duplicate_same_name_option_is_skipped_instead_of_guessed(self):
+    async def test_duplicate_same_name_option_selects_first(self):
         await self.listing.apply_recommended_category()
 
         actual = await self.listing.fill_attribute("款式细节", "口袋")
 
-        self.assertIsNone(actual)
+        self.assertEqual(actual, ('口袋',))
         self.assertEqual(
             await self.page.locator(
                 ".complex-item:has(.el-form-item__label:text-is('款式细节')) .el-tag"
             ).count(),
-            0,
+            1,
         )
 
     async def test_or_value_prefers_unique_later_platform_option(self):
@@ -732,7 +937,84 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         actual = await self.listing.fill_attribute("款式细节", "口袋/多口袋")
 
-        self.assertEqual(actual, ("多口袋",))
+        self.assertEqual(actual, ("口袋",))
+
+    async def test_or_value_prefers_first_registered_option_outside_dom_viewport(self):
+        await self.listing.apply_recommended_category()
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('风格')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              setSelectValue(element, '工装');
+              element.__vue__.cachedOptions = [
+                {value: '休闲', currentLabel: '休闲', created: false, disabled: false},
+                {value: '工装', currentLabel: '工装', created: false, disabled: false}
+              ];
+              const first = Array.from(
+                element.querySelectorAll('.el-select-dropdown__item')
+              ).find(option => option.textContent.trim() === '休闲');
+              first.remove();
+            }"""
+        )
+
+        actual = await self.listing.fill_attribute("风格", "休闲/工装")
+
+        self.assertEqual(actual, ("休闲",))
+
+    async def test_or_value_removes_extra_existing_multi_select_values(self):
+        await self.listing.apply_recommended_category()
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('款式细节')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              setSelectValue(element, '口袋');
+              setSelectValue(element, '多口袋');
+            }"""
+        )
+        self.assertEqual(await select.locator(".el-tag").count(), 2)
+
+        actual = await self.listing.fill_attribute("款式细节", "口袋/多口袋")
+
+        self.assertEqual(actual, ("口袋",))
+        self.assertEqual(await select.locator(".el-tag").count(), 1)
+
+    async def test_saved_value_records_learning_without_reopening_dropdown(self):
+        await self.listing.apply_recommended_category()
+        self.assertEqual(
+            await self.listing.fill_attribute("图案", "纯色"),
+            ("纯色",),
+        )
+        self.listing.attribute_runtime = object()
+        self.listing.attribute_platform_id = "tb"
+        self.listing._resolve_learning_select_groups = AsyncMock(
+            return_value=("纯色",)
+        )
+
+        actual = await self.listing.fill_attribute("图案", "纯色")
+
+        self.assertEqual(actual, ("纯色",))
+        self.listing._resolve_learning_select_groups.assert_awaited_once()
+        self.assertEqual(
+            self.listing._resolve_learning_select_groups.await_args.kwargs[
+                "observed_values"
+            ],
+            ("纯色",),
+        )
+
+    async def test_unmapped_excel_field_keeps_legacy_or_selection_with_learning_enabled(self):
+        class Runtime:
+            async def resolve(self, _request):
+                raise AssertionError("unmapped Excel field must not enter AI review")
+
+        await self.listing.apply_recommended_category()
+        self.listing.attribute_runtime = Runtime()
+        self.listing.attribute_platform_id = "tb"
+
+        actual = await self.listing.fill_attribute("款式细节", "口袋/多口袋")
+
+        self.assertEqual(actual, ("口袋",))
 
     async def test_or_value_uses_first_same_name_platform_item_as_last_resort(self):
         await self.listing.apply_recommended_category()
@@ -817,6 +1099,133 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             tuple((item.value_id, item.label) for item in request.candidates),
             (("long", "长裤"), ("nine", "九分裤")),
         )
+
+    async def test_sku_batch_select_falls_back_to_exact_dom_when_api_omits_field(self):
+        class Runtime:
+            async def resolve(self, _request):
+                raise AssertionError("missing API field must not reach runtime")
+
+        self.listing.attribute_runtime = Runtime()
+        self.listing.attribute_platform_id = "tb"
+        product_details = await self.listing._wrap_item("商品明细")
+        row = await self.listing._sku_batch_row(product_details)
+
+        actual = await self.listing._fill_batch_select(row, "裤长", ("长裤",))
+
+        self.assertEqual(actual, "长裤")
+
+    async def test_learning_uses_api_schema_when_dom_renders_only_candidate_subset(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-brand",
+                )
+
+        async def fulfill_schema(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "fieldDescriptorList": [
+                            {
+                                "name": "p-brand",
+                                "label": "品牌",
+                                "component": {
+                                    "props": {
+                                        "dataSource": {
+                                            "options": [
+                                                {"value": "brand", "displayName": "NEIGBORL"},
+                                                {"value": "none", "displayName": "无品牌"},
+                                                {"value": "other", "displayName": "其他品牌"},
+                                            ]
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.page.route("**/tb/getItemPublishSchema*", fulfill_schema)
+        await self.page.evaluate(
+            "fetch('https://api.test/tb/getItemPublishSchema?catId=5001')"
+        )
+        await self.listing.apply_recommended_category()
+
+        actual = await self.listing.fill_attribute("品牌", "NEIGBORL")
+
+        self.assertEqual(actual, ("NEIGBORL",))
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(
+            tuple(candidate.label for candidate in runtime.requests[0].candidates),
+            ("NEIGBORL", "无品牌", "其他品牌"),
+        )
+
+    async def test_learning_directly_enters_excel_value_when_select_allows_custom(self):
+        class Runtime:
+            async def resolve(self, request):
+                # Verified custom input is now captured for learning, not
+                # bypassed. Exact Excel evidence must prevent human review.
+                assert request.excel_value == "新品牌"
+                assert any(value.label == "新品牌" for value in request.candidates)
+                return ResolvedAttribute("新品牌", "新品牌", "explicit_text", "custom-brand")
+
+        async def fulfill_schema(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "fieldDescriptorList": [
+                            {
+                                "name": "p-brand",
+                                "label": "品牌",
+                                "component": {
+                                    "props": {
+                                        "dataSource": {
+                                            "options": [
+                                                {"value": "none", "displayName": "无品牌"}
+                                            ]
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            )
+
+        self.listing.attribute_runtime = Runtime()
+        await self.page.route("**/tb/getItemPublishSchema*", fulfill_schema)
+        await self.page.evaluate(
+            "fetch('https://api.test/tb/getItemPublishSchema?catId=5001')"
+        )
+        await self.listing.apply_recommended_category()
+        await self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('品牌 重要')) .el-select"
+        ).evaluate("element => element.setAttribute('caninputcustom', 'true')")
+
+        actual = await self.listing.fill_attribute("品牌", "新品牌")
+
+        self.assertEqual(actual, ("新品牌",))
 
     async def test_duplicate_page_labels_are_both_filled_and_reported(self):
         fields = parse_taobao_fields(
@@ -964,6 +1373,25 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["values"]["是否加绒"], "否")
         self.assertTrue(all(row["是否加绒"] == "否" for row in actual["rows"]))
 
+    async def test_unmapped_sku_batch_field_does_not_enter_learning_review(self):
+        class Runtime:
+            async def resolve(self, _request):
+                raise AssertionError("unmapped SKU field must use Excel selection")
+
+        await self.listing.apply_recommended_category()
+        self.listing.attribute_runtime = Runtime()
+        self.listing.attribute_platform_id = "tb"
+        product_details = await self.listing._wrap_item("商品明细")
+        batch_row = await self.listing._sku_batch_row(product_details)
+
+        actual = await self.listing._fill_batch_select(
+            batch_row,
+            "是否加绒",
+            ("否",),
+        )
+
+        self.assertEqual(actual, "否")
+
     async def test_sku_batch_fills_dynamic_pants_length_and_records_rows(self):
         await self.listing.apply_recommended_category()
         fields = parse_taobao_fields(
@@ -981,6 +1409,41 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual["values"]["裤长"], "长裤")
         self.assertTrue(all(row["裤长"] == "长裤" for row in actual["rows"]))
+
+    async def test_sku_batch_collects_every_unprovided_live_select_before_review(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        await self.listing.apply_recommended_category()
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        self.listing.attribute_platform_id = "tb"
+        fields = parse_taobao_fields(
+            {
+                "价格": 690,
+                "数量": 100,
+                "SKU分类": "单品",
+            }
+        )
+
+        actual = await self.listing.fill_sku_batch(fields.fields)
+
+        self.assertFalse(actual["batch_clicked"])
+        self.assertEqual(
+            actual["deferred_fields"],
+            ("是否加绒", "适用体型", "裤长"),
+        )
+        self.assertEqual(
+            tuple(request.field_label for request in runtime.requests),
+            ("是否加绒", "适用体型", "裤长"),
+        )
+        self.assertTrue(all(not request.excel_value for request in runtime.requests))
+        self.assertEqual(await self.page.evaluate("window.actionLog"), [])
 
     async def test_sku_fleece_does_not_replace_excel_value_with_alias(self):
         await self.listing.apply_recommended_category()
@@ -1008,6 +1471,68 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual["values"]["是否加绒"], "否")
         self.assertNotEqual(actual["values"]["是否加绒"], "不加绒")
+
+    async def test_missing_stock_mode_is_deferred_without_skipping_service_fields(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        await self.listing.apply_recommended_category()
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        self.listing.attribute_platform_id = "tb"
+
+        actual = await self.listing.apply_payment_and_service({})
+
+        self.assertIsNone(actual["库存扣减方式"])
+        self.assertTrue(actual["保修服务"])
+        self.assertTrue(actual["七天退货承诺"])
+        self.assertEqual(
+            tuple(request.field_label for request in runtime.requests),
+            ("库存扣减方式",),
+        )
+        self.assertEqual(
+            tuple(candidate.label for candidate in runtime.requests[0].candidates),
+            ("拍下减库存", "付款减库存"),
+        )
+        self.assertEqual(
+            await self.page.evaluate("window.actionLog"),
+            ["warranty", "seven-day-return"],
+        )
+
+    async def test_unmatched_freight_is_deferred_instead_of_stopping_platform(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        await self.listing.apply_recommended_category()
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        self.listing.attribute_platform_id = "tb"
+        await self.page.locator(
+            ".set-ship:has(.shop-title:text-is('钊叔制')) .el-select"
+        ).evaluate("element => element.setAttribute('caninputcustom', 'false')")
+
+        actual = await self.listing.fill_freight_template(
+            {"运费设置": "新疆西藏不包邮鞋子皮衣外套"}
+        )
+
+        self.assertIsNone(actual)
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.field_label, "运费模板")
+        self.assertEqual(
+            tuple(candidate.label for candidate in request.candidates),
+            ("新疆，西藏，不包邮-T恤，裤子，装饰品",),
+        )
 
     async def test_seven_day_return_uses_first_operable_duplicate_checkbox(self):
         await self.listing.apply_recommended_category()

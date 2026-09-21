@@ -79,6 +79,79 @@ class PlatformRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown platform"):
             registry.expand_platform_selection("unknown")
 
+    def test_combination_keeps_given_order_and_drops_duplicates(self):
+        registry = _load_registry(self)
+
+        self.assertEqual(
+            tuple(
+                spec.cli_name
+                for spec in registry.expand_platform_selection("pdd,tmall,xhs")
+            ),
+            ("pdd", "tmall", "xhs"),
+        )
+        self.assertEqual(
+            tuple(
+                spec.cli_name
+                for spec in registry.expand_platform_selection("jd,pdd,jd,pdd")
+            ),
+            ("jd", "pdd"),
+        )
+        self.assertEqual(
+            tuple(
+                spec.cli_name
+                for spec in registry.expand_platform_selection("base,tmall,base")
+            ),
+            ("base", "tmall"),
+        )
+
+    def test_combination_accepts_mixed_separators_and_platform_ids(self):
+        registry = _load_registry(self)
+
+        for value in ("tmall,pdd", "tmall，pdd", "tmall、pdd", "tmall pdd"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    tuple(
+                        spec.cli_name
+                        for spec in registry.expand_platform_selection(value)
+                    ),
+                    ("tmall", "pdd"),
+                )
+        self.assertEqual(
+            tuple(
+                spec.cli_name for spec in registry.expand_platform_selection("tm,fxg")
+            ),
+            ("tmall", "douyin"),
+        )
+
+    def test_combination_rejects_unknown_member(self):
+        registry = _load_registry(self)
+
+        with self.assertRaisesRegex(ValueError, "unknown platform"):
+            registry.expand_platform_selection("tmall,unknown")
+        with self.assertRaisesRegex(ValueError, "unknown platform"):
+            registry.expand_platform_selection("")
+
+
+class PlatformSelectionKindTests(unittest.TestCase):
+    def test_only_literal_all_counts_as_all_selection(self):
+        registry = _load_registry(self)
+
+        self.assertTrue(registry.is_all_platform_selection("all"))
+        self.assertTrue(registry.is_all_platform_selection(" all "))
+        self.assertFalse(registry.is_all_platform_selection("base"))
+        self.assertFalse(registry.is_all_platform_selection("tmall,pdd"))
+        self.assertFalse(
+            registry.is_all_platform_selection(
+                "douyin,taobao,tmall,pdd,wxsph,xhs,youzan,jd"
+            )
+        )
+
+    def test_empty_selection_is_not_treated_as_all(self):
+        registry = _load_registry(self)
+
+        with self.assertRaises(ValueError):
+            registry.is_all_platform_selection("")
+
 
 if __name__ == "__main__":
     unittest.main()

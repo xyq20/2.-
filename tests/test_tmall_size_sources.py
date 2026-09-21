@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from size_image_recognition import RecognitionError, SizeLength, SkuRecommendation
+from size_image_recognition import (
+    ClothingSkuRecommendation,
+    RecognitionError,
+    SizeLength,
+    SkuRecommendation,
+)
 from tmall_data import parse_tmall_fields
 import tmall_size_sources
 
@@ -165,14 +170,24 @@ class TmallSizeSourceResolutionTests(unittest.TestCase):
         recognize.assert_not_called()
         self.assertEqual(captured.exception.reason_code, "missing_height_weight_image")
 
-    def test_coat_fixture_uses_clothing_length_ocr_only(self):
+    def test_coat_fixture_uses_full_clothing_ocr_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             product_dir = Path(directory)
             size_chart = self._image(product_dir, "尺码信息表")
-            recognized = (SizeLength("S", 68), SizeLength("M", 70))
+            height_weight = self._image(product_dir, "身高体重推荐表")
+            recognized = (
+                ClothingSkuRecommendation(
+                    "S", 155, 160, 50, 55, 68, 125, 55, 56
+                ),
+                ClothingSkuRecommendation(
+                    "M", 160, 175, 55, 70, 70, 129, 56.5, 57
+                ),
+            )
             with patch(
-                "tmall_size_sources.recognize_size_lengths",
+                "tmall_size_sources.recognize_clothing_recommendations",
                 return_value=recognized,
+            ) as recognize_clothing, patch(
+                "tmall_size_sources.recognize_size_lengths"
             ) as recognize_lengths, patch(
                 "tmall_size_sources.recognize_recommendations"
             ) as recognize_recommendations:
@@ -183,16 +198,35 @@ class TmallSizeSourceResolutionTests(unittest.TestCase):
                     size_chart_image=size_chart,
                 )
 
-        recognize_lengths.assert_called_once_with(size_chart, ("S", "M"), "clothing")
+        recognize_clothing.assert_called_once_with(
+            size_chart, height_weight, ("S", "M")
+        )
+        recognize_lengths.assert_not_called()
         recognize_recommendations.assert_not_called()
         self.assertEqual(result.category_kind, "clothing")
-        self.assertEqual(result.headers, ("尺码", "衣长(cm)"))
         self.assertEqual(
-            result.rows,
+            result.headers,
             (
-                {"尺码": "S", "衣长(cm)": 68},
-                {"尺码": "M", "衣长(cm)": 70},
+                "尺码",
+                "身高(cm)",
+                "体重(kg)",
+                "胸围(cm)",
+                "肩宽(cm)",
+                "袖长(cm)",
+                "衣长(cm)",
             ),
+        )
+        self.assertEqual(
+            result.rows[0],
+            {
+                "尺码": "S",
+                "身高(cm)": (155, 160),
+                "体重(kg)": (50, 55),
+                "胸围(cm)": 125,
+                "肩宽(cm)": 55,
+                "袖长(cm)": 56,
+                "衣长(cm)": 68,
+            },
         )
 
     def test_shoe_fixture_normalizes_only_numeric_ma_suffix_and_never_calls_ocr(self):
@@ -250,8 +284,9 @@ class TmallSizeSourceResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             product_dir = Path(directory)
             size_chart = self._image(product_dir, "尺码信息表")
+            self._image(product_dir, "身高体重推荐表")
             with patch(
-                "tmall_size_sources.recognize_size_lengths",
+                "tmall_size_sources.recognize_clothing_recommendations",
                 side_effect=RecognitionError("fixture unreadable"),
             ):
                 with self.assertRaises(

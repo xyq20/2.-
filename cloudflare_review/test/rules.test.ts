@@ -39,6 +39,24 @@ it("requires three consecutive confirmations and at least 95 percent acceptance"
   expect(await findMatureRule(testEnv.DB, "pv3", "pdd", "pants", "pants_length", "schema1", ["long"])).toBe("long");
 });
 
+it("reuses an active rule across categories by candidate name", async () => {
+  await seedOutcome(1);
+  await seedOutcome(2);
+  await seedOutcome(3);
+  expect(
+    await findMatureRule(
+      testEnv.DB,
+      "pv3",
+      "pdd",
+      "shirt",
+      "pants_length",
+      "different-schema",
+      ["shirt-long"],
+      [{ value_id: "shirt-long", label: "长裤" }],
+    ),
+  ).toBe("shirt-long");
+});
+
 it("a correction demotes an active rule and duplicate readback is idempotent", async () => {
   await seedOutcome(1);
   await seedOutcome(2);

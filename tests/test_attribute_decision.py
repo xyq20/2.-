@@ -201,6 +201,21 @@ class AttributeDecisionTests(unittest.TestCase):
 
         self.assert_review(result, "free_text_not_allowed")
 
+    def test_confirmed_custom_value_is_accepted_when_snapshot_allows_input(self):
+        result = validate_decision(
+            make_decision(
+                proposed_value_id="加长裤",
+                source="human_override",
+                mature_rule=False,
+                evidence_kinds=(),
+            ),
+            make_snapshot(custom_allowed=True),
+        )
+
+        self.assertEqual(result.status, DecisionStatus.AUTO_FILL_READY)
+        self.assertEqual((result.value_id, result.value_label), ("加长裤", "加长裤"))
+        self.assertEqual(result.reason_code, "validated")
+
     def test_conflict_requires_review(self):
         result = validate_decision(make_decision(has_conflict=True), make_snapshot())
 
@@ -351,6 +366,21 @@ class AttributeDecisionTests(unittest.TestCase):
         human = validate_decision(
             make_decision(source="human_override", mature_rule=False), make_snapshot()
         )
+        human_without_original_visual_evidence = validate_decision(
+            make_decision(
+                canonical_field="thickness",
+                proposed_value_id="regular",
+                source="human_override",
+                mature_rule=False,
+                evidence_kinds=(),
+            ),
+            make_snapshot(
+                platform_id="douyin",
+                field_id="thickness",
+                field_label="厚度",
+                values=(SnapshotValue("regular", "常规"),),
+            ),
+        )
         explicit_missing = validate_decision(
             make_decision(source="explicit_text", mature_rule=False), make_snapshot()
         )
@@ -366,6 +396,10 @@ class AttributeDecisionTests(unittest.TestCase):
         )
 
         self.assertEqual(human.status, DecisionStatus.AUTO_FILL_READY)
+        self.assertEqual(
+            human_without_original_visual_evidence.status,
+            DecisionStatus.AUTO_FILL_READY,
+        )
         self.assert_review(explicit_missing, "explicit_text_evidence_missing")
         self.assertEqual(explicit_present.status, DecisionStatus.AUTO_FILL_READY)
 

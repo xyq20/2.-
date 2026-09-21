@@ -30,6 +30,18 @@ class XhsDataTests(unittest.TestCase):
 
 
 class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
+    def test_category_hints_accept_one_exact_outerwear_leaf(self):
+        self.assertEqual(
+            XhsFormListing._choose_category_text(
+                (
+                    "服饰 > 男装 > 男士休闲夹克",
+                    "服饰 > 男装 > 夹克",
+                ),
+                ("夹克", "外套", "男士休闲夹克", "其他夹克"),
+            ),
+            ("服饰 > 男装 > 男士休闲夹克", "unique_exact_hint_leaf"),
+        )
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -215,6 +227,78 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
             [((Path("three-four-1.jpg"), Path("three-four-2.jpg")), "小红书3:4主图", 30, True)],
         )
 
+    async def test_identity_waits_for_category_rerender(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          panel.querySelector('[data-xhs-field="商品标题"]').remove();
+          setTimeout(() => panel.insertAdjacentHTML('beforeend', '<div class="el-form-item"><label>商品标题：</label><textarea></textarea></div>'), 600);
+        }''')
+        report = await listing.fill_identity('NEIGBORL 工装裤', 'NGBL-2068')
+        self.assertEqual(report['商品标题'], '工装裤')
+
+    async def test_identity_scrolls_editor_to_load_field(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          panel.innerHTML = '<div style="height:1200px"></div>';
+          panel.style.cssText = 'height:200px;overflow-y:auto';
+          panel.addEventListener('scroll', () => {
+            if (panel.scrollTop > 0 && !panel.querySelector('textarea')) panel.insertAdjacentHTML('beforeend', '<div class="el-form-item"><label>商品标题：</label><textarea></textarea></div>');
+          });
+        }''')
+        control = await listing._find_named_input('商品标题')
+        await control.fill('工装裤')
+        self.assertEqual(await control.input_value(), '工装裤')
+
+    async def test_verifies_persisted_identity_attributes_presale_and_sku_values(self):
+        listing = await self._listing()
+        fields = XhsFields(
+            fields={
+                "面料材质/面料": "棉（100%）",
+                "厚薄": "常规",
+                "上市时间/上市年份季节": "2026/2026年秋季",
+                "服饰版型/版型": "直筒",
+                "风格/细分风格/基础风格": "休闲风/时尚都市",
+                "裤长": "长裤",
+                "价格/售价": "586",
+                "数量": "100",
+            },
+            category_path=("休闲裤", "男士休闲直筒裤", "工装休闲裤"),
+        )
+
+        async def uploader(*_args, **_kwargs):
+            return "replaced"
+
+        before_save = await listing.apply_excel_fields(
+            fields,
+            title="【绿巨人】NEIGBORL钊叔制工装休闲裤",
+            style_code="NGBL-10588",
+            portrait_paths=(Path("three-four-1.jpg"),),
+            timeout_seconds=30,
+            uploader=uploader,
+        )
+
+        report = await listing.verify_persisted_values(
+            fields,
+            title="【绿巨人】NEIGBORL钊叔制工装休闲裤",
+            style_code="NGBL-10588",
+            expected_attributes=before_save["attributes"]["attributes"],
+        )
+
+        self.assertEqual(report["identity"]["商品标题"], "【绿巨人】钊叔制工装休闲裤")
+        self.assertEqual(report["attributes"]["裤长"], ("长裤",))
+        self.assertEqual(report["presale"]["付款后"], "15")
+        self.assertEqual(report["sku_values"], {"售价": "586", "库存": "100"})
+        self.assertEqual(report["row_count"], 2)
+
+        await self.page.locator('[data-xhs-field="货号"] input').fill("wrong")
+        with self.assertRaisesRegex(Exception, "保存后身份字段回读失败"):
+            await listing.verify_persisted_values(
+                fields,
+                title="【绿巨人】NEIGBORL钊叔制工装休闲裤",
+                style_code="NGBL-10588",
+                expected_attributes=before_save["attributes"]["attributes"],
+            )
+
     def test_adapter_has_no_save_or_publish_entrypoints(self):
         self.assertFalse(hasattr(XhsFormListing, "save"))
         self.assertFalse(hasattr(XhsFormListing, "publish"))
@@ -297,9 +381,9 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
                 content_type="application/json",
                 headers={"access-control-allow-origin": "*"},
                 json={
-                    "values": [
-                        {"id": "regular", "name": "常规"},
-                        {"id": "thick", "name": "加厚"},
+                    "attributeValueV3s": [
+                        {"valueId": "regular", "valueName": "常规"},
+                        {"valueId": "thick", "valueName": "加厚"},
                     ]
                 },
             )
@@ -325,6 +409,12 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
               option.onclick = () => choose(option);
               node.append(option);
             }"""
+        )
+        await item.locator(".el-select-dropdown__item").evaluate_all(
+            """nodes => nodes.forEach(node => {
+              const label = node.textContent.trim();
+              node.__vue__ = {value: label, created: false};
+            })"""
         )
 
         actual = await listing._fill_attribute(

@@ -18,6 +18,7 @@ import numpy as np
 MIN_OCR_CONFIDENCE = 0.25
 _TOKEN_FIELDS = {"text", "confidence", "x", "y", "width", "height"}
 _DUPLICATE_MODULE_SIGNATURE = "redefinition of module 'SwiftBridging'"
+_SDK_MISMATCH_SIGNATURE = "this SDK is not supported by the compiler"
 _TOOL_TIMEOUT_SECONDS = 60
 
 
@@ -60,6 +61,19 @@ class SkuRecommendation:
     waist: Number
     hip: Number
     length: Number
+
+
+@dataclass(frozen=True)
+class ClothingSkuRecommendation:
+    size: str
+    height_min: Number
+    height_max: Number
+    weight_min: Number
+    weight_max: Number
+    length: Number
+    chest: Number
+    shoulder: Number
+    sleeve: Number
 
 
 @dataclass(frozen=True)
@@ -165,6 +179,49 @@ def _duplicate_module_workaround(toolchain: _Toolchain) -> Iterator[List[str]]:
         ) from error
 
 
+def _default_sdk_path() -> Optional[Path]:
+    try:
+        result = subprocess.run(
+            ["xcrun", "--show-sdk-path"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return Path(value) if value else None
+
+
+def _compatible_sdk_candidates(default_sdk: Optional[Path]) -> List[Path]:
+    try:
+        resolved_default = default_sdk.resolve() if default_sdk else None
+    except OSError:
+        resolved_default = default_sdk
+    directories = {
+        path
+        for directory in (
+            Path("/Library/Developer/CommandLineTools/SDKs"),
+            Path("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs"),
+        )
+        if directory.is_dir()
+        for path in directory.glob("MacOSX*.sdk")
+    }
+    candidates = []
+    for path in directories:
+        try:
+            if resolved_default is not None and path.resolve() == resolved_default:
+                continue
+        except OSError:
+            pass
+        if (path / "usr" / "lib" / "swift" / "Swift.swiftmodule").is_dir():
+            candidates.append(path)
+    return sorted(candidates, key=_numeric_version, reverse=True)
+
+
 def _run_compile(command: List[str]):
     try:
         return subprocess.run(
@@ -192,6 +249,14 @@ def _compile_bridge(script_path: Path, output_path: Path, toolchain: _Toolchain)
                 str(output_path),
             ]
             result = _run_compile(retry_command)
+
+    if result.returncode != 0 and _SDK_MISMATCH_SIGNATURE in result.stderr:
+        default_sdk = _default_sdk_path()
+        for sdk_path in _compatible_sdk_candidates(default_sdk):
+            retry_command = base_command + ["-sdk", str(sdk_path), str(script_path), "-o", str(output_path)]
+            result = _run_compile(retry_command)
+            if result.returncode == 0:
+                break
 
     if result.returncode != 0:
         detail = result.stderr.strip() or f"退出码 {result.returncode}"
@@ -371,6 +436,19 @@ _MEASUREMENT_NAMES = {
     "foot_opening": "脚围",
 }
 
+_CLOTHING_MEASUREMENT_ALIASES = {
+    "length": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
+    "chest": ("胸围", "BUST", "CHEST"),
+    "shoulder": ("肩宽", "SHOULDERWIDTH", "SHOULDER"),
+    "sleeve": ("袖长", "SLEEVELENGTH", "SLEEVE"),
+}
+_CLOTHING_MEASUREMENT_NAMES = {
+    "length": "衣长",
+    "chest": "胸围",
+    "shoulder": "肩宽",
+    "sleeve": "袖长",
+}
+
 _TAOBAO_LENGTH_ALIASES = {
     "pants": ("裤长", "LENGTH", "PANTSLENGTH", "TROUSERLENGTH"),
     "clothing": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
@@ -404,6 +482,76 @@ def _expected_size_map(expected_sizes: Sequence[str], source: str) -> Dict[str, 
     if not result:
         raise RecognitionError(f"{source}：Excel 尺码为空")
     return result
+
+
+def parse_size_names(
+    tokens: Tuple[OCRToken, ...],
+    garment_kind: str,
+    *,
+    source: str = "尺码信息表",
+) -> Tuple[str, ...]:
+    """Discover one ordered letter-size header from a garment length table.
+
+    This is only a fallback for workbooks without a ``尺码`` row.  It requires a
+    unique pants/clothing length label and at least two same-row size headers;
+    ambiguous OCR is rejected instead of inventing a size list.
+    """
+
+    aliases = _TAOBAO_LENGTH_ALIASES.get(garment_kind)
+    if aliases is None:
+        raise RecognitionError(f"不支持从尺码表推导该品类尺码：{garment_kind!r}")
+    label_tokens = [
+        token for token in tokens if _matches_alias_composition(token.text, aliases)
+    ]
+    if len(label_tokens) != 1:
+        display_name = "裤长" if garment_kind == "pants" else "衣长"
+        raise RecognitionError(
+            f"{source}：{display_name}行标题匹配数为 {len(label_tokens)}，无法安全推导尺码"
+        )
+    label = label_tokens[0]
+    candidates = [
+        (size, token)
+        for token in tokens
+        for size in [_normalize_size(token.text)]
+        if size is not None
+        and _center_y(token) < _center_y(label)
+        and _center_x(token) > label.x + label.width
+    ]
+    if len(candidates) < 2:
+        raise RecognitionError(f"{source}：尺码表头精确尺码少于 2 个")
+
+    # Keep only the closest horizontal header row above the length label.
+    ordered_by_y = sorted(candidates, key=lambda item: _center_y(item[1]))
+    rows: List[List[Tuple[str, OCRToken]]] = []
+    for item in ordered_by_y:
+        if not rows or abs(_center_y(item[1]) - _center_y(rows[-1][0][1])) > 0.04:
+            rows.append([item])
+        else:
+            rows[-1].append(item)
+    viable = [row for row in rows if len(row) >= 2]
+    if not viable:
+        raise RecognitionError(f"{source}：找不到同一行的尺码表头")
+    closest_y = max(_center_y(row[0][1]) for row in viable)
+    closest = [row for row in viable if abs(_center_y(row[0][1]) - closest_y) <= 0.001]
+    if len(closest) != 1:
+        raise RecognitionError(f"{source}：尺码表头位置不唯一")
+
+    result: List[str] = []
+    for size, _token in sorted(closest[0], key=lambda item: _center_x(item[1])):
+        if size in result:
+            raise RecognitionError(f"{source}：尺码列标题重复：{size}")
+        result.append(size)
+    return tuple(result)
+
+
+def recognize_size_names(
+    size_chart_path: Path,
+    garment_kind: str,
+) -> Tuple[str, ...]:
+    size_chart_path = Path(size_chart_path)
+    return parse_size_names(
+        vision_ocr(size_chart_path), garment_kind, source=str(size_chart_path)
+    )
 
 
 def _require_size_set(actual: Sequence[str], expected: Sequence[str], source: str) -> None:
@@ -668,6 +816,95 @@ def parse_measurement_table(
             foot_opening=cells.get((size, "foot_opening")),
         )
     return result
+
+
+def parse_clothing_measurement_table(
+    tokens: Tuple[OCRToken, ...],
+    expected_sizes: Sequence[str],
+    *,
+    source: str = "尺码信息表",
+) -> Dict[str, Mapping[str, Number]]:
+    """Parse the four measurements required by Douyin clothing size tables."""
+    expected_map = _expected_size_map(expected_sizes, source)
+
+    row_tokens: Dict[str, OCRToken] = {}
+    for token in tokens:
+        matches = [
+            kind
+            for kind, aliases in _CLOTHING_MEASUREMENT_ALIASES.items()
+            if _matches_alias_composition(token.text, aliases)
+        ]
+        if len(matches) != 1:
+            continue
+        kind = matches[0]
+        if kind in row_tokens:
+            raise RecognitionError(
+                f"{source}：{_CLOTHING_MEASUREMENT_NAMES[kind]}行标题重复"
+            )
+        row_tokens[kind] = token
+
+    missing_rows = [
+        display_name
+        for kind, display_name in _CLOTHING_MEASUREMENT_NAMES.items()
+        if kind not in row_tokens
+    ]
+    if missing_rows:
+        raise RecognitionError(f"{source}：缺少测量行：{', '.join(missing_rows)}")
+
+    first_row_y = min(_center_y(token) for token in row_tokens.values())
+    label_right = max(token.x + token.width for token in row_tokens.values())
+    header_candidates = [
+        (size, token)
+        for token in tokens
+        for size in [_normalize_size(token.text)]
+        if size is not None
+        and _center_y(token) < first_row_y
+        and _center_x(token) > label_right
+    ]
+    headers: Dict[str, OCRToken] = {}
+    for size, token in header_candidates:
+        if size in headers:
+            raise RecognitionError(f"{source}：尺码列标题重复：{size}")
+        headers[size] = token
+    _require_size_set(tuple(headers), tuple(expected_map), source)
+
+    columns = sorted(headers.items(), key=lambda item: _center_x(item[1]))
+    column_bounds = _cell_bounds([_center_x(token) for _size, token in columns])
+    ordered_rows = sorted(row_tokens.items(), key=lambda item: _center_y(item[1]))
+    row_bounds = _cell_bounds([_center_y(token) for _kind, token in ordered_rows])
+    numeric_tokens = tuple(
+        (token, value)
+        for token in tokens
+        for value in [_number(token.text)]
+        if value is not None
+    )
+
+    cells: Dict[Tuple[str, str], Number] = {}
+    for (kind, _row_token), (top, bottom) in zip(ordered_rows, row_bounds):
+        for (size, _header), (left, right) in zip(columns, column_bounds):
+            matches = [
+                value
+                for token, value in numeric_tokens
+                if left <= _center_x(token) < right
+                and top <= _center_y(token) < bottom
+            ]
+            cell_name = f"{size} {_CLOTHING_MEASUREMENT_NAMES[kind]}"
+            if len(matches) != 1:
+                raise RecognitionError(
+                    f"{source}：单元格 {cell_name}匹配数为 {len(matches)}"
+                )
+            value = matches[0]
+            if value <= 0:
+                raise RecognitionError(f"{source}：单元格 {cell_name}必须是正数")
+            cells[(size, kind)] = value
+
+    return {
+        size: {
+            kind: cells[(size, kind)]
+            for kind in _CLOTHING_MEASUREMENT_NAMES
+        }
+        for size in expected_map
+    }
 
 
 # A descriptive alias for callers that prefer the source name in the API.
@@ -1045,6 +1282,64 @@ def recognize_recommendations(
         ("waist", "腰围"),
         ("hip", "臀围"),
         ("length", "裤长"),
+    )
+    for previous, current in zip(rows, rows[1:]):
+        for field, display_name in monotonic_fields:
+            if getattr(current, field) < getattr(previous, field):
+                raise RecognitionError(
+                    f"尺码顺序 {previous.size} → {current.size} 的{display_name}递减"
+                )
+    return tuple(rows)
+
+
+def recognize_clothing_recommendations(
+    size_chart_path: Path,
+    height_weight_path: Path,
+    expected_sizes: Sequence[str],
+) -> Tuple[ClothingSkuRecommendation, ...]:
+    """Read the measurements shown by Douyin for an upper-body garment."""
+    expected_map = _expected_size_map(expected_sizes, "Excel")
+    expected = tuple(expected_map)
+    size_chart_path = Path(size_chart_path)
+    height_weight_path = Path(height_weight_path)
+    measurements = parse_clothing_measurement_table(
+        vision_ocr(size_chart_path),
+        expected,
+        source=str(size_chart_path),
+    )
+    ranges = parse_height_weight_chart(
+        height_weight_path,
+        vision_ocr(height_weight_path),
+        expected,
+    )
+    _require_size_set(tuple(measurements), expected, str(size_chart_path))
+    _require_size_set(tuple(ranges), expected, str(height_weight_path))
+
+    rows = []
+    for size in expected:
+        height_min, height_max, weight_min, weight_max = ranges[size]
+        values = measurements[size]
+        rows.append(
+            ClothingSkuRecommendation(
+                expected_map[size],
+                _positive_number(height_min, str(height_weight_path), size, "身高下限"),
+                _positive_number(height_max, str(height_weight_path), size, "身高上限"),
+                _positive_number(weight_min, str(height_weight_path), size, "体重下限"),
+                _positive_number(weight_max, str(height_weight_path), size, "体重上限"),
+                _positive_number(values["length"], str(size_chart_path), size, "衣长"),
+                _positive_number(values["chest"], str(size_chart_path), size, "胸围"),
+                _positive_number(values["shoulder"], str(size_chart_path), size, "肩宽"),
+                _positive_number(values["sleeve"], str(size_chart_path), size, "袖长"),
+            )
+        )
+
+    monotonic_fields = (
+        ("height_max", "身高上限"),
+        ("weight_max", "体重上限"),
+        ("length", "衣长"),
+        ("chest", "胸围"),
+        ("shoulder", "肩宽"),
+        ("sleeve", "袖长"),
     )
     for previous, current in zip(rows, rows[1:]):
         for field, display_name in monotonic_fields:

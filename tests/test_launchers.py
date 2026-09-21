@@ -30,7 +30,7 @@ class LauncherArgumentTests(unittest.TestCase):
     def test_double_click_menu_allows_jd_publish_after_confirmation(self):
         arguments, output = self._run_launcher(input_text="9\n3\nPUBLISH\n")
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "jd", "--save"))
-        self.assertIn("向所选平台的指定店铺提交铺货", output)
+        self.assertIn("的指定店铺提交铺货", output)
 
     def test_create_cli_defaults_to_base_and_preserves_equals_platform(self):
         arguments, _ = self._run_launcher(("--create-product", "--no-save"))
@@ -38,7 +38,7 @@ class LauncherArgumentTests(unittest.TestCase):
         arguments, _ = self._run_launcher(("--platform=base", "--create-product", "--no-save"))
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform=base", "--create-product", "--no-save"))
 
-    def _run_launcher(self, user_arguments=(), input_text=""):
+    def _run_launcher(self, user_arguments=(), input_text="", extra_env=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "run.command"
@@ -60,6 +60,8 @@ class LauncherArgumentTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                env={**__import__("os").environ,
+                     "KUAIMAI_SKIP_PRODUCT_SELECTION": "1", **(extra_env or {})},
             )
         output = completed.stdout.splitlines()
         marker = output.index("RUN_ARGS_START")
@@ -96,7 +98,7 @@ class LauncherArgumentTests(unittest.TestCase):
             arguments,
             ("kuaimai_erp.py", "--platform", "wxsph", "--save"),
         )
-        self.assertIn("向所选平台的指定店铺提交铺货", output)
+        self.assertIn("的指定店铺提交铺货", output)
 
     def test_double_click_menu_selects_xhs_form_preview_without_platform_save(self):
         arguments, output = self._run_launcher(input_text="7\n1\n")
@@ -123,7 +125,7 @@ class LauncherArgumentTests(unittest.TestCase):
             arguments,
             ("kuaimai_erp.py", "--platform", "xhs", "--save"),
         )
-        self.assertIn("向所选平台的指定店铺提交铺货", output)
+        self.assertIn("的指定店铺提交铺货", output)
 
     def test_double_click_menu_selects_youzan_no_save_preview(self):
         arguments, output = self._run_launcher(input_text="8\n1\n")
@@ -149,7 +151,7 @@ class LauncherArgumentTests(unittest.TestCase):
             arguments,
             ("kuaimai_erp.py", "--platform", "youzan", "--save"),
         )
-        self.assertIn("向所选平台的指定店铺提交铺货", output)
+        self.assertIn("的指定店铺提交铺货", output)
 
     def test_double_click_menu_allows_pdd_publish_after_confirmation(self):
         arguments, output = self._run_launcher(input_text="5\n3\nPUBLISH\n")
@@ -158,7 +160,7 @@ class LauncherArgumentTests(unittest.TestCase):
             arguments,
             ("kuaimai_erp.py", "--platform", "pdd", "--save"),
         )
-        self.assertIn("向所选平台的指定店铺提交铺货", output)
+        self.assertIn("的指定店铺提交铺货", output)
 
     def test_double_click_menu_allows_tmall_save_only_without_once_flag(self):
         arguments, output = self._run_launcher(input_text="4\n2\n")
@@ -214,6 +216,61 @@ class LauncherArgumentTests(unittest.TestCase):
         arguments, _output = self._run_launcher(("--no-save",))
 
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "all", "--no-save"))
+
+    def test_learning_helper_environment_adds_flag_without_changing_menu_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "run.command"
+            shutil.copy2(PROJECT_ROOT / "run.command", launcher)
+            launcher.chmod(0o755)
+            fake_python = root / ".venv" / "bin" / "python"
+            fake_python.parent.mkdir(parents=True)
+            fake_python.write_text(
+                "#!/bin/zsh\n"
+                "if [[ \"$1\" == \"-m\" && \"$2\" == \"pip\" ]]; then exit 0; fi\n"
+                "print -r -- RUN_ARGS_START\n"
+                "for argument in \"$@\"; do print -r -- \"$argument\"; done\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            completed = subprocess.run(
+                ["/bin/zsh", str(launcher)],
+                input="9\n1\n",
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**__import__("os").environ, "KUAIMAI_LEARNING_AUTO_ENABLE": "1",
+                     "KUAIMAI_SKIP_PRODUCT_SELECTION": "1"},
+            )
+        output = completed.stdout.splitlines()
+        marker = output.index("RUN_ARGS_START")
+        self.assertEqual(
+            tuple(output[marker + 1 :]),
+            ("kuaimai_erp.py", "--platform", "jd", "--no-save", "--learning-enabled"),
+        )
+
+    def test_product_menu_scans_and_remembers_last_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            products = root / "products"
+            first = products / "A款" / "产品信息.xlsx"
+            second = products / "B 款" / "产品信息.xlsx"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.touch()
+            second.touch()
+            last_file = root / "state" / "last-product-path"
+            env = {"KUAIMAI_SKIP_PRODUCT_SELECTION": "0",
+                   "KUAIMAI_PRODUCTS_ROOT": str(products),
+                   "KUAIMAI_LAST_PRODUCT_FILE": str(last_file)}
+            arguments, output = self._run_launcher(input_text="2\n9\n1\n", extra_env=env)
+            self.assertIn("B 款", output)
+            self.assertEqual(arguments,
+                ("kuaimai_erp.py", "--excel-url", str(second), "--platform", "jd", "--no-save"))
+            arguments, output = self._run_launcher(input_text="\n9\n1\n", extra_env=env)
+            self.assertIn("[上次选择]", output)
+            self.assertEqual(arguments,
+                ("kuaimai_erp.py", "--excel-url", str(second), "--platform", "jd", "--no-save"))
 
 
 if __name__ == "__main__":

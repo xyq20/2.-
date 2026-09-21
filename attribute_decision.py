@@ -133,12 +133,16 @@ def validate_decision(
         return _review("evidence_conflict", snapshot_version)
 
     evidence_names = set(_evidence_names(decision))
-    for required in policy.required_evidence:
-        if required.value not in evidence_names:
-            return _review(
-                "required_{}_evidence_missing".format(required.value),
-                snapshot_version,
-            )
+    # A confirmed operator choice is itself the final evidence. Requiring the
+    # original machine evidence again would turn the same resolved field back
+    # into a review task on resume.
+    if decision.source != "human_override":
+        for required in policy.required_evidence:
+            if required.value not in evidence_names:
+                return _review(
+                    "required_{}_evidence_missing".format(required.value),
+                    snapshot_version,
+                )
 
     candidates = tuple(snapshot.values)
     if not candidates:
@@ -165,6 +169,15 @@ def validate_decision(
         if candidate.value_id == decision.proposed_value_id
     )
     if not matches:
+        if snapshot.custom_allowed and decision.source == "human_override":
+            custom_value = decision.proposed_value_id.strip()
+            return ValidatedDecision(
+                status=DecisionStatus.AUTO_FILL_READY,
+                value_id=custom_value,
+                value_label=custom_value,
+                reason_code="validated",
+                snapshot_version=snapshot_version,
+            )
         is_label_only_value = any(
             candidate.label == decision.proposed_value_id for candidate in candidates
         )

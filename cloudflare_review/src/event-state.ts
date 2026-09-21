@@ -37,6 +37,22 @@ const checkpointTransitions: Record<string, readonly string[]> = {
   completed: ["completed"],
   cancelled: ["cancelled"],
 };
+const platformRunnerNames: Record<string, string> = {
+  fxg: "douyin",
+  tb: "taobao",
+  tm: "tmall",
+  yz: "youzan",
+};
+function canonicalPlatformName(value: Json | undefined): string {
+  const name = String(value ?? "").trim();
+  return platformRunnerNames[name] ?? name;
+}
+function platformsEquivalent(
+  left: Json | undefined,
+  right: Json | undefined,
+): boolean {
+  return canonicalPlatformName(left) === canonicalPlatformName(right);
+}
 export async function validateCheckpoint(
   env: ReviewEnv,
   p: Record<string, Json>,
@@ -109,7 +125,10 @@ export async function validateCheckpoint(
     requireValue(
       task &&
         Array.isArray(p.platform_order) &&
-        p.platform_order[Number(p.current_index)] === task.platform_id,
+        platformsEquivalent(
+          p.platform_order[Number(p.current_index)],
+          task.platform_id,
+        ),
       409,
       "checkpoint_review_mismatch",
     );

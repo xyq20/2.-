@@ -5,7 +5,7 @@ import unittest
 from platform_discovery import ApiClient, DiscoveryContext
 from platform_registry import get_platform_spec
 from platform_schema import CategoryCandidate, CategoryResolution, to_dict
-from wxsph_listing import WxsphListing
+from wxsph_listing import WxsphListing, parse_wxsph_attribute_fields
 
 
 class RecordingTransport:
@@ -42,6 +42,54 @@ def all_fields(fragment):
 
 
 class WxsphListingContractTests(unittest.TestCase):
+    def test_current_nested_attribute_shape_is_normalized(self):
+        fields = parse_wxsph_attribute_fields(
+            {
+                "result": True,
+                "data": {
+                    "attr": {
+                        "productAttrList": [
+                            {
+                                "name": "裤长",
+                                "type": "select_one",
+                                "typeV2": "select_one",
+                                "value": "短裤;长裤;超长裤",
+                                "isRequired": "true",
+                                "appendAllowed": False,
+                            },
+                            {
+                                "name": "风格",
+                                "type": "select_one",
+                                "typeV2": "select_many",
+                                "value": "休闲;通勤;休闲",
+                                "appendAllowed": True,
+                            },
+                        ]
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(tuple(field.label for field in fields), ("裤长", "风格"))
+        self.assertEqual(fields[0].source_id, "裤长")
+        self.assertEqual(fields[0].control_type, "select_one")
+        self.assertTrue(fields[0].required)
+        self.assertEqual(
+            tuple(option.label for option in fields[0].option_values),
+            ("短裤", "长裤", "超长裤"),
+        )
+        self.assertEqual(
+            tuple(option.value_id for option in fields[0].option_values),
+            ("短裤", "长裤", "超长裤"),
+        )
+        self.assertEqual(fields[1].control_type, "select_many")
+        self.assertTrue(fields[1].multiple)
+        self.assertTrue(fields[1].custom_allowed)
+        self.assertEqual(
+            tuple(option.label for option in fields[1].option_values),
+            ("休闲", "通勤"),
+        )
+
     def test_protocol_registry_and_endpoint_catalog_are_read_only_and_exact(self):
         adapter = WxsphListing()
 

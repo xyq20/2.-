@@ -88,6 +88,27 @@ class TmallApiExtractionTests(unittest.TestCase):
         self.assertEqual(fields[0].source_id, "122216347")
         self.assertEqual(fields[0].options, ("2026年秋季",))
 
+    def test_extracts_json_encoded_edit_schema_fields(self):
+        fields = extract_api_fields(
+            {
+                "success": True,
+                "data": [
+                    {
+                        "editSchemaFieldDescriptor": """
+                        {"fields":[{"propId":"344943689","label":"裤型",
+                        "options":[{"value":"straight","label":"直筒裤"}]}]}
+                        """,
+                    }
+                ]
+            },
+            "/tm/detail.json",
+        )
+
+        pants_fields = tuple(field for field in fields if field.label == "裤型")
+        self.assertEqual(len(pants_fields), 1)
+        self.assertEqual(pants_fields[0].source_id, "344943689")
+        self.assertEqual(pants_fields[0].options, ("直筒裤",))
+
 
 class TmallApiIndexTests(unittest.IsolatedAsyncioTestCase):
     async def test_matching_existing_product_requires_successful_product_id(self):
@@ -181,6 +202,34 @@ class TmallApiIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields[0].category_leaf_id, "3035")
         self.assertEqual(fields[0].source_id, "thickness")
         self.assertEqual(fields[0].option_values[0].value_id, "regular")
+
+    async def test_candidate_field_uses_category_id_from_detail_payload(self):
+        index = TmallApiJsonIndex(FakePage())
+        path = "/tm/detail.json"
+        await index._consume(
+            FakeResponse(
+                "https://scm.example/tm/detail.json",
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "categoryId": "3035",
+                            "editSchemaFieldDescriptor": """
+                            {"fields":[{"propId":"344943689","label":"裤型",
+                            "options":[{"value":"straight","label":"直筒裤"}]}]}
+                            """,
+                        }
+                    ]
+                },
+            ),
+            path,
+            "GET",
+        )
+
+        fields = index.candidate_fields("裤型")
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].category_leaf_id, "3035")
 
     async def test_resolve_option_follows_candidate_order_and_rejects_duplicates(self):
         page = FakePage()

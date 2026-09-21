@@ -6,6 +6,8 @@ publish method: the common runner retains the final write gate.
 
 from __future__ import annotations
 
+from field_policies import without_color_attributes
+
 import asyncio
 import re
 from decimal import Decimal, InvalidOperation
@@ -13,13 +15,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
+from canonical_fields import is_learning_managed_field
 from pdd_data import PddFields
 from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
 from pdd_listing import parse_pdd_attribute_fields
 from platform_candidate_source import (
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
+    validate_observed_selection,
 )
 from platform_schema import FieldSchema
 from taobao_listing import (
@@ -30,6 +35,7 @@ from taobao_listing import (
     normalize_option,
     parse_taobao_materials,
     selection_value_groups,
+    selection_value_groups_for_control,
 )
 
 
@@ -225,43 +231,76 @@ class PddFormListing(TaobaoListing):
         page_label: str,
         select: Any,
         groups: Sequence[Sequence[str]],
+        *,
+        observed_values: Sequence[str] = (),
     ) -> Tuple[Tuple[str, ...], ...]:
         runtime = getattr(self, "attribute_runtime", None)
         normalized_groups = tuple(tuple(str(value) for value in group) for group in groups)
         if runtime is None:
             return normalized_groups
-        field, category_id = await self._captured_api_field(page_label)
-        if not field.source_id:
-            raise PddFormListingError(
-                "拼多多属性“{0}”的接口字段 ID 为空".format(page_label)
-            )
-        multi = await select.locator(".el-select__tags").count() > 0
-        await self._open_select(select, multi=multi)
+        managed = is_learning_managed_field("pdd", page_label)
         try:
-            _dropdown, options = await self._visible_dom_options(select)
-        finally:
-            try:
-                await self._dismiss_select_dropdown(select)
-            except Exception:
-                pass
-        try:
-            candidates = reconcile_candidates(
-                field.option_values,
-                tuple(
-                    DomCandidate(
-                        str(option.get("value") or ""),
-                        str(option.get("name") or ""),
-                        not bool(option.get("disabled")),
-                    )
-                    for option in options
-                ),
-            )
-        except CandidateSourceError as exc:
-            raise PddFormListingError(
-                "拼多多属性“{0}”接口候选与页面候选不一致：{1}".format(
-                    page_label, exc.reason_code
+            field, category_id = await self._captured_api_field(page_label)
+        except PddFormListingError as exc:
+            if self.logger is not None:
+                self.logger.info(
+                    "拼多多属性“%s”：接口字段未定位，改用当前 DOM 匹配/直接输入与回读：%s",
+                    page_label,
+                    exc,
                 )
-            ) from exc
+            return normalized_groups
+        if not field.source_id:
+            if self.logger is not None:
+                self.logger.info(
+                    "拼多多属性“%s”：接口字段 ID 为空，改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return normalized_groups
+        if observed_values:
+            try:
+                candidates = validate_observed_selection(
+                    field.option_values,
+                    observed_values,
+                )
+            except CandidateSourceError as exc:
+                if self.logger is not None:
+                    self.logger.info(
+                        "拼多多属性“%s”已保存值无法与当前接口 JSON "
+                        "唯一关联，仅保留 DOM 回读，本次不重复入库：%s",
+                        page_label,
+                        exc.reason_code,
+                    )
+                return normalized_groups
+        else:
+            multi = await select.locator(".el-select__tags").count() > 0
+            await self._open_select(select, multi=multi)
+            try:
+                _dropdown, options = await self._visible_dom_options(select)
+            finally:
+                try:
+                    await self._dismiss_select_dropdown(select)
+                except Exception:
+                    pass
+            try:
+                candidates = reconcile_candidates(
+                    field.option_values,
+                    tuple(
+                        DomCandidate(
+                            str(option.get("value") or ""),
+                            str(option.get("name") or ""),
+                            not bool(option.get("disabled")),
+                        )
+                        for option in options
+                    ),
+                )
+            except CandidateSourceError as exc:
+                if not managed:
+                    return normalized_groups
+                raise PddFormListingError(
+                    "拼多多属性“{0}”接口候选与页面候选不一致：{1}".format(
+                        page_label, exc.reason_code
+                    )
+                ) from exc
         schema_version = canonical_sha256(
             {
                 "platform_id": "pdd",
@@ -275,25 +314,23 @@ class PddFormListing(TaobaoListing):
         )
         resolved_groups = []
         for group in normalized_groups:
-            exact = tuple(
-                value.label
-                for value in candidates
-                if any(
-                    normalize_option(value.label) == normalize_option(alias)
-                    for alias in group
-                )
+            request_candidates, excel_value = await self._excel_before_review(
+                select, candidates, group, label=page_label,
+                preflight_request=AttributeRequest(
+                    platform_id="pdd", category_leaf_id=category_id,
+                    field_id=str(field.source_id), field_label=page_label,
+                    candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                    excel_value="/".join(group), evidence={},
+                    custom_allowed=bool(field.custom_allowed), schema_version=schema_version,
+                ),
             )
-            excel_value = exact[0] if len(exact) == 1 else "/".join(group)
             resolved = await runtime.resolve(
                 AttributeRequest(
                     platform_id="pdd",
                     category_leaf_id=category_id,
                     field_id=str(field.source_id),
                     field_label=page_label,
-                    candidates=tuple(
-                        CandidateValue(value.value_id, value.label)
-                        for value in candidates
-                    ),
+                    candidates=request_candidates,
                     excel_value=excel_value,
                     evidence={"excel": bool(excel_value)},
                     custom_allowed=bool(field.custom_allowed),
@@ -301,6 +338,8 @@ class PddFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
+            if resolved is None:
+                return ()
             resolved_groups.append((resolved.label,))
         return tuple(resolved_groups)
 
@@ -520,15 +559,56 @@ class PddFormListing(TaobaoListing):
             groups = (
                 tuple((str(value),) for value in exact_values)
                 if exact_values is not None
-                else selection_value_groups(page_label, expected)
+                else selection_value_groups_for_control(
+                    page_label, expected, multi=multi
+                )
             )
             if not groups:
                 raise PddFormListingError("拼多多属性“{0}”期望值为空".format(page_label))
-            if not multi and len(groups) > 1:
-                raise PddFormListingError(
-                    "拼多多属性“{0}”是单选，Excel 却提供多个逗号分组".format(page_label)
+            current = tuple(
+                value
+                for value in await self._read_select_values(select, multi=multi)
+                if normalize_option(value)
+            )
+            remaining = list(current)
+            current_matches = []
+            for group in groups:
+                match_index = next(
+                    (
+                        index
+                        for index, current_value in enumerate(remaining)
+                        if any(
+                            normalize_option(current_value)
+                            == normalize_option(candidate)
+                            for candidate in group
+                        )
+                    ),
+                    None,
                 )
+                if match_index is None:
+                    break
+                current_matches.append(remaining.pop(match_index))
+            if len(current_matches) == len(groups) and not remaining:
+                await self._resolve_learning_groups(
+                    page_label,
+                    select,
+                    tuple((value,) for value in current_matches),
+                    observed_values=current_matches,
+                )
+                if self.logger is not None:
+                    self.logger.info(
+                        "拼多多属性“%s”当前值已匹配，完成轻量学习后跳过下拉点击",
+                        page_label,
+                    )
+                return tuple(current_matches)
             groups = await self._resolve_learning_groups(page_label, select, groups)
+            if not groups:
+                if self.logger is not None:
+                    self.logger.info(
+                        "拼多多属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                        page_label,
+                    )
+                return None
             return await self._select_values(select, groups, label=page_label, multi=multi)
         if len(visible_inputs) != 1:
             raise PddFormListingError(
@@ -616,6 +696,7 @@ class PddFormListing(TaobaoListing):
         self, fields: Mapping[str, str], page_items: Mapping[str, Tuple[str, Any]]
     ) -> Dict[str, Tuple[str, str]]:
         target_sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         for key, value in fields.items():
             aliases = set(excel_aliases(key))
             for normalized_page, (page_label, _item) in page_items.items():
@@ -645,7 +726,7 @@ class PddFormListing(TaobaoListing):
 
     async def fill_category_attributes(self, fields: PddFields) -> Mapping[str, Any]:
         category = await self.apply_recommended_category()
-        page_items = await self._attribute_items()
+        page_items = without_color_attributes(await self._attribute_items())
         assignments = await self._attribute_assignments(fields.fields, page_items)
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped: Dict[str, str] = {}
@@ -668,12 +749,29 @@ class PddFormListing(TaobaoListing):
                 fields.fields, page_label, expected
             )
             try:
-                actual = await self.fill_attribute(
-                    page_label,
-                    expected,
-                    exact_values=exact_values,
-                    item=item,
-                )
+                if (
+                    normalize_label(page_label)
+                    in {
+                        normalize_label("面料"),
+                        normalize_label("面料俗称"),
+                        normalize_label("材质"),
+                    }
+                    and exact_values is not None
+                    and len(exact_values) >= 2
+                ):
+                    actual = await self._fill_fabric_attribute(
+                        page_label, exact_values, item=item,
+                        writer=lambda value, values: self.fill_attribute(
+                            page_label, value, exact_values=values, item=item
+                        ),
+                    )
+                else:
+                    actual = await self.fill_attribute(
+                        page_label,
+                        expected,
+                        exact_values=exact_values,
+                        item=item,
+                    )
             except TaobaoListingError as exc:
                 raise PddFormListingError(str(exc).replace("淘宝", "拼多多")) from exc
             if actual is None:
@@ -867,9 +965,18 @@ class PddFormListing(TaobaoListing):
 
     @staticmethod
     def _expected_price_inventory(fields: Mapping[str, str]) -> Mapping[str, str]:
+        try:
+            group_price = normalize_money_value(
+                _required_excel_value(fields, ("拼单价", "拼团价"), "拼单价")
+            )
+            single_price = normalize_money_value(
+                _required_excel_value(fields, ("单买价", "单独购买价"), "单买价")
+            )
+        except MoneyValueError as exc:
+            raise PddFormListingError(f"Excel 拼多多价格{exc}") from exc
         expected = {
-            "拼单价": _required_excel_value(fields, ("拼单价", "拼团价"), "拼单价"),
-            "单买价": _required_excel_value(fields, ("单买价", "单独购买价"), "单买价"),
+            "拼单价": group_price,
+            "单买价": single_price,
             # PDD 的“库存”对应 Excel 通用“数量”。不要把抖音专用的
             # “现货库存”混入候选；两者常同时存在且语义不同。
             "库存": _required_excel_value(fields, ("库存", "数量"), "库存"),
@@ -995,9 +1102,29 @@ class PddFormListing(TaobaoListing):
         if self.logger is not None:
             self.logger.info("拼多多价格库存：等待页面校验状态稳定")
         visible_errors = await self._settled_visible_validation_errors()
-        if visible_errors:
+        if (
+            visible_errors
+            and not (
+                self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+            )
+        ):
             raise PddFormListingError("拼多多页面校验错误：" + "；".join(visible_errors))
-        return {"attributes": attributes, "sku_batch": batch, "timed_presale": presale}
+        return {
+            "attributes": attributes,
+            "sku_batch": batch,
+            "timed_presale": presale,
+            "deferred_validation_errors": (
+                visible_errors
+                if self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+                else ()
+            ),
+        }
 
     async def verify_persisted_price_inventory(
         self, fields: Mapping[str, str]

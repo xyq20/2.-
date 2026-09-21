@@ -17,10 +17,11 @@ from learning_models import (
     RunCheckpoint,
     StageResult,
     canonical_json,
+    canonical_sha256,
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -133,6 +134,17 @@ class LearningStore:
               field_id TEXT NOT NULL,
               payload_json TEXT NOT NULL,
               created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS review_resolutions (
+              product_version TEXT NOT NULL,
+              platform_id TEXT NOT NULL,
+              snapshot_version TEXT NOT NULL,
+              review_id TEXT NOT NULL,
+              final_value_id TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (product_version, platform_id, snapshot_version)
             )
             """,
             """
@@ -365,6 +377,174 @@ class LearningStore:
                     utc_now(),
                 ),
             )
+
+    def save_review_resolution(
+        self,
+        *,
+        product_version: str,
+        platform_id: str,
+        snapshot_version: str,
+        review_id: str,
+        final_value_id: str,
+    ) -> None:
+        """Persist an operator-confirmed choice before the browser retries."""
+        values = {
+            "product_version": str(product_version).strip(),
+            "platform_id": str(platform_id).strip(),
+            "snapshot_version": str(snapshot_version).strip(),
+            "review_id": str(review_id).strip(),
+            "final_value_id": str(final_value_id).strip(),
+        }
+        if not all(values.values()):
+            raise ValueError("review resolution fields must be non-empty")
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO review_resolutions("
+                "product_version,platform_id,snapshot_version,review_id,"
+                "final_value_id,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(product_version,platform_id,snapshot_version) "
+                "DO UPDATE SET review_id=excluded.review_id,"
+                "final_value_id=excluded.final_value_id,updated_at=excluded.updated_at",
+                (
+                    values["product_version"],
+                    values["platform_id"],
+                    values["snapshot_version"],
+                    values["review_id"],
+                    values["final_value_id"],
+                    utc_now(),
+                ),
+            )
+
+    def load_review_resolution(
+        self,
+        *,
+        product_version: str,
+        platform_id: str,
+        snapshot_version: str,
+    ) -> Optional[str]:
+        row = self.connection.execute(
+            "SELECT final_value_id FROM review_resolutions "
+            "WHERE product_version=? AND platform_id=? AND snapshot_version=?",
+            (
+                str(product_version).strip(),
+                str(platform_id).strip(),
+                str(snapshot_version).strip(),
+            ),
+        ).fetchone()
+        return str(row["final_value_id"]) if row is not None else None
+
+    def reusable_review_label(
+        self,
+        snapshot: CandidateSnapshot,
+        excel_value: str,
+        control_type: str,
+        canonical_field: Optional[str] = None,
+    ) -> Optional[str]:
+        """Reuse a confirmed choice for the same platform/field input.
+
+        A vendor category ID is not part of the learning key.  The same
+        logical field can be exposed by different category endpoints with
+        different option IDs (and schema versions), so reuse is matched by
+        platform, canonical/logical field, live candidate *names*, control
+        type and the exact Excel OR input.  Candidate IDs are remapped by the
+        caller.
+
+        If older products contain different confirmed values for the same
+        otherwise-identical input, the most recently confirmed value wins.
+        This keeps one corrected operator decision from causing the same
+        question to be audited again on every category.
+        """
+        excel = tuple(v.strip() for v in re.split(r"[/／]", excel_value) if v.strip())
+        labels = [v.label for v in snapshot.values]
+        if not excel or len(labels) != len(set(labels)):
+            return None
+        rows = self.connection.execute(
+            "SELECT r.final_value_id,r.updated_at,s.payload_json,e.payload_json AS review_json "
+            "FROM review_resolutions r JOIN candidate_snapshots s "
+            "ON r.snapshot_version=s.snapshot_version "
+            "LEFT JOIN sync_outbox e ON e.event_type='review.created' "
+            "AND json_extract(e.payload_json,'$.id')=r.review_id "
+            "WHERE s.platform_id=? "
+            "ORDER BY r.updated_at DESC",
+            (snapshot.platform_id,),
+        ).fetchall()
+        choices: list[tuple[str, str]] = []
+        for row in rows:
+            old = json.loads(row['payload_json'])
+            review = json.loads(row['review_json']) if row['review_json'] else {}
+            old_canonical = str(review.get('canonical_field') or '').strip()
+            # The SQL filter is intentionally only a coarse selector.  Keep
+            # the exact field label check here for databases created before
+            # field_label was consistently persisted in snapshots.
+            same_logical_field = (
+                bool(canonical_field)
+                and old_canonical == str(canonical_field).strip()
+            ) or (
+                not old_canonical
+                and str(old.get('field_label', '')).strip()
+                == str(snapshot.field_label).strip()
+            ) or (
+                not canonical_field
+                and str(old.get('field_label', '')).strip()
+                == str(snapshot.field_label).strip()
+            )
+            if not same_logical_field:
+                continue
+            values = old['values']
+            old_labels = [v['label'] for v in values]
+            if old['custom_allowed'] != snapshot.custom_allowed:
+                continue
+            evidence = review.get('evidence_json', {})
+            context = evidence.get('reuse_context')
+            if context is not None:
+                context_candidates = tuple(
+                    str(value).strip()
+                    for value in context.get('excel_candidates', ())
+                    if str(value).strip()
+                ) if isinstance(context, Mapping) else ()
+                if (
+                    not isinstance(context, Mapping)
+                    or context.get('control_type') != control_type
+                    or set(context_candidates) != set(excel)
+                ):
+                    continue
+            else:
+                # Legacy text adapters built their snapshot directly from Excel
+                # OR values. Verify that exact construction; never infer the
+                # input from an ordinary select's whole option dictionary.  The
+                # legacy schema is rebuilt with the *old* category/field keys;
+                # those keys are provenance only and must not block the new
+                # cross-category reuse policy.
+                legacy_schema = canonical_sha256({
+                    'platform_id': old.get('platform_id', snapshot.platform_id),
+                    'category_leaf_id': old.get('category_leaf_id', ''),
+                    'field_id': old.get('field_id', ''), 'control_type': 'text',
+                    'options': values,
+                })
+                if (control_type != 'text' or not evidence.get('excel')
+                        or not evidence.get('text') or set(old_labels) != set(excel)
+                        or old['schema_version'] != legacy_schema):
+                    continue
+            if evidence.get('force_review') or evidence.get('selection_only'):
+                continue
+            matches = [v['label'] for v in values
+                       if row['final_value_id'] in (v['value_id'], v['label'])]
+            if len(matches) != 1:
+                continue
+            # A category may add/remove unrelated candidates.  The learned
+            # choice is reusable as long as its name is still a unique live
+            # candidate; IDs and the complete option-list shape are irrelevant.
+            if sum(1 for value in snapshot.values if value.label == matches[0]) != 1:
+                continue
+            choices.append((str(row['updated_at'] or ''), matches[0]))
+        if not choices:
+            return None
+        # The rows are already newest-first.  A later correction is the
+        # operator's current rule when old category-specific approvals differ.
+        chosen = choices[0][1]
+        # An explicit new Excel value always wins over a cross-product rule.
+        exact = [v.label for v in snapshot.values if excel_value.strip() in (v.label, v.value_id)]
+        return chosen if not exact or chosen in exact else None
 
     def enqueue(
         self,

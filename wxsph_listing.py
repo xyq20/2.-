@@ -163,8 +163,20 @@ def _recommended_category(
 
 
 def _control(value: Mapping[str, Any]) -> str:
-    kind = str(value.get("inputType") or value.get("type") or "").lower()
-    if value.get("multiple") is True or "multi" in kind:
+    kind = " ".join(
+        str(part)
+        for part in (
+            value.get("inputType"),
+            value.get("type"),
+            value.get("typeV2"),
+        )
+        if part not in (None, "")
+    ).lower()
+    if (
+        value.get("multiple") is True
+        or "multi" in kind
+        or "select_many" in kind
+    ):
         return "select_many"
     if value.get("values") or "select" in kind:
         return "select_one"
@@ -234,6 +246,7 @@ def _fields(
                     if isinstance(value.get("multiple"), bool)
                     else True if control_type == "select_many" else False if control_type == "select_one" else None
                 ),
+                custom_allowed=_bool_value(value.get("appendAllowed")),
                 option_summary=option_summary(options, source="api") if options else None,
                 option_values=field_options(options, source="api"),
                 api_paths=(path,),
@@ -281,8 +294,51 @@ def unwrap_wxsph_payload(payload: Any) -> Any:
 def parse_wxsph_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
     """Parse authoritative category-attribute candidates from captured JSON."""
     body = _mapping(unwrap_wxsph_payload(payload))
+    attr = body.get("attr")
+    if isinstance(attr, Mapping):
+        values = _items(attr.get("productAttrList"))
+    else:
+        values = _items(attr)
+
+    normalized = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        item = dict(value)
+        kind = " ".join(
+            str(part)
+            for part in (
+                item.get("inputType"),
+                item.get("type"),
+                item.get("typeV2"),
+            )
+            if part not in (None, "")
+        ).lower()
+        raw_candidates = item.get("value")
+        if not _items(item.get("values")) and "select" in kind:
+            if isinstance(raw_candidates, str):
+                candidates = tuple(
+                    candidate.strip()
+                    for candidate in re.split(r"[;；]", raw_candidates)
+                    if candidate.strip()
+                )
+            else:
+                candidates = _items(raw_candidates)
+            # The current WeChat API can repeat a label (for example "棉").
+            # Preserve the server order while keeping reconciliation unique.
+            candidates = tuple(dict.fromkeys(candidates))
+            # This API shape exposes labels only. FastMai's bound select value
+            # uses that same string, so keep the label as the authoritative
+            # value ID and verify it against both the live DOM ID and label.
+            item["values"] = tuple(
+                {"id": candidate, "name": candidate}
+                if isinstance(candidate, str)
+                else candidate
+                for candidate in candidates
+            )
+        normalized.append(item)
     return _fields(
-        _items(body.get("attr")),
+        normalized,
         section="attributes",
         prefix="wxsph:attribute",
         path=_PROPERTIES.path,

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -37,7 +38,15 @@ _CONTAINER_KEYS = frozenset(
         "children",
         "childFields",
         "childrenUI",
+        "attributeList",
+        "publishSchema",
+        "publishSchemaField",
+        "editSchema",
+        "editSchemaFieldDescriptor",
     )
+)
+_ENCODED_SCHEMA_KEYS = frozenset(
+    ("publishSchema", "publishSchemaField", "editSchema", "editSchemaFieldDescriptor")
 )
 _OPTION_KEYS = (
     "options",
@@ -197,6 +206,21 @@ def _response_category_id(response: Any) -> str:
     return unique[0] if len(unique) == 1 else ""
 
 
+def _payload_category_id(payload: Any) -> str:
+    root = _unwrap_payload(payload)
+    records = root if isinstance(root, (tuple, list)) else (root,)
+    values = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        for key in ("leafCategoryId", "categoryId"):
+            value = record.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                values.append(str(value).strip())
+    unique = tuple(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else ""
+
+
 @dataclass(frozen=True)
 class TmallApiField:
     endpoint_path: str
@@ -254,11 +278,17 @@ def extract_api_fields(payload: Any, endpoint_path: str) -> Tuple[TmallApiField,
         for key, nested in value.items():
             if key not in _CONTAINER_KEYS:
                 continue
+            if key in _ENCODED_SCHEMA_KEYS and isinstance(nested, str):
+                try:
+                    nested = json.loads(nested)
+                except (TypeError, ValueError):
+                    continue
             if isinstance(nested, Mapping):
                 for fallback_id, descriptor in nested.items():
                     if isinstance(descriptor, Mapping):
                         add_descriptor(descriptor, str(fallback_id))
                         visit(descriptor, descriptor_context=False, depth=depth + 1)
+                visit(nested, descriptor_context=False, depth=depth + 1)
             else:
                 visit(nested, descriptor_context=True, depth=depth + 1)
 
@@ -281,6 +311,7 @@ class TmallApiJsonIndex:
         self._installed = False
         self._tasks: Set[Any] = set()
         self._fields: List[TmallApiField] = []
+        self._category_leaf_ids: Set[str] = set()
         self._endpoint_states: Dict[str, Mapping[str, Any]] = {}
         self.matched_existing_product = False
 
@@ -349,7 +380,9 @@ class TmallApiJsonIndex:
             if self.logger is not None:
                 self.logger.info("天猫产品匹配接口：已匹配既有产品=%s", self.matched_existing_product)
 
-        category_id = _response_category_id(response)
+        category_id = _response_category_id(response) or _payload_category_id(payload)
+        if category_id:
+            self._category_leaf_ids.add(category_id)
         fields = tuple(
             TmallApiField(
                 endpoint_path=field.endpoint_path,
@@ -402,6 +435,9 @@ class TmallApiJsonIndex:
             for field in self._fields
             if normalize_api_label(field.label) == normalized
         )
+
+    def category_leaf_ids(self) -> Tuple[str, ...]:
+        return tuple(sorted(self._category_leaf_ids))
 
     def source_ids(self, label: object) -> Tuple[str, ...]:
         return tuple(

@@ -41,6 +41,91 @@ const checkpoint = {
   pending_review_id: null,
   version: 1,
 };
+it("accepts empty options only when the field allows custom input", async () => {
+  const closed = {
+    ...snapshot,
+    snapshot_version: "sv-empty-closed",
+    custom_allowed: false,
+    options: [],
+  };
+  const rejected = await device("snapshot.created", closed);
+  expect(rejected.status).toBe(400);
+  expect(await rejected.json()).toEqual({ error: "invalid_options" });
+  expect(
+    (
+      await device("snapshot.created", {
+        ...closed,
+        snapshot_version: "sv-empty-custom",
+        custom_allowed: true,
+      })
+    ).status,
+  ).toBe(201);
+});
+it("accepts a platform registry id for a runner-name checkpoint", async () => {
+  const aliasProduct = { ...product, product_version: "pv-alias" };
+  const aliasSnapshot = {
+    ...snapshot,
+    snapshot_version: "sv-alias",
+    product_version: undefined,
+    platform_id: "tb",
+  };
+  const aliasReview = {
+    ...review,
+    id: "review-alias",
+    run_id: "run-alias",
+    product_version: "pv-alias",
+    platform_id: "tb",
+    snapshot_version: "sv-alias",
+  };
+  const aliasCheckpoint = {
+    ...checkpoint,
+    run_id: "run-alias",
+    product_version: "pv-alias",
+    platform_order: ["base", "taobao", "tmall"],
+    current_index: 1,
+  };
+  expect((await device("product.upsert", aliasProduct)).status).toBe(201);
+  expect((await device("snapshot.created", aliasSnapshot)).status).toBe(201);
+  expect((await device("checkpoint.updated", aliasCheckpoint)).status).toBe(201);
+  expect((await device("review.created", aliasReview)).status).toBe(201);
+  expect(
+    (
+      await device("checkpoint.updated", {
+        ...aliasCheckpoint,
+        status: "waiting_review",
+        pending_review_id: "review-alias",
+        version: 2,
+      })
+    ).status,
+  ).toBe(201);
+});
+it("normalizes legacy checkpoint_id before idempotency comparison", async () => {
+  await device("product.upsert", product);
+  const legacy = { ...checkpoint, checkpoint_id: checkpoint.run_id };
+  expect(
+    (await device("checkpoint.updated", legacy, "legacy-checkpoint")).status,
+  ).toBe(201);
+  expect(
+    await testEnv.DB.prepare(
+      "SELECT payload_json FROM device_events WHERE idempotency_key=?",
+    )
+      .bind("legacy-checkpoint")
+      .first("payload_json"),
+  ).not.toContain("checkpoint_id");
+  expect(
+    (await device("checkpoint.updated", checkpoint, "legacy-checkpoint"))
+      .status,
+  ).toBe(409);
+  expect(
+    (
+      await device("checkpoint.updated", {
+        ...checkpoint,
+        run_id: "different-run",
+        checkpoint_id: checkpoint.run_id,
+      })
+    ).status,
+  ).toBe(400);
+});
 const readback = {
   run_id: "run1",
   product_version: "pv1",

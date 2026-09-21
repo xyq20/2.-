@@ -20,7 +20,9 @@ from size_image_recognition import (
     OCRToken,
     RecognitionError,
     SkuRecommendation,
+    parse_clothing_measurement_table,
     parse_measurement_table,
+    parse_size_names,
     parse_size_lengths,
     recognize_recommendations,
     vision_ocr,
@@ -173,6 +175,57 @@ class VisionOCRUnitTests(unittest.TestCase):
             [(item.size, item.length) for item in actual],
             [("S", 62.5), ("M", 64.5)],
         )
+
+    def test_douyin_clothing_reads_all_visible_measurement_rows(self):
+        tokens = (
+            _token("S", 0.40, 0.10),
+            _token("M", 0.60, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("肩宽/SHOULDER WIDTH", 0.05, 0.45, width=0.20),
+            _token("胸围/BUST", 0.05, 0.60, width=0.20),
+            _token("袖长/SLEEVE LENGTH", 0.05, 0.75, width=0.20),
+            _token("63.5", 0.40, 0.30),
+            _token("65", 0.60, 0.30),
+            _token("55", 0.40, 0.45),
+            _token("56.5", 0.60, 0.45),
+            _token("125", 0.40, 0.60),
+            _token("129", 0.60, 0.60),
+            _token("56", 0.40, 0.75),
+            _token("57", 0.60, 0.75),
+        )
+
+        actual = parse_clothing_measurement_table(
+            tokens, ("S", "M"), source="外套尺码表"
+        )
+
+        self.assertEqual(
+            actual,
+            {
+                "S": {"length": 63.5, "chest": 125, "shoulder": 55, "sleeve": 56},
+                "M": {"length": 65, "chest": 129, "shoulder": 56.5, "sleeve": 57},
+            },
+        )
+
+    def test_discovers_clothing_sizes_from_unique_length_header(self):
+        tokens = (
+            _token("上装/Topcoat", 0.17, 0.43, width=0.20),
+            _token("S", 0.46, 0.51),
+            _token("M", 0.56, 0.51),
+            _token("L", 0.66, 0.51),
+            _token("XL", 0.76, 0.51),
+            _token("衣长/LENGTH", 0.21, 0.59, width=0.14),
+            _token("63.5", 0.46, 0.59),
+            _token("65", 0.56, 0.59),
+        )
+
+        self.assertEqual(
+            parse_size_names(tokens, "clothing", source="外套尺码表"),
+            ("S", "M", "L", "XL"),
+        )
+
+    def test_size_discovery_rejects_unknown_product_family(self):
+        with self.assertRaisesRegex(RecognitionError, "不支持"):
+            parse_size_names(_measurement_tokens(), "footwear")
 
     @patch("size_image_recognition.subprocess.run")
     def test_rejects_other_malformed_token_schema(self, run):
@@ -523,3 +576,4 @@ class VisionOCRIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    parse_clothing_measurement_table,
