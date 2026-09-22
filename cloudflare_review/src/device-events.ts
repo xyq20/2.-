@@ -205,7 +205,7 @@ export function validateDeviceEvent(
   if (type === "snapshot.created") {
     requireValue(
       Array.isArray(p.options) &&
-        p.options.length <= 500 &&
+        p.options.length <= 5000 &&
         (p.options.length > 0 || p.custom_allowed === true),
       400,
       "invalid_options",
