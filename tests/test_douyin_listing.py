@@ -830,6 +830,22 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual, ("棉混纺布",))
 
+    async def test_reviewed_multi_choice_is_selected_one_candidate_at_a_time(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing.attribute_runtime = object()
+        self.listing._resolve_learning_select_value = AsyncMock(
+            return_value=("棉,亚麻", ())
+        )
+
+        actual = await self.listing.fill_attribute("里料材质", "通用/男女通用")
+
+        self.assertEqual(actual, ("棉", "亚麻"))
+        tags = self.page.locator(
+            ".attr-item:has(.el-form-item__label:text-is('里料材质')) .el-tag"
+        )
+        self.assertEqual(await tags.all_inner_texts(), ["棉", "亚麻"])
+
     async def test_direct_input_failure_falls_back_to_operational_review(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()

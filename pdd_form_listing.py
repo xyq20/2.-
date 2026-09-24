@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
+from category_profile import choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from pdd_data import PddFields
 from learning_models import CandidateValue, canonical_sha256
@@ -31,9 +32,11 @@ from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     parse_taobao_materials,
+    material_value_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -133,11 +136,7 @@ def _special_category_values(
     """Translate only PDD's known display formats before exact option matching."""
     normalized_label = normalize_label(page_label)
     if normalized_label in {normalize_label("面料俗称"), normalize_label("材质")}:
-        try:
-            materials = parse_taobao_materials(fields)
-        except TaobaoListingError as exc:
-            raise PddFormListingError(str(exc).replace("淘宝", "拼多多")) from exc
-        names = tuple(material.name for material in materials)
+        names = tuple("/".join(group) for group in material_name_groups(expected))
         return names or None
     if normalized_label == normalize_label("是否加绒"):
         option = {
@@ -557,7 +556,7 @@ class PddFormListing(TaobaoListing):
             select = selects.first
             multi = await select.locator(".el-select__tags").count() > 0
             groups = (
-                tuple((str(value),) for value in exact_values)
+                material_value_groups(page_label, exact_values)
                 if exact_values is not None
                 else selection_value_groups_for_control(
                     page_label, expected, multi=multi
@@ -648,12 +647,10 @@ class PddFormListing(TaobaoListing):
                     continue
                 row = button.locator("xpath=..")
                 row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
-                has_recommendation = await row.get_by_text("推荐", exact=True).count()
-                if has_recommendation or "推荐" in row_text:
-                    expected = re.sub(r"^\s*推荐\s*", "", row_text)
-                    expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
-                    if expected:
-                        recommended.append((button, expected))
+                expected = re.sub(r"^\s*推荐\s*", "", row_text)
+                expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
+                if expected:
+                    recommended.append((button, expected))
             if recommended:
                 break
             if current and normalize_label(current) not in {
@@ -661,18 +658,49 @@ class PddFormListing(TaobaoListing):
                 normalize_label("请选择类目"),
                 normalize_label("商品分类"),
             }:
-                return current
+                if not self.category_hints:
+                    return current
+                chosen, _strategy = choose_category_candidate(
+                    (current,), self.category_hints
+                )
+                if chosen:
+                    return current
+                raise PddFormListingError(
+                    f"拼多多已选类目与 Excel 商品分类不匹配：{current!r}"
+                )
             await asyncio.sleep(0.25)
 
         if not recommended:
             raise PddFormListingError("拼多多页面在 45 秒内没有可用推荐类目")
-        if len(recommended) != 1:
-            raise PddFormListingError(
-                "拼多多页面带“推荐”标记的预测类目不是唯一项：{0}".format(
-                    len(recommended)
-                )
+        if self.category_hints:
+            chosen, strategy = choose_category_candidate(
+                tuple(expected for _button, expected in recommended),
+                self.category_hints,
             )
-        button, expected = recommended[0]
+            matches = [
+                item for item in recommended
+                if self._normalize_category_path(item[1])
+                == self._normalize_category_path(chosen)
+            ] if chosen else []
+            if len(matches) != 1:
+                raise PddFormListingError(
+                    "拼多多预测类目中没有与 Excel 商品分类唯一匹配的项："
+                    f"{len(matches)}"
+                )
+            button, expected = matches[0]
+            if self.logger is not None:
+                self.logger.info(
+                    "拼多多预测类目按 Excel 选择第 %s 个：%s（%s）",
+                    next(index + 1 for index, item in enumerate(recommended) if item[0] == button),
+                    expected,
+                    strategy,
+                )
+        else:
+            if len(recommended) != 1:
+                raise PddFormListingError(
+                    "拼多多页面预测类目不是唯一项：{0}".format(len(recommended))
+                )
+            button, expected = recommended[0]
         await button.scroll_into_view_if_needed()
         await button.click()
         self.category_clicked = True

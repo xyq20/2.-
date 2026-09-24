@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Tuple
@@ -24,6 +25,7 @@ UNSUPPORTED_CONTROL_TYPES = frozenset({"shop", "logistics", "freight"})
 
 MULTI_CHOICE_SEPARATORS = r"[,，、;；]"
 EXCEL_ALTERNATIVE_SEPARATORS = r"[,，、;；/／]"
+MULTI_SELECT_CONTROL_TYPES = frozenset({"multi_select", "multi-select", "multiselect"})
 
 
 def _normalize_choice_text(value: object) -> str:
@@ -54,6 +56,54 @@ def excel_alternative_set(excel_value: object) -> frozenset:
         )
         if part.strip()
     )
+
+
+def _matched_excel_variants(
+    excel_value: object,
+    candidates: Tuple[CandidateValue, ...],
+    *,
+    control_type: str,
+) -> Tuple[Tuple[CandidateValue, ...], ...]:
+    """Resolve ordered Excel alternatives against live platform candidates.
+
+    For a proven multi-select control, slash separates alternative plans and
+    commas separate the values required by one plan.  Thus
+    ``秋季，冬季/春秋冬/春秋`` means ``[秋季 + 冬季]`` first, then either
+    one-value fallback.  Single-select controls keep commas inside the label.
+    """
+
+    text = str(excel_value or "").strip()
+    if not text:
+        return ()
+    if str(control_type).casefold() in MULTI_SELECT_CONTROL_TYPES:
+        raw_variants = tuple(
+            tuple(
+                part.strip()
+                for part in re.split(MULTI_CHOICE_SEPARATORS, alternative)
+                if part.strip()
+            )
+            for alternative in re.split(r"[/／]", text)
+            if alternative.strip()
+        )
+    else:
+        raw_variants = ((text,),)
+
+    matched_variants = []
+    for variant in raw_variants:
+        matched = []
+        for part in variant:
+            found = tuple(
+                candidate
+                for candidate in candidates
+                if part in {candidate.value_id, candidate.label}
+            )
+            if len(found) != 1 or found[0] in matched:
+                matched = []
+                break
+            matched.append(found[0])
+        if matched:
+            matched_variants.append(tuple(matched))
+    return tuple(matched_variants)
 
 
 @dataclass(frozen=True)
@@ -264,45 +314,54 @@ class AttributeRuntime:
     def reusable_choice(self, request: AttributeRequest) -> Optional[ResolvedAttribute]:
         """Read-only preflight before an adapter attempts Excel input.
 
-        An approval is exact for the same product/snapshot, while the learning
-        library may reuse a confirmed rule across category snapshots when the
-        platform, logical field, candidate names and Excel OR input match.
-        Candidate IDs are remapped to the current live dictionary. A genuinely
-        changed Excel candidate still overrides incompatible history.
+        An approval is exact for the same product/snapshot, and the same
+        product may reuse its approval across category snapshots.  A different
+        product's review is only training evidence: it must pass the learning
+        service's confidence gate before this runtime can use it.
         """
         approved = self.confirmed_choice(request)
         if approved is not None:
             return approved
-        cross_product = self._cross_product_choice(request)
-        if cross_product is not None:
-            return cross_product
-        aliases = tuple(part.strip() for part in re.split(r'[/／]', request.excel_value))
-        exact = tuple(
-            candidate
-            for candidate in request.candidates
-            if candidate.label in aliases or candidate.value_id in aliases
+        same_product_review = self._cross_product_choice(
+            request, same_product_only=True
         )
+        if same_product_review is not None:
+            return same_product_review
+        matched_excel = _matched_excel_variants(
+            request.excel_value,
+            request.candidates,
+            control_type=request.control_type,
+        )
+        exact = matched_excel[0] if matched_excel else ()
         labels = self.verified_history.get((canonical_platform_name(request.platform_id),
                                            normalize_history_field_label(request.field_label)), ())
-        if not labels:
+        if labels:
+            matches = [c for c in request.candidates if c.label in labels]
+            # 多选字段的历史是多个 label（如 适用季节=秋季,冬季）：每个都唯一
+            # 命中当前候选时组合复用，与 resolve 的多值历史语义保持一致。
+            if (
+                len(matches) == len(labels)
+                and len(set(matches)) == len(matches)
+                and (not exact or all(match in exact for match in matches))
+            ):
+                return ResolvedAttribute(
+                    ",".join(match.value_id for match in matches),
+                    ",".join(match.label for match in matches),
+                    'verified_history',
+                    '',
+                )
+        if exact:
             return None
-        matches = [c for c in request.candidates if c.label in labels]
-        # 多选字段的历史是多个 label（如 适用季节=秋季,冬季）：每个都唯一
-        # 命中当前候选时组合复用，与 resolve 的多值历史语义保持一致。
-        if len(matches) != len(labels) or len(set(matches)) != len(matches):
-            return None
-        if exact and not all(match in exact for match in matches):
-            return None
-        return ResolvedAttribute(
-            ",".join(match.value_id for match in matches),
-            ",".join(match.label for match in matches),
-            'verified_history',
-            '',
-        )
+        return None
 
-    def _cross_product_choice(self, request: AttributeRequest) -> Optional[ResolvedAttribute]:
+    def _cross_product_choice(
+        self, request: AttributeRequest, *, same_product_only: bool = False
+    ) -> Optional[ResolvedAttribute]:
         request = replace(request, candidates=first_per_label(request.candidates))
-        if request.evidence.get('force_review') or request.evidence.get('selection_only'):
+        # A selection_only request means the confirmed value was already tried
+        # against the live control and could not be written. Reusing it would
+        # repeat the same failed click instead of opening a fresh review.
+        if request.evidence.get("selection_only"):
             return None
         snapshot = CandidateSnapshot(
             request.platform_id, request.category_leaf_id, request.field_id,
@@ -320,11 +379,20 @@ class AttributeRuntime:
             request.excel_value,
             request.control_type,
             canonical_field,
+            self.product_version if same_product_only else None,
         )
-        matches = [v for v in request.candidates if v.label == label]
-        if len(matches) != 1:
+        parts = split_multi_choice(label)
+        matches = []
+        for part in parts:
+            part_matches = [v for v in request.candidates if v.label == part]
+            if len(part_matches) != 1 or part_matches[0] in matches:
+                return None
+            matches.append(part_matches[0])
+        if not matches:
             return None
-        return ResolvedAttribute(matches[0].value_id, matches[0].label,
+        return ResolvedAttribute(
+            ",".join(match.value_id for match in matches),
+            ",".join(match.label for match in matches),
                                  'cross_product_human', snapshot.snapshot_version)
 
     def _remember_resolved(
@@ -337,6 +405,37 @@ class AttributeRuntime:
             )
         ] = (request, resolved)
         return resolved
+
+    def _queue_candidate_snapshot(
+        self,
+        snapshot: CandidateSnapshot,
+        canonical_field: Optional[str],
+        control_type: str,
+    ) -> None:
+        self.store.save_candidate_snapshot(snapshot)
+        self.store.enqueue(
+            f"snapshot.created:{snapshot.snapshot_version}",
+            "snapshot.created",
+            {
+                "snapshot_version": snapshot.snapshot_version,
+                "platform_id": snapshot.platform_id,
+                "category_leaf_id": snapshot.category_leaf_id,
+                "field_id": snapshot.field_id,
+                "field_label": snapshot.field_label,
+                "schema_version": snapshot.schema_version,
+                "custom_allowed": snapshot.custom_allowed,
+                "canonical_field": canonical_field,
+                "control_type": control_type,
+                "options": [
+                    {
+                        "value_id": candidate.value_id,
+                        "label": candidate.label,
+                        "position": position,
+                    }
+                    for position, candidate in enumerate(snapshot.values)
+                ],
+            },
+        )
 
     def record_verified_readbacks(
         self, platform_id: str, attributes: Mapping[str, Any]
@@ -355,18 +454,44 @@ class AttributeRuntime:
                 for value in values_source
                 if value is not None and str(value).strip()
             )
-            if len(values) != 1:
-                continue
             remembered = self._resolved_attributes.get(
                 (platform, normalize_history_field_label(raw_label))
             )
             if remembered is None:
                 continue
             request, resolved = remembered
-            if normalize_history_field_label(values[0]) != normalize_history_field_label(
-                resolved.label
-            ):
-                continue
+            resolved_ids = split_multi_choice(resolved.value_id)
+            is_multi_choice = len(resolved_ids) > 1 and all(
+                sum(
+                    1
+                    for candidate in request.candidates
+                    if candidate.value_id == value_id
+                )
+                == 1
+                for value_id in resolved_ids
+            )
+            if is_multi_choice:
+                actual_labels = tuple(
+                    part
+                    for value in values
+                    for part in split_multi_choice(value)
+                )
+                resolved_labels = split_multi_choice(resolved.label)
+                if Counter(
+                    normalize_history_field_label(value)
+                    for value in actual_labels
+                ) != Counter(
+                    normalize_history_field_label(value)
+                    for value in resolved_labels
+                ):
+                    continue
+                actual_label = resolved.label
+            else:
+                if len(values) != 1 or normalize_history_field_label(
+                    values[0]
+                ) != normalize_history_field_label(resolved.label):
+                    continue
+                actual_label = values[0]
             payload = {
                 "run_id": self.run_id,
                 "product_version": self.product_version,
@@ -375,7 +500,7 @@ class AttributeRuntime:
                 "field_id": request.field_id,
                 "snapshot_version": resolved.snapshot_version,
                 "actual_value_id": resolved.value_id,
-                "actual_label": values[0],
+                "actual_label": actual_label,
                 "verified": True,
                 "payload_json": {"source": "save_readback"},
             }
@@ -395,13 +520,12 @@ class AttributeRuntime:
         if request.control_type.casefold() in UNSUPPORTED_CONTROL_TYPES:
             raise ValueError("operational selector cannot use attribute learning")
         requested_candidates = tuple(request.candidates)
-        exact_excel = tuple(
-            candidate
-            for candidate in requested_candidates
-            if request.excel_value.strip()
-            and request.excel_value.strip()
-            in {candidate.value_id, candidate.label}
+        matched_excel_variants = _matched_excel_variants(
+            request.excel_value,
+            requested_candidates,
+            control_type=request.control_type,
         )
+        exact_excel = matched_excel_variants[0] if matched_excel_variants else ()
         historical_labels = self.verified_history.get(
             (
                 canonical_platform_name(request.platform_id),
@@ -422,10 +546,18 @@ class AttributeRuntime:
             len({candidate.label for candidate in historical_candidates})
             == len(historical_candidates)
         ) and (
-            not excel_alternatives
-            or all(
-                _normalize_choice_text(candidate.label) in excel_alternatives
-                for candidate in historical_candidates
+            any(
+                {candidate.label for candidate in historical_candidates}
+                == {candidate.label for candidate in variant}
+                for variant in matched_excel_variants
+            )
+            if matched_excel_variants
+            else (
+                not excel_alternatives
+                or all(
+                    _normalize_choice_text(candidate.label) in excel_alternatives
+                    for candidate in historical_candidates
+                )
             )
         )
         historical_candidate = (
@@ -440,7 +572,7 @@ class AttributeRuntime:
         # the review service.  It keeps the snapshot bounded without weakening
         # the click-time DOM/readback validation performed by the adapter.
         snapshot_candidates = (
-            exact_excel if len(exact_excel) == 1 and not request.evidence.get("force_review") else requested_candidates
+            exact_excel if exact_excel and not request.evidence.get("force_review") else requested_candidates
         )
         snapshot = CandidateSnapshot(
             request.platform_id,
@@ -521,37 +653,22 @@ class AttributeRuntime:
             )
         except FieldMappingError:
             canonical_field = None
-        self.store.enqueue(
-            f"snapshot.created:{snapshot.snapshot_version}",
-            "snapshot.created",
-            {
-                "snapshot_version": snapshot.snapshot_version,
-                "platform_id": snapshot.platform_id,
-                "category_leaf_id": snapshot.category_leaf_id,
-                "field_id": snapshot.field_id,
-                "field_label": snapshot.field_label,
-                "schema_version": snapshot.schema_version,
-                "custom_allowed": snapshot.custom_allowed,
-                "canonical_field": canonical_field,
-                "control_type": request.control_type,
-                "options": [
-                    {
-                        "value_id": candidate.value_id,
-                        "label": candidate.label,
-                        "position": position,
-                    }
-                    for position, candidate in enumerate(snapshot.values)
-                ],
-            },
+        same_product_review = self._cross_product_choice(
+            request, same_product_only=True
+        )
+        if same_product_review is not None:
+            self._queue_candidate_snapshot(
+                full_snapshot, canonical_field, request.control_type
+            )
+            self._schedule_flush()
+            return self._remember_resolved(request, same_product_review)
+        self._queue_candidate_snapshot(
+            snapshot, canonical_field, request.control_type
         )
         if request.evidence.get("force_review"):
             await self._raise_review(request, snapshot, canonical_field,
                                      "platform_write_failed")
             return None
-        cross_product = self._cross_product_choice(request)
-        if cross_product is not None:
-            self._schedule_flush()
-            return self._remember_resolved(request, cross_product)
         if historical_candidate is not None or historical_group_valid:
             if historical_candidate is None:
                 # 多选字段的保存回读是一组值（如 适用季节=秋季,冬季）：
@@ -616,8 +733,11 @@ class AttributeRuntime:
                     snapshot.snapshot_version,
                 ),
             )
-        if len(exact_excel) == 1:
-            exact_candidate = exact_excel[0]
+        if exact_excel:
+            exact_candidate = CandidateValue(
+                ",".join(candidate.value_id for candidate in exact_excel),
+                ",".join(candidate.label for candidate in exact_excel),
+            )
             values = {}
             if canonical_field is not None:
                 values[canonical_field] = {

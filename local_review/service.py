@@ -30,6 +30,25 @@ def require(condition: object, status: int, code: str) -> None:
         raise ApiError(status, code)
 
 
+def _candidate_selection_is_unique(options: list[dict[str, Any]], value: str) -> bool:
+    """Validate one candidate ID or a comma-separated multi-selection."""
+    if sum(1 for option in options if option.get("value_id") == value) == 1:
+        return True
+    parts = tuple(
+        part.strip()
+        for part in re.split(r"[,，、;；]", value)
+        if part.strip()
+    )
+    return (
+        len(parts) > 1
+        and len(parts) == len(set(parts))
+        and all(
+            sum(1 for option in options if option.get("value_id") == part) == 1
+            for part in parts
+        )
+    )
+
+
 EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     "product.upsert": (
         {"product_version", "style_code", "title"},
@@ -457,7 +476,7 @@ def ingest_event(settings: Settings, data: Any) -> tuple[int, dict[str, Any]]:
                 require(
                     bool(snapshot["custom_allowed"])
                     or bool(human_value)
-                    or sum(1 for option in options if option["value_id"] == actual) == 1,
+                    or _candidate_selection_is_unique(options, actual),
                     422,
                     "actual_candidate_not_unique",
                 )
@@ -609,13 +628,8 @@ def _record_verified_rule_outcome(
     if outcome is None:
         return False
     candidates = json.loads(outcome["options_json"])
-    candidate_valid = (
-        sum(
-            1
-            for candidate in candidates
-            if candidate.get("value_id") == outcome["final_value_id"]
-        )
-        == 1
+    candidate_valid = _candidate_selection_is_unique(
+        candidates, outcome["final_value_id"]
     )
     accepted = bool(
         candidate_valid

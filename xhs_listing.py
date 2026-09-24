@@ -22,6 +22,7 @@ from platform_schema import (
     field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -515,39 +516,42 @@ class XhsListing:
             observations,
             state,
         )
-        hints = _hint_leaves(context)
-        exact = tuple(
+        chosen, strategy = choose_category_object(candidates, context.category_hints)
+        hint_leaves = _hint_leaves(context)
+        exact_candidates = tuple(
             candidate
             for candidate in candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+            if hint_leaves and normalize_label(candidate.path[-1]) in hint_leaves
         )
         blocking_issues = tuple(
             issue
             for issue in state["issues"]
             if issue != "category_tree_report_budget_exceeded"
         )
-        if len(exact) > _TREE_REPORT_BUDGET:
+        if len(candidates) > _TREE_REPORT_BUDGET:
             self._tree_issue(state, "category_tree_report_budget_exceeded")
-            exact = exact[:_TREE_REPORT_BUDGET]
-        elif not exact and len(candidates) > _TREE_REPORT_BUDGET:
-            self._tree_issue(state, "category_tree_report_budget_exceeded")
-        reported_candidates = exact or candidates[:_TREE_REPORT_BUDGET]
+        if strategy.startswith("ambiguous") and exact_candidates:
+            reported_candidates = exact_candidates[:_TREE_REPORT_BUDGET]
+        elif chosen is not None:
+            reported_candidates = (chosen,)
+        else:
+            reported_candidates = candidates[:_TREE_REPORT_BUDGET]
         self._resolution_fragment = SchemaFragment(
             endpoints=tuple(observations),
             issues=tuple(state["issues"]),
         )
-        if len(exact) == 1 and not blocking_issues:
+        if chosen is not None and not blocking_issues:
             return CategoryResolution(
                 status="resolved",
                 source="tree",
-                selected=exact[0],
+                selected=chosen,
                 candidates=reported_candidates,
             )
         return CategoryResolution(
             status="review_required",
             source="tree",
             candidates=reported_candidates,
-            reason="ambiguous_exact_leaf" if len(exact) > 1 else "no_exact_leaf",
+            reason="ambiguous_exact_leaf" if strategy.startswith("ambiguous") else "no_excel_match",
         )
 
     async def activate_category(

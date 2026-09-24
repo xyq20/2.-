@@ -33,9 +33,11 @@ from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     parse_taobao_fabrics,
+    material_value_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -201,12 +203,14 @@ class YouzanFormListing(TaobaoListing):
         logger: Any,
         *,
         attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
     ) -> None:
         super().__init__(
             page,
             drawer,
             logger,
             attribute_runtime=attribute_runtime,
+            category_hints=category_hints,
         )
         self._youzan_api_generation = 0
         self._youzan_api_category_id = ""
@@ -838,23 +842,11 @@ class YouzanFormListing(TaobaoListing):
     ) -> Optional[Tuple[str, ...]]:
         normalized = normalize_label(page_label)
         if normalized == normalize_label("面料"):
-            try:
-                values = tuple(component.name for component in parse_taobao_fabrics(fields))
-            except TaobaoListingError as exc:
-                raw = str(expected).strip()
-                if "%" in raw or "％" in raw:
-                    raise YouzanFormListingError(
-                        str(exc).replace("淘宝", "有赞")
-                    ) from exc
-                values = tuple(
-                    part.strip()
-                    for part in re.split(r"[、,，;+＋;/／]", raw)
-                    if part.strip()
-                )
-                if not values:
-                    raise YouzanFormListingError(
-                        "Excel 中的有赞面料为空"
-                    ) from exc
+            values = tuple(
+                "/".join(group) for group in material_name_groups(expected)
+            )
+            if not values:
+                raise YouzanFormListingError("Excel 中的有赞面料为空")
             return values or None
         if normalized == normalize_label("年份"):
             year = re.search(r"(?:19|20)\d{2}", str(expected))
@@ -991,7 +983,7 @@ class YouzanFormListing(TaobaoListing):
             select = selects.first
             multi = await select.locator(".el-select__tags").count() > 0
             groups = (
-                tuple((str(value),) for value in exact_values)
+                material_value_groups(page_label, exact_values)
                 if exact_values is not None
                 else selection_value_groups_for_control(
                     page_label, expected, multi=multi

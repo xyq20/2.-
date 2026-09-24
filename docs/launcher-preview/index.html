@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>快麦 · 商品工作台预览</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#" aria-label="快麦工作台首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>快麦<span class="brand-sub">商品工作台</span></span></a>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="工作区导航">
+      <button class="nav-item active" id="nav-home"><span data-icon="grid"></span>商品运行<span class="nav-dot"></span></button>
+      <button class="nav-item" id="nav-history"><span data-icon="history"></span>演示记录<span id="history-count" class="nav-count">0</span></button>
+    </nav>
+    <div class="sidebar-note"><span data-icon="spark"></span><strong>让每次上新，少一点重复。</strong><p>选好商品与平台，<br>从一个地方开始。</p></div>
+    <div class="sidebar-bottom"><button class="nav-item" id="nav-help"><span data-icon="help"></span>使用说明</button><div class="version"><span class="status-dot"></span>网页体验版<span>V 0.1</span></div></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">工作空间<span>/</span><strong>商品运行</strong></div><div class="topbar-right"><span class="preview-badge"><span data-icon="eye"></span>界面预览</span><span class="topbar-divider"></span><span class="avatar">N</span><span class="account">NEIGBORL 工作区</span></div></header>
+    <main>
+      <div class="page-heading"><div><div class="eyebrow">PRODUCT OPERATIONS</div><h1>新一次运行，从这里开始<span class="title-dot">.</span></h1><p>一件商品，多个平台。把重复的工作交给快麦。</p></div><button class="button secondary more-button" id="more-button"><span data-icon="more"></span>更多操作</button></div>
+      <div class="work-grid">
+        <div class="config-column">
+          <section class="panel product-panel" aria-labelledby="product-heading">
+            <div class="section-heading"><h2 id="product-heading"><span class="step">01</span>选择商品</h2><span class="section-caption">本次处理 1 件商品</span></div>
+            <div class="product-content"><div class="product-image" id="product-image"></div><div class="product-info"><div class="product-code"><span id="product-code">NGBL-2107</span><span class="small-badge">示例资料</span></div><h3 id="product-title">复古做旧鼹鼠皮多口袋刺绣工装裤</h3><p id="product-category">男装 / 休闲裤</p><div class="product-meta"><span data-icon="sheet"></span>产品信息.xlsx<span class="meta-divider"></span><span data-icon="image"></span>主图与详情素材</div></div><button class="button secondary change-button" id="change-product">更换商品<span data-icon="chevron"></span></button></div>
+          </section>
+          <section class="panel platform-panel" aria-labelledby="platform-heading">
+            <div class="section-heading"><h2 id="platform-heading"><span class="step">02</span>选择平台<span class="count-badge" id="selected-count">已选 3 个</span></h2><div class="inline-actions"><button id="select-all">全选</button><span></span><button id="clear-all">清空</button></div></div>
+            <p class="section-description">点选一个或多个平台，运行顺序可在右侧调整。</p>
+            <div class="platform-grid" id="platform-grid" role="group" aria-label="选择运行平台"></div>
+            <div class="platform-footnote"><span data-icon="info"></span>只处理选中的平台，沿用各平台已配置的店铺。</div>
+          </section>
+          <section class="panel mode-panel" aria-labelledby="mode-heading">
+            <div class="section-heading"><h2 id="mode-heading"><span class="step">03</span>执行到哪一步</h2></div>
+            <div class="mode-grid" id="mode-grid" role="radiogroup" aria-label="执行模式"></div>
+            <div class="learning-row"><span class="learning-icon" data-icon="spark"></span><div><strong>智能填充与人工审核</strong><p>遇到无法确定的属性，等待你确认后再继续。</p></div><label class="switch" title="智能填充与人工审核"><input id="learning-toggle" type="checkbox" checked aria-label="智能填充与人工审核"><span></span></label></div>
+          </section>
+          <div class="page-footnote"><span data-icon="lock"></span>独立网页预览 · 所有操作仅在本页演示，不会保存或铺货。</div>
+        </div>
+        <aside class="plan-panel" aria-label="本次运行计划">
+          <div class="plan-top"><span class="plan-label">RUN PLAN</span><span data-icon="route"></span></div><h2>本次运行</h2><p class="plan-description">开始前，再看一眼你的选择。</p>
+          <div class="plan-product"><span class="label">商品</span><strong id="plan-product">NGBL-2107</strong></div>
+          <div class="plan-section-title"><span>平台顺序</span><span id="plan-count">3 个平台</span></div>
+          <ol id="plan-list" class="plan-list" aria-label="平台运行顺序"></ol>
+          <div id="empty-plan" class="empty-plan" hidden><span data-icon="grid"></span><p>先选择一个平台<br><small>单选、多选都可以</small></p></div>
+          <div class="plan-divider"></div><dl class="plan-details"><div><dt>执行模式</dt><dd id="plan-mode">只保存</dd></div><div><dt>人工审核</dt><dd id="plan-learning"><i></i>已开启</dd></div></dl>
+          <div class="mode-note" id="mode-note"><span data-icon="shield"></span><p>资料保存后结束，不提交到店铺。</p></div>
+          <button id="preview-run" class="button primary start-button"><span data-icon="play"></span>预览运行<span data-icon="arrow"></span></button><p class="start-caption">体验完整流程，不执行真实任务</p>
+        </aside>
+      </div>
+      <footer><span>快麦工作台</span><span>更清晰的操作，更从容的上新。</span></footer>
+    </main>
+  </div>
+  <dialog id="product-dialog" class="dialog product-dialog"><div class="dialog-header"><div><span class="eyebrow">PRODUCT LIBRARY</span><h2>选择商品</h2></div><button class="icon-button" data-close="product-dialog" aria-label="关闭商品选择"><span data-icon="close"></span></button></div><p class="dialog-subtitle">当前为示例商品，用于体验切换效果。</p><div class="search-box"><span data-icon="search"></span><input id="product-search" type="search" placeholder="搜索商品名称或货号" aria-label="搜索商品" autocomplete="off"></div><div id="product-list" class="product-list"></div><p id="product-empty" class="empty-message" hidden>没有匹配的示例商品，请换个关键词。</p></dialog>
+  <dialog id="run-dialog" class="dialog run-dialog"><div class="dialog-header"><div><span class="eyebrow">RUN PREVIEW</span><h2 id="run-title">确认这次运行</h2></div><button class="icon-button" id="close-run" aria-label="关闭运行预览"><span data-icon="close"></span></button></div><p class="dialog-subtitle">这是模拟演示，不会操作真实商品或店铺。</p><div class="run-summary" id="run-summary"></div><div class="run-progress" id="run-progress" hidden><div><strong id="run-progress-label">准备中</strong><span id="run-percent">0%</span></div><div class="progress-track"><div id="progress-fill"></div></div></div><div id="run-stages" class="run-stages"></div><details id="log-details" class="log-details" hidden><summary>查看模拟日志</summary><pre id="run-log" aria-live="polite"></pre></details><div class="dialog-actions"><button class="button secondary" id="run-secondary">返回调整</button><button class="button primary" id="run-confirm"><span data-icon="play"></span>开始演示</button></div></dialog>
+  <dialog id="history-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">DEMO HISTORY</span><h2>演示记录</h2></div><button class="icon-button" data-close="history-dialog" aria-label="关闭演示记录"><span data-icon="close"></span></button></div><p class="dialog-subtitle">这里只显示本页产生的模拟运行记录，刷新后清空。</p><div id="history-list"></div></dialog>
+  <dialog id="help-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">QUICK GUIDE</span><h2>三步，开始一次运行</h2></div><button class="icon-button" data-close="help-dialog" aria-label="关闭使用说明"><span data-icon="close"></span></button></div><div class="guide-list"><div><span>01</span><section><h3>选好商品</h3><p>点击“更换商品”，搜索并选择本次要处理的商品。</p></section></div><div><span>02</span><section><h3>勾选需要的平台</h3><p>只勾一个就是单选，多勾几个就是多选。在右侧用箭头调整执行顺序。</p></section></div><div><span>03</span><section><h3>选择执行模式</h3><p>仅填写、只保存、保存并铺货，按这次需要选择。点击“预览运行”体验模拟流程。</p></section></div></div><div class="help-note">本页是独立预览。现有命令行启动器继续保留，实际任务仍使用原启动器。</div></dialog>
+  <dialog id="more-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">MORE ACTIONS</span><h2>更多操作</h2></div><button class="icon-button" data-close="more-dialog" aria-label="关闭更多操作"><span data-icon="close"></span></button></div><p class="dialog-subtitle">这版先体验已有商品的多平台流程。下面两项在确认整合后接入。</p><div class="future-action"><span data-icon="box"></span><div><h3>基础资料</h3><p>单独完善商品信息、图片和规格。</p></div><span class="small-badge">待接入</span></div><div class="future-action"><span data-icon="plus"></span><div><h3>新建商品</h3><p>从产品资料创建新的快麦商品。</p></div><span class="small-badge">待接入</span></div></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

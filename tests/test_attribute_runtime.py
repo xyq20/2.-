@@ -84,70 +84,155 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             platform_id=request.platform_id, snapshot_version=snapshot.snapshot_version,
             review_id=review_id, final_value_id=value)
 
-    async def test_cross_product_reuse_is_generic_and_maps_current_ids_by_name(self):
-        for platform, field, label in [('douyin', '680', '上市时间'),
-                                        ('wxsph', 'length', '裤长'),
-                                        ('jd', 'style', '风格')]:
-            with self.subTest(platform=platform, field=field):
-                old = make_length_request(platform_id=platform, field_id=field,
-                    field_label=label, excel_value='候选甲/候选乙')
-                self.remember_cross_product(old, 'long')
-                new = replace(old, candidates=(CandidateValue('new-short', '短裤'),
-                    CandidateValue('new-long', '长裤')), schema_version='new-schema')
-                client = FakeClient()
-                runtime = AttributeRuntime(self.store, client, 'new-run', 'new-product')
-                self.assertEqual(runtime.reusable_choice(new).value_id, 'new-long')
-                result = await runtime.resolve(new)
-                self.assertEqual((result.value_id, result.source), ('new-long', 'cross_product_human'))
-                self.assertEqual(client.decide_calls, [])
-                await runtime._flush()
-
-    async def test_cross_category_reuse_still_respects_excel_and_control_scope(self):
-        old = make_length_request(excel_value='原文甲/原文乙')
+    async def test_new_product_without_excel_match_uses_confidence_gated_learning(self):
+        old = make_length_request(excel_value='候选甲/候选乙')
         self.remember_cross_product(old, 'long')
-        runtime = AttributeRuntime(self.store, FakeClient(), 'new-run', 'new-product')
-        for changed in [replace(old, excel_value='短裤'),
-                        replace(old, excel_value='新原文'),
-                        replace(old, platform_id='jd'),
-                        replace(old, control_type='text'),
-                        replace(old, candidates=(CandidateValue('short', '短裤'),)),
-                        replace(old, evidence={'force_review': True})]:
-            self.assertIsNone(runtime.reusable_choice(changed))
-        # Category and vendor field IDs may change between platform endpoints;
-        # the logical field name and live candidate names are the reuse key.
-        self.assertEqual(
-            runtime.reusable_choice(replace(old, category_leaf_id='other')).label,
-            '长裤',
+        new = replace(
+            old,
+            candidates=(
+                CandidateValue('new-short', '短裤'),
+                CandidateValue('new-long', '长裤'),
+            ),
+            schema_version='new-schema',
         )
-        self.assertEqual(
-            runtime.reusable_choice(replace(old, field_id='other')).label,
-            '长裤',
-        )
-        self.assertEqual(
-            runtime.reusable_choice(
-                replace(
-                    old,
-                    category_leaf_id='other-with-extra-option',
-                    candidates=old.candidates + (CandidateValue('new', '新候选'),),
-                )
-            ).label,
-            '长裤',
-        )
-        result = await runtime.resolve(replace(old, excel_value='短裤'))
-        self.assertEqual(result.label, '短裤')
+        client = FakeClient({
+            "status": "auto_fill_ready",
+            "value_id": "new-long",
+            "source": "mature_rule",
+            "evidence_kinds": ["visual"],
+            "mature_rule": True,
+            "support_count": 3,
+            "calibrated_acceptance_rate": 0.95,
+        })
+        runtime = AttributeRuntime(self.store, client, 'new-run', 'new-product')
+
+        self.assertIsNone(runtime.reusable_choice(new))
+        result = await runtime.resolve(new)
+
+        self.assertEqual((result.value_id, result.source),
+                         ('new-long', 'mature_rule'))
+        self.assertEqual(len(client.decide_calls), 1)
         await runtime._flush()
 
-    async def test_latest_cross_product_correction_wins_conflicting_history(self):
+    async def test_cross_product_reuse_supports_confirmed_multi_choice(self):
+        old = make_length_request(excel_value='原文甲/原文乙')
+        self.remember_cross_product(old, 'short,long')
+        new = replace(
+            old,
+            candidates=(
+                CandidateValue('new-short', '短裤'),
+                CandidateValue('new-long', '长裤'),
+            ),
+            schema_version='new-schema',
+        )
+        runtime = AttributeRuntime(self.store, FakeClient(), 'new-run', 'old-product')
+
+        reusable = runtime.reusable_choice(new)
+        self.assertEqual(
+            (reusable.value_id, reusable.label, reusable.source),
+            ('new-short,new-long', '短裤,长裤', 'cross_product_human'),
+        )
+        resolved = await runtime.resolve(new)
+        self.assertEqual(
+            (resolved.value_id, resolved.label, resolved.source),
+            ('new-short,new-long', '短裤,长裤', 'cross_product_human'),
+        )
+        await runtime.drain()
+
+    async def test_legacy_select_metadata_reuses_proven_multi_choice_review(self):
+        old = make_length_request(excel_value="通用/成人", control_type="select")
+        self.remember_cross_product(old, "short,long")
+        new = replace(
+            old,
+            candidates=(
+                CandidateValue("new-short", "短裤"),
+                CandidateValue("new-long", "长裤"),
+            ),
+            excel_value="通用/男女通用",
+            schema_version="new-schema",
+            control_type="multi_select",
+        )
+        runtime = AttributeRuntime(
+            self.store, FakeClient(), "new-run", "new-product"
+        )
+
+        # A legacy cross-product approval is training evidence only. The new
+        # product must ask the decision service, where the confidence gate is
+        # applied, instead of reusing this one historical row locally.
+        self.assertIsNone(runtime.reusable_choice(new))
+
+    async def test_other_product_review_never_bypasses_excel_or_confidence_gate(self):
+        old = make_length_request(excel_value='原文甲/原文乙')
+        self.remember_cross_product(old, 'long')
+        client = FakeClient()
+        runtime = AttributeRuntime(self.store, client, 'new-run', 'new-product')
+        for changed in [replace(old, platform_id='jd'),
+                        replace(old, control_type='text'),
+                        replace(old, candidates=(CandidateValue('short', '短裤'),))]:
+            self.assertIsNone(runtime.reusable_choice(changed))
+        self.assertIsNone(runtime.reusable_choice(
+            replace(old, excel_value='短裤')
+        ))
+        self.assertIsNone(runtime.reusable_choice(
+            replace(old, excel_value='新原文')
+        ))
+        forced = runtime.reusable_choice(
+            replace(old, excel_value='短裤', evidence={'force_review': True})
+        )
+        self.assertIsNone(forced)
+        self.assertIsNone(runtime.reusable_choice(
+            replace(old, evidence={'force_review': True, 'selection_only': True})
+        ))
+        result = await runtime.resolve(replace(old, excel_value='短裤'))
+        self.assertEqual((result.label, result.source),
+                         ('短裤', 'explicit_text'))
+        await runtime._flush()
+        uploaded_snapshots = {
+            event[2]['snapshot_version']
+            for event in runtime.client.events
+            if event[1] == 'snapshot.created'
+        }
+        self.assertIn(result.snapshot_version, uploaded_snapshots)
+
+    async def test_same_product_review_precedes_excel_across_category_snapshots(self):
+        old = make_length_request(excel_value='原文甲/原文乙')
+        self.remember_cross_product(old, 'long', product='same-product')
+        request = replace(
+            old,
+            category_leaf_id='new-category',
+            schema_version='new-schema',
+            excel_value='短裤',
+        )
+        client = FakeClient()
+        runtime = AttributeRuntime(
+            self.store, client, 'new-run', 'same-product'
+        )
+
+        result = await runtime.resolve(request)
+        await runtime.drain()
+
+        self.assertEqual(
+            (result.label, result.source),
+            ('长裤', 'cross_product_human'),
+        )
+        uploaded_snapshots = {
+            event[2]['snapshot_version']
+            for event in client.events
+            if event[1] == 'snapshot.created'
+        }
+        self.assertIn(result.snapshot_version, uploaded_snapshots)
+
+    async def test_same_product_latest_correction_wins_conflicting_history(self):
         request = make_length_request(excel_value='原文甲/原文乙')
         self.remember_cross_product(request, 'long', 'old-1')
         self.remember_cross_product(request, 'short', 'old-2')
         runtime = AttributeRuntime(self.store, FakeClient({'status': 'review_required'}),
-                                   'new-run', 'new-product')
+                                   'new-run', 'old-2')
         # The second confirmation is the operator's latest correction and is
         # reused even though the older category recorded the other value.
         self.assertEqual(runtime.reusable_choice(request).label, '短裤')
         result = await runtime.resolve(request)
-        self.assertEqual((result.label, result.source), ('短裤', 'cross_product_human'))
+        self.assertEqual((result.label, result.source), ('短裤', 'human_override'))
         await runtime.drain()
 
     async def test_legacy_text_approval_requires_provable_excel_provenance(self):
@@ -166,7 +251,7 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(runtime.reusable_choice(request))
         self.store.enqueue('legacy', 'review.created', {'id': 'legacy',
             'evidence_json': {'excel': True, 'text': True}})
-        self.assertEqual(runtime.reusable_choice(request).label, '2026')
+        self.assertIsNone(runtime.reusable_choice(request))
         self.assertIsNone(runtime.reusable_choice(replace(request, excel_value='2027/动态选择当天')))
 
     async def test_human_full_snapshot_overrides_exact_excel(self):
@@ -379,6 +464,58 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client.decide_calls, [])
 
+    async def test_multi_select_prefers_first_complete_excel_variant(self):
+        client = FakeClient()
+        runtime = AttributeRuntime(
+            self.store, client, "run-1", "product-1", device_id="device-1"
+        )
+        result = await runtime.resolve(
+            make_length_request(
+                platform_id="jd",
+                field_id="season",
+                field_label="适用季节",
+                candidates=(
+                    CandidateValue("spring", "春季"),
+                    CandidateValue("summer", "夏季"),
+                    CandidateValue("autumn", "秋季"),
+                    CandidateValue("winter", "冬季"),
+                ),
+                excel_value="秋季，冬季/春秋冬/春秋",
+                control_type="multi_select",
+            )
+        )
+        await runtime.drain()
+
+        self.assertEqual(
+            (result.value_id, result.label, result.source),
+            ("autumn,winter", "秋季,冬季", "explicit_text"),
+        )
+        self.assertEqual(client.decide_calls, [])
+
+    async def test_single_select_keeps_comma_inside_candidate_label(self):
+        client = FakeClient()
+        runtime = AttributeRuntime(
+            self.store, client, "run-1", "product-1", device_id="device-1"
+        )
+        result = await runtime.resolve(
+            make_length_request(
+                candidates=(
+                    CandidateValue("combined", "防风，保暖"),
+                    CandidateValue("wind", "防风"),
+                    CandidateValue("warm", "保暖"),
+                ),
+                excel_value="防风，保暖",
+                control_type="select",
+            )
+        )
+        await runtime.drain()
+
+        self.assertEqual(
+            (result.value_id, result.label, result.source),
+            ("combined", "防风，保暖", "explicit_text"),
+        )
+        self.assertEqual(client.decide_calls, [])
+
     async def test_same_product_snapshot_and_value_are_not_enqueued_again_on_rerun(self):
         first_client = FakeClient()
         first_runtime = AttributeRuntime(
@@ -547,6 +684,37 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readback["actual_label"], "长裤")
         self.assertEqual(readback["snapshot_version"], result.snapshot_version)
         self.assertTrue(readback["verified"])
+
+    async def test_save_readback_queues_multi_choice_learning_event(self):
+        client = FakeClient()
+        runtime = AttributeRuntime(
+            self.store,
+            client,
+            "run-1",
+            "product-1",
+            device_id="device-1",
+        )
+        result = await runtime.resolve(
+            make_length_request(
+                excel_value="短裤，长裤",
+                control_type="multi_select",
+            )
+        )
+
+        recorded = runtime.record_verified_readbacks(
+            "wxsph", {"裤长": ["短裤", "长裤"]}
+        )
+        await runtime.drain()
+        readback = next(
+            payload
+            for _key, event_type, payload in client.events
+            if event_type == "readback.recorded"
+        )
+
+        self.assertEqual(recorded, 1)
+        self.assertEqual(readback["actual_value_id"], "short,long")
+        self.assertEqual(readback["actual_label"], "短裤,长裤")
+        self.assertEqual(readback["snapshot_version"], result.snapshot_version)
 
     async def test_confirmed_review_is_reused_for_unmapped_field_after_retry(self):
         client = FakeClient(

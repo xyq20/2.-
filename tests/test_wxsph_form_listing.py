@@ -839,7 +839,8 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(resolved, ("棉",))
-        self.assertEqual(actual, ("棉",))
+        # DOM 中精确“棉”不可点击时，材质字段允许唯一模糊匹配“棉布”。
+        self.assertEqual(actual, ("棉布",))
 
     async def test_post_save_readback_rejects_lost_sku_value_without_rewriting(self):
         listing = await self._listing()

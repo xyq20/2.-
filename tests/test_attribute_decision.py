@@ -55,6 +55,8 @@ def make_decision(**overrides):
         "evidence_kinds": ("visual",),
         "source": "mature_rule",
         "mature_rule": True,
+        "support_count": 3,
+        "calibrated_acceptance_rate": 0.95,
     }
     values.update(overrides)
     return DecisionInput(**values)
@@ -296,6 +298,19 @@ class AttributeDecisionTests(unittest.TestCase):
         )
 
         self.assert_review(result, "rule_not_mature")
+
+    def test_mature_rule_still_requires_calibrated_confidence(self):
+        too_little_support = validate_decision(
+            make_decision(support_count=2, calibrated_acceptance_rate=1.0),
+            make_snapshot(),
+        )
+        low_acceptance = validate_decision(
+            make_decision(support_count=3, calibrated_acceptance_rate=0.949),
+            make_snapshot(),
+        )
+
+        self.assert_review(too_little_support, "confidence_gate_not_met")
+        self.assert_review(low_acceptance, "confidence_gate_not_met")
 
     def test_two_verified_model_outcomes_at_one_hundred_percent_are_rejected(self):
         result = validate_decision(

@@ -34,6 +34,7 @@ from taobao_listing import (
     TAOBAO_MATERIAL_OPTION_ALIASES,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     parse_material_components,
@@ -616,12 +617,15 @@ class JdFormListing(YouzanFormListing):
         self,
         select: Any,
         desired: str,
+        *,
+        field_label: str = "材质",
+        review_unmatched: bool = True,
     ) -> Optional[Tuple[str, ...]]:
         """Click the live JD material option and prove its numeric platform ID."""
         try:
-            field, category_id = await self._captured_api_field("材质")
+            field, category_id = await self._captured_api_field(field_label)
         except JdFormListingError:
-            field = await self._captured_api_field_definition("材质")
+            field = await self._captured_api_field_definition(field_label)
             category_id = ""
         desired_labels = tuple(
             part.strip() for part in re.split(r"[/／]", desired) if part.strip()
@@ -642,7 +646,12 @@ class JdFormListing(YouzanFormListing):
         )
         if len(matches) != 1:
             runtime = getattr(self, "attribute_runtime", None)
-            if runtime is not None and category_id and field.source_id:
+            if (
+                review_unmatched
+                and runtime is not None
+                and category_id
+                and field.source_id
+            ):
                 schema_version = canonical_sha256(
                     {
                         "platform_id": "jd",
@@ -659,7 +668,7 @@ class JdFormListing(YouzanFormListing):
                         platform_id="jd",
                         category_leaf_id=category_id,
                         field_id=str(field.source_id),
-                        field_label="材质",
+                        field_label=field_label,
                         candidates=tuple(
                             CandidateValue(option.value_id, option.label)
                             for option in numeric_options
@@ -683,7 +692,9 @@ class JdFormListing(YouzanFormListing):
                 )
                 if len(matches) != 1:
                     raise JdFormListingError(
-                        "京东属性材质的审核结果不在当前数字候选中"
+                        "京东属性{0}的审核结果不在当前数字候选中".format(
+                            field_label
+                        )
                     )
             else:
                 available = "、".join(
@@ -692,7 +703,8 @@ class JdFormListing(YouzanFormListing):
                     if option.label
                 )
                 raise JdFormListingError(
-                    "京东属性材质没有唯一的数字 ID 候选：期望 {0}；接口候选 {1}".format(
+                    "京东属性{0}没有唯一的数字 ID 候选：期望 {1}；接口候选 {2}".format(
+                        field_label,
                         "/".join(desired_labels) or "空",
                         available or "无",
                     )
@@ -770,14 +782,18 @@ class JdFormListing(YouzanFormListing):
                     }"""
                 )
                 if not cleared:
-                    raise JdFormListingError("京东属性材质无法清除旧文字值")
+                    raise JdFormListingError(
+                        "京东属性{0}无法清除旧文字值".format(field_label)
+                    )
             clear_deadline = asyncio.get_running_loop().time() + 2
             while asyncio.get_running_loop().time() < clear_deadline:
                 if not any(await self._read_select_values(select, multi=False)):
                     break
                 await asyncio.sleep(0.05)
             else:
-                raise JdFormListingError("京东属性材质旧文字值清空回读失败")
+                raise JdFormListingError(
+                    "京东属性{0}旧文字值清空回读失败".format(field_label)
+                )
 
         await self._open_select(select, multi=False)
         await self._search_select(select, target.label)
@@ -812,7 +828,8 @@ class JdFormListing(YouzanFormListing):
                 for option in last_options
             )
             raise JdFormListingError(
-                "京东属性材质没有唯一的同名页面候选：期望 {0}；页面候选 {1}".format(
+                "京东属性{0}没有唯一的同名页面候选：期望 {1}；页面候选 {2}".format(
+                    field_label,
                     target.label,
                     available or "无",
                 )
@@ -824,7 +841,8 @@ class JdFormListing(YouzanFormListing):
             await option.click(timeout=2_000)
         except Exception as exc:
             raise JdFormListingError(
-                "京东属性材质候选点击失败：{0}[{1}]".format(
+                "京东属性{0}候选点击失败：{1}[{2}]".format(
+                    field_label,
                     target.label, target.value_id
                 )
             ) from exc
@@ -843,7 +861,8 @@ class JdFormListing(YouzanFormListing):
                 await self._dismiss_select_dropdown(select)
                 if self.logger is not None:
                     self.logger.info(
-                        "京东属性材质已按名称选择并绑定数字值：%s[%s]",
+                        "京东属性%s已按名称选择并绑定数字值：%s[%s]",
+                        field_label,
                         target.label,
                         "/".join(
                             value
@@ -854,7 +873,8 @@ class JdFormListing(YouzanFormListing):
                 return last_labels
             await asyncio.sleep(0.05)
         raise JdFormListingError(
-            "京东属性材质数字值回读失败：期望名称 {0}，页面文字={1}，底层值={2}".format(
+            "京东属性{0}数字值回读失败：期望名称 {1}，页面文字={2}，底层值={3}".format(
+                field_label,
                 target.label,
                 last_labels,
                 last_ids,
@@ -1024,9 +1044,13 @@ class JdFormListing(YouzanFormListing):
         )
         # Every live field with a known schema can be reviewed, including
         # fields newly introduced by another category. Preserve Excel OR order.
-        exact = preferred_exact_candidate_label(
-            tuple(value.label for value in candidates),
-            aliases,
+        exact = (
+            None
+            if multi and re.search(r"[,，、;；]", str(desired))
+            else preferred_exact_candidate_label(
+                tuple(value.label for value in candidates),
+                aliases,
+            )
         )
         if current_equivalent is not None:
             current_candidate = preferred_exact_candidate_label(
@@ -1050,6 +1074,7 @@ class JdFormListing(YouzanFormListing):
             field_id=str(field.source_id), field_label=page_label,
             candidates=request_candidates, excel_value=str(desired).strip(),
             evidence={}, custom_allowed=True, schema_version=schema_version,
+            control_type="multi_select" if multi else "select",
         )) if callable(reuse) else None
         if (
             exact is None
@@ -1084,7 +1109,7 @@ class JdFormListing(YouzanFormListing):
                 # Operator input is permitted; the writer still verifies it.
                 custom_allowed=True,
                 schema_version=schema_version,
-                control_type="select",
+                control_type="multi_select" if multi else "select",
             )
         )
         if resolved is None:
@@ -2021,8 +2046,9 @@ class JdFormListing(YouzanFormListing):
             if await selects.count() != 1:
                 raise JdFormListingError("京东属性面料下拉框不是唯一项")
             select = selects.first
-            fabric_rows = parse_material_components(expected)
-            fabric_names = tuple(name for name, _percentage in fabric_rows)
+            fabric_names = tuple(
+                "/".join(group) for group in material_name_groups(expected)
+            )
             if not fabric_names:
                 fabric_names = (str(expected).strip(),)
 
@@ -2033,7 +2059,10 @@ class JdFormListing(YouzanFormListing):
                     raise JdFormListingError("京东属性面料为单值数字下拉，不能同时选择多个面料")
                 target_name = str(values[0] if values else value).strip()
                 return await self._select_numeric_material_option(
-                    select, _material_option_desired(target_name)
+                    select,
+                    _material_option_desired(target_name),
+                    field_label=page_label,
+                    review_unmatched=False,
                 )
 
             try:
@@ -2153,6 +2182,13 @@ class JdFormListing(YouzanFormListing):
                         await self._clear_non_numeric_select_value(
                             value_select, page_label
                         )
+                        if getattr(self, "attribute_runtime", None) is None:
+                            raise JdFormListingError(
+                                "京东属性“{0}”没有可点选的数字候选，"
+                                "且本次未连接审核服务，无法创建待审核项".format(
+                                    page_label
+                                )
+                            )
                         if self.logger is not None:
                             self.logger.info(
                                 "京东属性“%s”没有可点选的数字候选，已清空自造文字并加入待审核汇总",
@@ -2543,6 +2579,35 @@ class JdFormListing(YouzanFormListing):
             if match_index is None:
                 return False
             remaining.pop(match_index)
+        # JD cascaders persist the complete path.  The fill path can resolve
+        # Excel's alias to the leaf only, while the reopened control returns
+        # both the parent and leaf (for example ``休闲风,简约风``).  The parent
+        # is structural context, so accept it when the expected leaf values
+        # occur uniquely and in order.
+        if (
+            normalize_label(page_label) == normalize_label("风格")
+            and expected
+            and len(actual) >= len(expected)
+        ):
+            cursor = 0
+            for expected_value in expected:
+                aliases = value_candidates(page_label, expected_value)
+                match_index = next(
+                    (
+                        index
+                        for index in range(cursor, len(actual))
+                        if any(
+                            normalize_option(actual[index])
+                            == normalize_option(alias)
+                            for alias in aliases
+                        )
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    return False
+                cursor = match_index + 1
+            return True
         return not remaining
 
     async def _verify_persisted_attributes(

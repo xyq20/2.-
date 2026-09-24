@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import match_option_candidates, without_color_attributes
 
 import asyncio
 import json
@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from attribute_runtime import AttributeRequest
+from attribute_runtime import AttributeRequest, split_multi_choice
+from category_profile import choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from platform_candidate_source import (
@@ -33,6 +34,7 @@ from platform_candidate_source import (
 )
 from platform_schema import FieldOption
 from sync_validation import matches_any, sequences_match, split_or_values
+from taobao_listing import is_material_field_label, material_value_candidates
 
 
 # 2026-08-27 在真实抖音资料页选择预测类目后观测到的精确路径。
@@ -121,6 +123,10 @@ def value_candidates(label: object, value: object) -> Tuple[str, ...]:
         for candidate in mapped:
             if candidate not in candidates:
                 candidates.append(candidate)
+        if is_material_field_label(label):
+            for candidate in material_value_candidates(source_candidate)[1:]:
+                if candidate not in candidates:
+                    candidates.append(candidate)
         # Excel may use the statutory description while the dropdown only
         # exposes the compact A类/B类/C类 labels.
         normalized_label = _normalize_label(label)
@@ -287,12 +293,16 @@ class DouyinListing:
         artifact_dir: Path,
         *,
         attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
     ) -> None:
         self.page = page
         self.drawer = drawer
         self.logger = logger
         self.artifact_dir = Path(artifact_dir)
         self.attribute_runtime = attribute_runtime
+        self.category_hints = tuple(
+            str(value).strip() for value in category_hints if str(value).strip()
+        )
         self.panel: Optional[Any] = None
         self._category_properties: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
         self._property_response_tasks: set[asyncio.Task[Any]] = set()
@@ -789,16 +799,25 @@ class DouyinListing:
         return text.split("同步平台类目", 1)[0].strip()
 
     async def apply_first_recommended_category(self) -> str:
-        """使用第一个平台预测类目，并校验最终可见路径。"""
+        """Use the Excel-matching prediction and verify the final path."""
         if self.panel is None:
             raise DouyinListingError("请先调用 open() 打开抖音资料")
         buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
-        button = None
+        predictions: List[Tuple[Any, str]] = []
         for index in range(await buttons.count()):
             candidate = buttons.nth(index)
-            if await candidate.is_visible():
-                button = candidate
-                break
+            if not await candidate.is_visible():
+                continue
+            row = candidate.locator("xpath=..")
+            if not await row.count() or not (await row.inner_text()).strip():
+                row = candidate.locator(
+                    "xpath=ancestor::*[contains(@class, 'prediction-item')][1]"
+                )
+            row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
+            expected = re.sub(r"(?:^推荐\s*|点击使用\s*$)", "", row_text).strip()
+            if expected:
+                predictions.append((candidate, expected))
+        button = predictions[0][0] if predictions else None
 
         try:
             current = await self._category_text()
@@ -811,6 +830,14 @@ class DouyinListing:
         # 已保存的商品在标题未变时通常不再显示“点击使用”。
         # 此时已选类目就是最终值，不应再盲等预测按钮。
         if button is None and current_is_selected:
+            if self.category_hints:
+                chosen, _strategy = choose_category_candidate(
+                    (current,), self.category_hints
+                )
+                if not chosen:
+                    raise DouyinListingError(
+                        f"抖音已选类目与 Excel 不匹配：{current!r}"
+                    )
             if self.logger is not None:
                 self.logger.info("抖音页面无预测候选，沿用已选商品分类：%s", current)
             return current
@@ -822,11 +849,42 @@ class DouyinListing:
             except Exception as exc:
                 raise DouyinListingError("抖音页面没有可用的预测类目") from exc
 
-        row = button.locator("xpath=ancestor::*[contains(@class, 'prediction-item')][1]")
-        if not await row.count():
-            row = button.locator("xpath=..")
-        row_text = (await row.inner_text()).strip()
-        expected = re.sub(r"(?:^推荐\s*|点击使用\s*$)", "", row_text).strip()
+        if self.category_hints and predictions:
+            chosen, strategy = choose_category_candidate(
+                tuple(expected for _button, expected in predictions),
+                self.category_hints,
+            )
+            if not chosen:
+                raise DouyinListingError(
+                    "抖音预测类目中没有与 Excel 商品分类匹配的项"
+                )
+            matches = [
+                (candidate, expected)
+                for candidate, expected in predictions
+                if re.sub(r"[\s>]", "", expected).casefold()
+                == re.sub(r"[\s>]", "", chosen).casefold()
+            ]
+            if len(matches) != 1:
+                raise DouyinListingError(
+                    f"抖音 Excel 类目匹配结果不是唯一项：{len(matches)}"
+                )
+            button, expected = matches[0]
+            if self.logger is not None:
+                self.logger.info(
+                    "抖音预测类目与 Excel 匹配，选择第 %s 个：%s（%s）",
+                    next(index + 1 for index, item in enumerate(predictions) if item[0] == button),
+                    expected,
+                    strategy,
+                )
+        else:
+            expected = ""
+
+        if not expected:
+            row = button.locator("xpath=ancestor::*[contains(@class, 'prediction-item')][1]")
+            if not await row.count():
+                row = button.locator("xpath=..")
+            row_text = (await row.inner_text()).strip()
+            expected = re.sub(r"(?:^推荐\s*|点击使用\s*$)", "", row_text).strip()
         if not expected:
             raise DouyinListingError("无法读取第一个抖音预测类目")
 
@@ -1452,7 +1510,36 @@ class DouyinListing:
             if result:
                 return dropdown, result
             await asyncio.sleep(0.05)
-        raise DouyinListingError("打开属性下拉框后未找到可见选项")
+        # Preserve the DOM boundary state in the error.  A select can be
+        # clicked successfully while Element UI keeps its popper hidden or
+        # renders a portal unrelated to the clicked row; without this snapshot
+        # those two cases look identical to the caller.
+        diagnostics: Dict[str, Any] = {}
+        try:
+            local_dropdowns = select.locator(".el-select-dropdown")
+            diagnostics["local_dropdowns"] = await local_dropdowns.count()
+            diagnostics["local_visible"] = await select.locator(
+                ".el-select-dropdown:visible"
+            ).count()
+            diagnostics["global_visible"] = await self.page.locator(
+                ".el-select-dropdown:visible"
+            ).count()
+            diagnostics["loading_masks"] = await self.page.locator(
+                ".el-loading-mask:visible, .el-loading-mask.is-fullscreen:visible"
+            ).count()
+            diagnostics["select_state"] = await select.evaluate(
+                """element => ({
+                  html: element.outerHTML.slice(0, 1200),
+                  inputValue: element.querySelector('input')?.value || '',
+                  ariaControls: element.querySelector('input')?.getAttribute('aria-controls') || ''
+                })"""
+            )
+        except Exception as exc:
+            diagnostics["diagnostic_error"] = type(exc).__name__
+        raise DouyinListingError(
+            "打开属性下拉框后未找到可见选项；诊断="
+            + json.dumps(diagnostics, ensure_ascii=False, default=str)
+        )
 
     async def _clear_multi_select(self, select: Any) -> None:
         while True:
@@ -1580,6 +1667,7 @@ class DouyinListing:
             return current
         if multi:
             await self._clear_multi_select(select)
+        realized_expected_values: List[str] = []
         for expected in expected_values:
             if api_options:
                 # API 只作为优先索引；远程搜索型下拉的初始接口可能只返回
@@ -1602,7 +1690,14 @@ class DouyinListing:
                     timeout_seconds=0.75 if allow_empty_options else 5,
                 )
             except DouyinListingError as exc:
-                if not allow_empty_options or str(exc) != "打开属性下拉框后未找到可见选项":
+                # `_visible_dom_options` appends a DOM snapshot to this
+                # boundary error for diagnosis.  Keep the operational
+                # fallback keyed to the stable error prefix, otherwise the
+                # diagnostic suffix would turn an expected empty remote
+                # search into a hard failure.
+                if not allow_empty_options or not str(exc).startswith(
+                    "打开属性下拉框后未找到可见选项"
+                ):
                     raise
                 dropdown = await self._active_select_dropdown(select)
                 if dropdown is None:
@@ -1628,6 +1723,20 @@ class DouyinListing:
                 await self._dismiss_select_dropdown(select)
                 choose_unique_option(expected, dom_options)
             chosen = matches[0] if matches else None
+            if chosen is None and is_material_field_label(label):
+                fuzzy_matches = match_option_candidates(
+                    (expected,),
+                    tuple(str(item.get("name", "")) for item in dom_options),
+                )
+                if len(fuzzy_matches) == 1:
+                    chosen = dom_options[fuzzy_matches[0]]
+                    if self.logger is not None:
+                        self.logger.info(
+                            "抖音属性“%s”：材质/面料模糊匹配 Excel 值 %s 到平台候选 %s",
+                            label,
+                            expected,
+                            chosen.get("name", ""),
+                        )
 
             if chosen is None:
                 # 部分 Element UI 下拉初始只渲染基础候选；必须像人工操作
@@ -1717,6 +1826,21 @@ class DouyinListing:
                                     expected,
                                 )
                             break
+                        if is_material_field_label(label):
+                            fuzzy_matches = match_option_candidates(
+                                (expected,),
+                                tuple(str(item.get("name", "")) for item in dom_options),
+                            )
+                            if len(fuzzy_matches) == 1:
+                                chosen = dom_options[fuzzy_matches[0]]
+                                if self.logger is not None:
+                                    self.logger.info(
+                                        "抖音属性“%s”：搜索后材质/面料模糊匹配 %s 到 %s",
+                                        label,
+                                        expected,
+                                        chosen.get("name", ""),
+                                    )
+                                break
             if chosen is None:
                 direct_actual = await self._try_direct_select_value(
                     select,
@@ -1726,6 +1850,9 @@ class DouyinListing:
                     require_committed_value=require_committed_direct_value,
                 )
                 if direct_actual is not None:
+                    realized_expected_values.append(
+                        str(direct_actual[0] if isinstance(direct_actual, tuple) else direct_actual)
+                    )
                     continue
                 await self._dismiss_select_dropdown(select)
                 if self.attribute_runtime is not None and allow_operational_review:
@@ -1738,9 +1865,14 @@ class DouyinListing:
                     if reviewed is None:
                         return None
                     reviewed_value, reviewed_api_options = reviewed
+                    reviewed_values = (
+                        split_multi_choice(reviewed_value)
+                        if multi
+                        else (reviewed_value,)
+                    )
                     return await self._select_values(
                         select,
-                        (reviewed_value,),
+                        reviewed_values,
                         label=label,
                         multi=multi,
                         api_options=reviewed_api_options,
@@ -1750,6 +1882,7 @@ class DouyinListing:
                         require_committed_direct_value=require_committed_direct_value,
                     )
                 choose_unique_option(expected, dom_options)
+            realized_expected_values.append(str(chosen.get("name") or expected))
             if self.logger is not None:
                 self.logger.info("抖音属性“%s”：已精确定位候选 %s", label, expected)
             # Vue 会在滚动长列表时重建 option 节点；在活动下拉容器中
@@ -1772,7 +1905,10 @@ class DouyinListing:
                 self.logger.info("抖音属性“%s”：候选点击完成", label)
 
         actual = await self._read_select_values(select, multi=multi)
-        expected_counter = Counter(normalize_option(value) for value in expected_values)
+        expected_counter = Counter(
+            normalize_option(value)
+            for value in (realized_expected_values or list(expected_values))
+        )
         actual_counter = Counter(normalize_option(value) for value in actual)
         if actual_counter != expected_counter:
             raise DouyinListingError(
@@ -1875,9 +2011,14 @@ class DouyinListing:
                         )
                     return None
                 chosen_expected, api_options = resolved_selection
+                chosen_values = (
+                    split_multi_choice(chosen_expected)
+                    if multi
+                    else (chosen_expected,)
+                )
                 return await self._select_values(
                     select,
-                    (chosen_expected,),
+                    chosen_values,
                     label=label,
                     multi=multi,
                     api_options=api_options,
@@ -2448,23 +2589,55 @@ class DouyinListing:
             except DouyinListingError as exc:
                 # 页面已有候选但下拉层可能被改版遮挡；材质控件本身
                 # 支持搜索/直接输入时，回退到输入框并回读确认。
-                editor = selects.first.locator(
-                    'input:not([type="hidden"]):not([readonly]):visible'
-                )
-                if await editor.count() != 1:
-                    raise
+                # 先重新读取一次当前选择。部分版本在点击候选后会先
+                # 重建行节点，再让旧 locator 抛出校验异常；此时实际值
+                # 已经提交，不能再次走“直接输入”分支。
+                try:
+                    committed_values = await asyncio.wait_for(
+                        self._read_select_values(selects.first, multi=False),
+                        timeout=3,
+                    )
+                except Exception:
+                    # The row can be replaced together with the select.  Keep
+                    # the original selection error and let the direct-input
+                    # fallback decide whether the new row is editable.
+                    committed_values = ()
                 value = str(component.name).strip()
-                await editor.fill(value)
-                await editor.press("Enter")
-                await editor.press("Tab")
-                actual = (await editor.input_value()).strip()
-                if normalize_option(actual) != normalize_option(value):
-                    raise DouyinListingError(
-                        f"{material_label}候选和直接输入均未回读到 {value!r}"
-                    ) from exc
-                selected = (actual,)
-                if self.logger is not None:
-                    self.logger.info("%s：候选不可见，已直接输入并回读 %s", material_label, actual)
+                if committed_values and normalize_option(committed_values[0]) == normalize_option(value):
+                    selected = committed_values
+                    if self.logger is not None:
+                        self.logger.info(
+                            "%s：候选点击后已回读到 %s，忽略旧节点校验异常",
+                            material_label,
+                            committed_values[0],
+                        )
+                else:
+                    editor = selects.first.locator(
+                        'input:not([type="hidden"]):not([readonly]):visible'
+                    )
+                    if await editor.count() != 1:
+                        raise
+                    # Element UI replaces the searchable input as soon as Enter or
+                    # Tab commits an allow-create value.  Reading the old locator
+                    # after that replacement waits for Playwright's 300s default
+                    # timeout and leaves the material row empty.  Re-query the
+                    # select after the commit and use the stable, readonly display
+                    # input for the readback instead.
+                    await editor.fill(value, timeout=4000)
+                    await editor.press("Enter", timeout=2000)
+                    await editor.press("Tab", timeout=2000)
+                    current_values = await asyncio.wait_for(
+                        self._read_select_values(selects.first, multi=False),
+                        timeout=4,
+                    )
+                    actual = current_values[0].strip() if current_values else ""
+                    if normalize_option(actual) != normalize_option(value):
+                        raise DouyinListingError(
+                            f"{material_label}候选和直接输入均未回读到 {value!r}"
+                        ) from exc
+                    selected = (actual,)
+                    if self.logger is not None:
+                        self.logger.info("%s：候选不可见，已直接输入并回读 %s", material_label, actual)
             percent_input = await self._percentage_input(row)
             raw_percentage = (await percent_input.input_value()).strip()
             if raw_percentage != str(percentages[index]):

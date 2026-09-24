@@ -85,6 +85,12 @@ def _normalized_parts(value: object) -> frozenset:
     return frozenset(part for part in normalized if part)
 
 
+# Known material/fabric spellings outrank broad substring matches. Keep them
+# here so JD's numeric-ID writer and other platforms' DOM writers agree.
+# Do not strip arbitrary fabric suffixes: 棉麻/珠地棉/牛仔布 add distinct facts.
+MATERIAL_OPTION_EQUIVALENTS = (frozenset({"棉", "棉布"}),)
+
+
 def match_option_candidates(
     desired_labels: Sequence[str],
     candidate_labels: Sequence[str],
@@ -99,9 +105,11 @@ def match_option_candidates(
     聚氨酯弹性纤维(氨纶). Part equality keeps 木棉 (a different fiber that
     merely contains 棉) and 弹性纤维 (a substring of the alias, not a part)
     out of this tier.
-    Tier 2 (component): plain substring in either direction, e.g. Excel 羊绒
+    Tier 2 (known spelling): 棉 and 棉布 refer to the same material in platform
+    dictionaries; unrelated cotton fabrics must not make that match ambiguous.
+    Tier 3 (component): plain substring in either direction, e.g. Excel 羊绒
     inside 京东候选 山羊绒. Compound names legitimately contain shorter
-    option names, so tier-2 only counts when no tier-0/1 candidate exists.
+    option names, so tier-3 only counts when no stronger candidate exists.
     Returns indices into ``candidate_labels``; the caller decides whether a
     non-unique result is an error or a review deferral.
     """
@@ -140,8 +148,23 @@ def match_option_candidates(
     )
     if annotated:
         return annotated
-    return tuple(
+    known_spellings = tuple(
         index
         for index, text in enumerate(normalized)
-        if text and any(text in want or want in text for want in desired)
+        if text and any(
+            text in group and any(want in group for want in desired)
+            for group in MATERIAL_OPTION_EQUIVALENTS
+        )
+    )
+    if known_spellings:
+        return known_spellings
+    return tuple(
+        index
+        for index, (raw_label, text) in enumerate(zip(candidate_labels, normalized))
+        if text
+        and not (
+            "混纺" in _normalize_option_text(raw_label)
+            or re.search(r"[与和+＋&]", str(raw_label))
+        )
+        and any(text in want or want in text for want in desired)
     )

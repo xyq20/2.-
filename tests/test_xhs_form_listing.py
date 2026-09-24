@@ -236,6 +236,64 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         report = await listing.fill_identity('NEIGBORL 工装裤', 'NGBL-2068')
         self.assertEqual(report['商品标题'], '工装裤')
 
+    async def test_identity_waits_until_category_rerender_makes_title_editable(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          const title = panel.querySelector('[data-xhs-field="商品标题"] input');
+          title.setAttribute('readonly', 'readonly');
+          setTimeout(() => title.removeAttribute('readonly'), 600);
+        }''')
+
+        report = await listing.fill_identity('NEIGBORL 工装裤', 'NGBL-2068')
+
+        self.assertEqual(report['商品标题'], '工装裤')
+        self.assertEqual(
+            await self.page.locator('[data-xhs-field="商品标题"] input').input_value(),
+            '工装裤',
+        )
+
+    async def test_identity_requeries_when_title_row_is_replaced_after_lookup(self):
+        listing = await self._listing()
+        original_find = listing._find_named_input
+        replaced = False
+
+        async def find_then_replace(label):
+            nonlocal replaced
+            control = await original_find(label)
+            if label == '商品标题' and not replaced:
+                replaced = True
+                await listing.panel.evaluate('''panel => {
+                  const row = panel.querySelector('[data-xhs-field="商品标题"]');
+                  row.outerHTML = `
+                    <div class="el-form-item">
+                      <div class="label-wrap"><label>商品标题：</label></div>
+                      <div class="control-wrap"><input value="【绿巨人】NEIGBORL钊叔制工装休闲裤"></div>
+                    </div>`;
+                }''')
+            return control
+
+        self.page.set_default_timeout(500)
+        with patch.object(listing, '_find_named_input', side_effect=find_then_replace):
+            report = await listing.fill_identity('NEIGBORL 工装裤', 'NGBL-2068')
+
+        self.assertEqual(report['商品标题'], '工装裤')
+
+    async def test_identity_finds_control_beyond_five_parent_levels(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          const row = panel.querySelector('[data-xhs-field="商品标题"]');
+          row.outerHTML = `
+            <div class="el-form-item">
+              <div><div><div><div><div><div><label>商品标题：</label></div></div></div></div></div></div>
+              <div class="el-form-item__content"><input value="旧标题"></div>
+            </div>`;
+        }''')
+
+        control = await listing._find_named_input_once('商品标题')
+
+        self.assertIsNotNone(control)
+        self.assertEqual(await control.input_value(timeout=500), '旧标题')
+
     async def test_identity_scrolls_editor_to_load_field(self):
         listing = await self._listing()
         await listing.panel.evaluate('''panel => {

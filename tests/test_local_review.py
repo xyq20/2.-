@@ -662,6 +662,62 @@ class LocalReviewApiTests(unittest.TestCase):
                 1,
             )
 
+    def test_multi_choice_readback_requires_every_unique_snapshot_candidate(self):
+        self.product_and_snapshot()
+        checkpoint = {
+            "run_id": "run-multi-readback",
+            "product_version": "pv-1",
+            "device_id": "mac-1",
+            "execution_mode": "save_only",
+            "platform_order": ["jd"],
+            "current_index": 0,
+            "status": "running",
+            "pending_review_id": None,
+            "version": 1,
+            "image_version": "images-1",
+        }
+        self.event(
+            "checkpoint-multi-readback", "checkpoint.updated", checkpoint
+        )
+        payload = {
+            "run_id": "run-multi-readback",
+            "product_version": "pv-1",
+            "platform_id": "jd",
+            "category_leaf_id": "straight-pants",
+            "field_id": "length",
+            "snapshot_version": "sv-1",
+            "actual_value_id": "short,long",
+            "actual_label": "短裤,长裤",
+            "verified": True,
+            "payload_json": {"source": "save_readback"},
+        }
+
+        self.event("readback-multi", "readback.recorded", payload)
+        invalid = self.client.post(
+            "/api/device/events",
+            headers=self.device_headers,
+            json={
+                "idempotency_key": "readback-multi-invalid",
+                "event_type": "readback.recorded",
+                "payload": {
+                    **payload,
+                    "actual_value_id": "short,missing",
+                },
+            },
+        )
+
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(invalid.json()["error"], "actual_candidate_not_unique")
+        with connect(self.settings) as connection:
+            stored = connection.execute(
+                "SELECT actual_value_id,actual_label FROM persisted_readbacks "
+                "WHERE idempotency_key='readback-multi'"
+            ).fetchone()
+        self.assertEqual(
+            (stored["actual_value_id"], stored["actual_label"]),
+            ("short,long", "短裤,长裤"),
+        )
+
     def test_review_images_prefer_oldest_uploaded_thumbnails(self):
         self.product_and_snapshot()
         uploaded_ids = []

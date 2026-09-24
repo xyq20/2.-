@@ -18,6 +18,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from attribute_runtime import AttributeRequest
 from category_profile import category_search_terms
 from canonical_fields import is_learning_managed_field
@@ -33,10 +35,12 @@ from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     parse_taobao_fabrics,
     parse_taobao_materials,
+    material_value_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -80,6 +84,10 @@ XHS_CATEGORY_RESULT_SELECTOR = (
     ".el-autocomplete-suggestion:visible li:visible, "
     ".el-autocomplete-suggestion:visible [role=option]:visible, "
     ".el-autocomplete-suggestion:visible .el-autocomplete-suggestion__item:visible"
+)
+XHS_IDENTITY_CONTROL_SELECTOR = (
+    'input:not([type="hidden"]):not([readonly]):not([disabled]):visible, '
+    'textarea:not([readonly]):not([disabled]):visible'
 )
 
 
@@ -185,12 +193,14 @@ class XhsFormListing(TaobaoListing):
         logger: Any,
         *,
         attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
     ) -> None:
         super().__init__(
             page,
             drawer,
             logger,
             attribute_runtime=attribute_runtime,
+            category_hints=category_hints,
         )
         self._xhs_api_generation = 0
         self._xhs_api_category_id = ""
@@ -1015,15 +1025,9 @@ class XhsFormListing(TaobaoListing):
     ) -> Optional[Tuple[str, ...]]:
         normalized = normalize_label(page_label)
         if normalized in {normalize_label("面料"), normalize_label("材质成分")}:
-            try:
-                materials = (
-                    parse_taobao_fabrics(fields)
-                    if normalized == normalize_label("面料")
-                    else parse_taobao_materials(fields)
-                )
-            except TaobaoListingError as exc:
-                raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
-            values = tuple(component.name for component in materials)
+            values = tuple(
+                "/".join(group) for group in material_name_groups(expected)
+            )
             return values or None
         if normalized == normalize_label("是否加绒"):
             mapped = {"是": "加绒", "否": "不加绒"}.get(str(expected).strip())
@@ -1176,7 +1180,7 @@ class XhsFormListing(TaobaoListing):
         select = selects.first
         multi = await select.locator(".el-select__tags").count() > 0
         groups = (
-            tuple((str(value),) for value in exact_values)
+            material_value_groups(page_label, exact_values)
             if exact_values is not None
             else selection_value_groups_for_control(
                 page_label, expected, multi=multi
@@ -1373,8 +1377,13 @@ class XhsFormListing(TaobaoListing):
         while True:
             control = await self._find_named_input_once(label)
             if control is not None:
-                await control.scroll_into_view_if_needed(timeout=5000)
-                return control
+                try:
+                    await control.scroll_into_view_if_needed(timeout=1500)
+                    return control
+                except PlaywrightTimeoutError:
+                    # The category confirmation can replace the whole form row
+                    # between DOM discovery and the first locator action.
+                    control = None
             if asyncio.get_running_loop().time() >= deadline:
                 raise XhsFormListingError(
                     "小红书字段“{0}”等待渲染并滚动查找后仍未找到输入框".format(label)
@@ -1397,31 +1406,73 @@ class XhsFormListing(TaobaoListing):
     async def _find_named_input_once(self, label: str) -> Any:
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
-        direct = self.panel.locator('[data-xhs-field="{0}"]'.format(label)).locator('input:not([type="hidden"]):visible, textarea:visible')
-        if await direct.count() == 1:
-            return direct.first
-        label_nodes = self.panel.get_by_text(
-            re.compile(r"^\s*\*?\s*{0}\s*[：:]?\s*$".format(re.escape(label)))
+        match_count = await self.panel.evaluate(
+            """(panel, label) => {
+              const marker = 'data-xhs-identity-control';
+              const controlSelector = 'input:not([type="hidden"]):not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled])';
+              const normalize = value => String(value || '')
+                .replace(/[\\s：:*]/g, '')
+                .trim();
+              const isVisible = element => {
+                if (!element || !element.isConnected) return false;
+                const style = getComputedStyle(element);
+                return style.display !== 'none'
+                  && style.visibility !== 'hidden'
+                  && style.opacity !== '0'
+                  && element.getClientRects().length > 0;
+              };
+              const controlsWithin = root => Array.from(root.querySelectorAll(controlSelector))
+                .filter(isVisible);
+
+              panel.querySelectorAll('[' + marker + ']').forEach(element => {
+                element.removeAttribute(marker);
+              });
+
+              const matches = new Set();
+              for (const field of panel.querySelectorAll('[data-xhs-field]')) {
+                if (normalize(field.getAttribute('data-xhs-field')) !== normalize(label)) continue;
+                const controls = controlsWithin(field);
+                if (controls.length === 1) matches.add(controls[0]);
+              }
+
+              if (matches.size === 0) {
+                const labelNodes = Array.from(panel.querySelectorAll(
+                  'label, .el-form-item__label, [class*="label"], span, div'
+                )).filter(element => isVisible(element) && normalize(element.textContent) === normalize(label));
+                labelNodes.sort((left, right) => {
+                  const score = element => (element.tagName === 'LABEL' ? 0 : 2)
+                    + (element.classList.contains('el-form-item__label') ? 0 : 1)
+                    + element.children.length;
+                  return score(left) - score(right);
+                });
+                for (const labelNode of labelNodes) {
+                  let root = labelNode.closest('.el-form-item') || labelNode.parentElement;
+                  while (root && panel.contains(root)) {
+                    const controls = controlsWithin(root);
+                    if (controls.length === 1) {
+                      matches.add(controls[0]);
+                      break;
+                    }
+                    if (root === panel) break;
+                    root = root.parentElement;
+                  }
+                }
+              }
+
+              if (matches.size === 1) {
+                matches.values().next().value.setAttribute(marker, '1');
+              }
+              return matches.size;
+            }""",
+            label,
         )
-        matches = []
-        for index in range(await label_nodes.count()):
-            node = label_nodes.nth(index)
-            if not await node.is_visible():
-                continue
-            root = node
-            for _depth in range(5):
-                inputs = root.locator('input:not([type="hidden"]):visible, textarea:visible')
-                if await inputs.count() == 1:
-                    matches.append(inputs.first)
-                    break
-                if await root.evaluate("e => e.classList.contains('el-form-item')"):
-                    break
-                root = root.locator("xpath=..")
-        if len(matches) > 1:
+        if match_count > 1:
             raise XhsFormListingError(
-                "小红书字段“{0}”输入框不是唯一项：{1}".format(label, len(matches))
+                "小红书字段“{0}”输入框不是唯一项：{1}".format(label, match_count)
             )
-        return matches[0] if matches else None
+        if match_count == 0:
+            return None
+        return self.panel.locator('[data-xhs-identity-control="1"]')
 
     async def fill_identity(self, title: str, style_code: str) -> Mapping[str, str]:
         expected_title = title_without_neigborl(title)
@@ -1438,11 +1489,31 @@ class XhsFormListing(TaobaoListing):
         for label, value in expected.items():
             if not value:
                 raise XhsFormListingError("小红书{0}不能为空".format(label))
-            control = await self._find_named_input(label)
-            if (await control.input_value()).strip() != value:
-                await control.fill(value)
-                await control.press("Tab")
-            current = (await control.input_value()).strip()
+            current = ""
+            last_timeout: Optional[Exception] = None
+            for attempt in range(3):
+                control = await self._find_named_input(label)
+                try:
+                    current = (await control.input_value(timeout=1500)).strip()
+                    if current != value:
+                        await control.fill(value, timeout=3000)
+                        await control.press("Tab", timeout=1500)
+                    current = (await control.input_value(timeout=1500)).strip()
+                    if current == value:
+                        break
+                except PlaywrightTimeoutError as exc:
+                    last_timeout = exc
+                    if self.page.is_closed():
+                        raise
+                if attempt < 2:
+                    if self.logger is not None:
+                        self.logger.info("小红书%s输入框发生重绘，重新定位后填写", label)
+                    await asyncio.sleep(0.2)
+            else:
+                if last_timeout is not None:
+                    raise XhsFormListingError(
+                        "小红书{0}输入框连续重绘，3 次短等待后仍无法填写".format(label)
+                    ) from last_timeout
             if current != value:
                 raise XhsFormListingError(
                     "小红书{0}回读失败：期望 {1!r}，页面为 {2!r}".format(

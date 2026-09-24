@@ -16,6 +16,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from attribute_runtime import AttributeRequest
+from category_profile import choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -34,6 +35,7 @@ from taobao_listing import (
     normalize_option,
     parse_taobao_materials,
     TAOBAO_MATERIAL_OPTION_ALIASES,
+    material_value_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -202,12 +204,14 @@ class TmallFormListing(TaobaoListing):
         api_index: Optional[TmallApiJsonIndex] = None,
         *,
         attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
     ) -> None:
         super().__init__(
             page,
             drawer,
             logger,
             attribute_runtime=attribute_runtime,
+            category_hints=category_hints,
         )
         self.api_index = api_index
 
@@ -523,9 +527,6 @@ class TmallFormListing(TaobaoListing):
                 if not await button.is_visible():
                     continue
                 row = button.locator("xpath=..")
-                marker = row.get_by_text("推荐", exact=True)
-                if not await marker.count() or not await marker.first.is_visible():
-                    continue
                 row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
                 expected = re.sub(r"^\s*推荐\s*", "", row_text)
                 expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
@@ -547,7 +548,13 @@ class TmallFormListing(TaobaoListing):
                     if await button.is_visible():
                         visible_expand.append(button)
                 if len(visible_expand) == 1:
-                    return current
+                    if not self.category_hints:
+                        return current
+                    chosen, _strategy = choose_category_candidate(
+                        (current,), self.category_hints
+                    )
+                    if chosen:
+                        return current
                 if len(visible_expand) > 1:
                     raise TmallFormListingError(
                         f"天猫产品信息“展开”入口不唯一：{len(visible_expand)}"
@@ -555,7 +562,13 @@ class TmallFormListing(TaobaoListing):
                 try:
                     scope = await self._product_identity_scope()
                     await self._tmall_form_item("货号", scope=scope)
-                    return current
+                    if not self.category_hints:
+                        return current
+                    chosen, _strategy = choose_category_candidate(
+                        (current,), self.category_hints
+                    )
+                    if chosen:
+                        return current
                 except TmallFormListingError as exc:
                     if not str(exc).endswith("：0"):
                         raise
@@ -563,11 +576,35 @@ class TmallFormListing(TaobaoListing):
 
         if not candidates:
             raise TmallFormListingError("天猫页面没有唯一可用的推荐类目")
-        if len(candidates) != 1:
-            raise TmallFormListingError(
-                f"天猫页面带“推荐”标记的类目不是唯一项：{len(candidates)}"
+        if self.category_hints:
+            chosen, strategy = choose_category_candidate(
+                tuple(expected for _button, expected in candidates),
+                self.category_hints,
             )
-        button, expected = candidates[0]
+            matches = [
+                item for item in candidates
+                if self._normalize_category_path(item[1])
+                == self._normalize_category_path(chosen)
+            ] if chosen else []
+            if len(matches) != 1:
+                raise TmallFormListingError(
+                    "天猫预测类目中没有与 Excel 商品分类唯一匹配的项："
+                    f"{len(matches)}"
+                )
+            button, expected = matches[0]
+            if self.logger is not None:
+                self.logger.info(
+                    "天猫预测类目按 Excel 选择第 %s 个：%s（%s）",
+                    next(index + 1 for index, item in enumerate(candidates) if item[0] == button),
+                    expected,
+                    strategy,
+                )
+        else:
+            if len(candidates) != 1:
+                raise TmallFormListingError(
+                    f"天猫页面预测类目不是唯一项：{len(candidates)}"
+                )
+            button, expected = candidates[0]
         # 即便上方文本已与推荐路径相同，只要“点击使用”仍存在，说明
         # 类目配置尚未激活，必须点击该受限推荐入口一次。
         await button.scroll_into_view_if_needed()
@@ -1842,7 +1879,7 @@ class TmallFormListing(TaobaoListing):
             return (actual,)
 
         groups = (
-            tuple((str(value),) for value in exact_values)
+            material_value_groups(label, exact_values)
             if exact_values is not None
             else selection_value_groups(label, expected)
         )

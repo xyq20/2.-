@@ -22,6 +22,7 @@ from platform_schema import (
     field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -422,25 +423,20 @@ class TmallListing:
             )
             if candidate is not None
         )
-        hints = _hint_leaves(context)
-        exact = tuple(
-            candidate
-            for candidate in candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
-        )
+        chosen, strategy = choose_category_object(candidates, context.category_hints)
         self._resolution_fragment = SchemaFragment(endpoints=(observation,))
-        if len(exact) == 1:
+        if chosen is not None:
             return CategoryResolution(
                 status="resolved",
                 source="recommendation",
-                selected=exact[0],
+                selected=chosen,
                 candidates=candidates,
             )
-        if len(exact) > 1:
+        if strategy.startswith("ambiguous"):
             return CategoryResolution(
                 status="review_required",
                 source="recommendation",
-                candidates=exact,
+                candidates=candidates,
                 reason="ambiguous_exact_leaf",
             )
 
@@ -454,23 +450,21 @@ class TmallListing:
             )
             if candidate is not None
         )
-        exact_tree = tuple(
-            candidate
-            for candidate in tree_candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+        chosen_tree, tree_strategy = choose_category_object(
+            tree_candidates, context.category_hints
         )
-        if len(exact_tree) == 1:
+        if chosen_tree is not None:
             return CategoryResolution(
                 status="resolved",
                 source="tree",
-                selected=exact_tree[0],
+                selected=chosen_tree,
                 candidates=tree_candidates,
             )
         return CategoryResolution(
             status="review_required",
             source="tree" if tree_candidates else "recommendation",
-            candidates=exact_tree or tree_candidates or candidates,
-            reason="ambiguous_exact_leaf" if len(exact_tree) > 1 else "no_exact_leaf",
+            candidates=tree_candidates or candidates,
+            reason="ambiguous_exact_leaf" if tree_strategy.startswith("ambiguous") else "no_excel_match",
         )
 
     async def activate_category(

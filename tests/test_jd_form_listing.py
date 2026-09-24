@@ -74,7 +74,10 @@ class JdFormListingHelperTests(unittest.TestCase):
             [("棉", 100)],
         )
         self.assertEqual(_jd_material_components("棉"), ())
-        self.assertEqual(_material_option_desired("氨纶"), "氨纶/聚氨酯弹性纤维(氨纶)")
+        self.assertEqual(
+            _material_option_desired("氨纶"),
+            "氨纶/聚氨酯弹性纤维(氨纶)/氨纶(聚氨酯弹性纤维)",
+        )
         with self.assertRaisesRegex(JdFormListingError, "京东"):
             _jd_material_components("棉60%,涤纶30%")
 
@@ -250,6 +253,18 @@ class JdFormListingHelperTests(unittest.TestCase):
         self.assertEqual(
             _expand_cascader_candidates("风格", ("休闲风", "时尚都市")),
             ("休闲风", "简约风", "时尚都市"),
+        )
+
+    def test_style_readback_accepts_parent_and_leaf_path(self):
+        self.assertTrue(
+            JdFormListing._persisted_attribute_values_match(
+                "风格", ("休闲风", "简约风"), ("简约风",)
+            )
+        )
+        self.assertFalse(
+            JdFormListing._persisted_attribute_values_match(
+                "风格", ("休闲风",), ("简约风",)
+            )
         )
 
     def test_classifies_two_colors_and_keeps_square_portrait_order_paired(self):
@@ -546,6 +561,109 @@ CATEGORY_POPOVER_FIXTURE = """
 
 
 class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fabric_cotton_replaces_other_with_numeric_cotton_cloth(self):
+        # Same competing cotton names and numeric IDs as the reported JD log.
+        options = [
+            (4340858, "棉麻"), (4340302, "珠地棉"), (1459032, "棉布"),
+            (4340853, "棉毛布"), (4340885, "美棉斜纹布"),
+            (4341271, "棉绸"), (4341314, "水柔棉"),
+            (4344753, "全棉牛仔布"), (1595531, "其他"),
+        ]
+        await self.page.set_content('''
+            <div class="el-form-item" id="fabric">
+              <label class="el-form-item__label">面料</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly value="其他">
+                <div class="el-select-dropdown" style="display:none"><ul></ul></div>
+              </div></div>
+            </div>
+        ''')
+        await self.page.evaluate('''options => {
+            const select = document.querySelector('.el-select');
+            const input = select.querySelector('input');
+            const dropdown = select.querySelector('.el-select-dropdown');
+            const choices = options.map(([value, label]) => ({
+                value, label, currentLabel: label, created: false, disabled: false
+            }));
+            const previous = choices.find(option => option.label === '其他');
+            select.__vue__ = {
+                value: previous.value, selected: previous, selectedLabel: '其他',
+                options: choices, cachedOptions: choices,
+                deleteSelected() {
+                    this.value = ''; this.selected = {}; this.selectedLabel = '';
+                    input.value = '';
+                },
+                handleOptionSelect(option) {
+                    this.value = option.value; this.selected = option;
+                    this.selectedLabel = option.label; input.value = option.label;
+                },
+                $nextTick(callback) { callback(); }
+            };
+            input.onclick = () => { dropdown.style.display = 'block'; };
+            for (const option of choices) {
+                const node = document.createElement('li');
+                node.className = 'el-select-dropdown__item';
+                node.textContent = option.label;
+                node.__vue__ = option;
+                node.onclick = () => {
+                    select.__vue__.handleOptionSelect(option);
+                    dropdown.style.display = 'none';
+                };
+                dropdown.querySelector('ul').appendChild(node);
+            }
+        }''', options)
+        listing = JdFormListing(self.page, self.page.locator("body"), None)
+        listing._api_observations = [{
+            "category_id": "44570",
+            "attribute_fields": parse_jd_attribute_fields({"properties": [{
+                "propId": "fabric", "propertyName": "面料",
+                "propertyValues": [
+                    {"valueId": value, "valueName": label} for value, label in options
+                ],
+            }]}),
+        }]
+
+        actual = await listing._fill_attribute_item(
+            "面料", self.page.locator("#fabric"), "棉", required=True
+        )
+
+        self.assertEqual(actual, ("棉布",))
+        self.assertEqual(
+            await self.page.locator('.el-select').evaluate('node => node.__vue__.value'),
+            1459032,
+        )
+        self.assertEqual(await self.page.locator('input').input_value(), "棉布")
+
+    async def test_fabric_slash_values_are_one_ordered_or_group(self):
+        await self.page.set_content(
+            '<div class="el-form-item" id="fabric">'
+            '<label class="el-form-item__label">面料</label>'
+            '<div class="el-form-item__content"><div class="el-select">'
+            '<input class="el-input__inner" readonly>'
+            '</div></div></div>'
+        )
+        listing = JdFormListing(self.page, self.page.locator("body"), None)
+        listing._select_numeric_material_option = AsyncMock(
+            return_value=("涤纶(聚酯纤维)",)
+        )
+
+        actual = await listing._fill_attribute_item(
+            "面料",
+            self.page.locator("#fabric"),
+            "涤纶/涤纶100%",
+            required=True,
+        )
+
+        self.assertEqual(actual, ("涤纶(聚酯纤维)",))
+        listing._select_numeric_material_option.assert_awaited_once()
+        select, desired = listing._select_numeric_material_option.await_args.args
+        self.assertEqual(await select.locator("input").count(), 1)
+        self.assertEqual(desired, _material_option_desired("涤纶"))
+        self.assertEqual(
+            listing._select_numeric_material_option.await_args.kwargs,
+            {"field_label": "面料", "review_unmatched": False},
+        )
+
     async def test_extra_material_rows_are_removed_idempotently(self):
         await self.page.set_content('''<div class="el-form-item"><div class="el-form-item__content">
             <div><div class="el-select"><input class="el-input__inner" readonly value="棉"></div><input value="100"><button onclick="this.parentElement.remove()">删除</button></div>

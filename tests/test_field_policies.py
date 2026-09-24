@@ -65,11 +65,32 @@ class FieldPolicyTests(unittest.TestCase):
         # 与“羊绒 ⊂ 山羊绒”同一条既有兼容路径。
         self.assertEqual(match_option_candidates(("棉",), ("木棉",)), (0,))
 
+    def test_cotton_cloth_alias_beats_other_cotton_fabrics(self):
+        # JD's real dictionary has eight substring matches for Excel 棉.
+        # The known spelling 棉布 must win without choosing a cotton blend.
+        candidates = (
+            "棉麻", "珠地棉", "棉布", "棉毛布", "美棉斜纹布",
+            "棉绸", "水柔棉", "全棉牛仔布", "其他",
+        )
+        self.assertEqual(match_option_candidates(("棉",), candidates), (2,))
+        self.assertEqual(
+            match_option_candidates(("棉",), candidates + ("棉",)), (9,)
+        )
+        self.assertEqual(
+            match_option_candidates(("棉布",), ("木棉", "棉", "棉麻")), (1,)
+        )
+
     def test_option_match_falls_back_to_contained_candidate(self):
         # 没有标注形候选时，才允许“候选 ⊂ 期望别名”的弱匹配。
         self.assertEqual(
             match_option_candidates(("聚氨酯弹性纤维",), ("弹性纤维", "棉")),
             (0,),
+        )
+
+    def test_simple_material_does_not_fuzzy_match_compound_blend(self):
+        self.assertEqual(
+            match_option_candidates(("涤纶",), ("羊毛与涤纶混纺", "棉麻混纺")),
+            (),
         )
 
     def test_option_match_ambiguous_stays_ambiguous(self):

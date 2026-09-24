@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import match_option_candidates, without_color_attributes
 
 import asyncio
 import json
@@ -14,6 +14,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from attribute_runtime import AttributeRequest
+from category_profile import category_search_terms, choose_category_candidate
 from douyin_data import DouyinDataError, MaterialComponent, parse_materials
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -47,6 +48,15 @@ def normalize_label(value: object) -> str:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     text = text.replace("重要", "")
     return re.sub(r"[\s*:：]+", "", text).casefold()
+
+
+def category_parts(value: object) -> Tuple[str, ...]:
+    """Return normalized, ordered segments from a marketplace category path."""
+    return tuple(
+        normalize_label(part)
+        for part in re.split(r"[>＞/／]", str(value or ""))
+        if normalize_label(part)
+    )
 
 
 def normalize_size_name(value: object) -> Optional[str]:
@@ -135,6 +145,10 @@ def value_candidates(label: object, value: object) -> Tuple[str, ...]:
         for candidate in mapped:
             if candidate not in candidates:
                 candidates.append(candidate)
+        if is_material_field_label(label):
+            for candidate in material_value_candidates(source_candidate)[1:]:
+                if candidate not in candidates:
+                    candidates.append(candidate)
         # Excel may use the statutory description while the dropdown only
         # exposes the compact A类/B类/C类 labels.
         normalized_label = normalize_label(label)
@@ -163,29 +177,117 @@ def value_candidates(label: object, value: object) -> Tuple[str, ...]:
 
 
 TAOBAO_MATERIAL_OPTION_ALIASES: Mapping[str, Tuple[str, ...]] = {
-    normalize_option("氨纶"): ("聚氨酯弹性纤维(氨纶)",),
-    normalize_option("锦纶"): ("聚酰胺纤维(锦纶)",),
-    normalize_option("涤纶"): ("聚对苯二甲酸乙二酯(涤纶)",),
-    normalize_option("腈纶"): ("聚丙烯腈纤维(腈纶)",),
-    normalize_option("丙纶"): ("聚丙烯纤维(丙纶)",),
-    normalize_option("粘纤"): ("粘胶纤维(粘纤)",),
-    normalize_option("莱赛尔"): ("莱赛尔纤维(莱赛尔)",),
+    # 平台候选同时存在俗称、化学名和“俗称（化学名）”形式；顺序保留
+    # Excel 原名之后的首选平台写法，后续写法用于其他平台的兼容。
+    normalize_option("氨纶"): (
+        "聚氨酯弹性纤维(氨纶)",
+        "氨纶(聚氨酯弹性纤维)",
+    ),
+    normalize_option("锦纶"): (
+        "聚酰胺纤维(锦纶)",
+        "锦纶(聚酰胺纤维)",
+    ),
+    normalize_option("涤纶"): (
+        "聚对苯二甲酸乙二酯(涤纶)",
+        "涤纶（聚酯纤维）",
+    ),
+    normalize_option("腈纶"): (
+        "聚丙烯腈纤维(腈纶)",
+        "腈纶(聚丙烯腈纤维)",
+    ),
+    normalize_option("丙纶"): (
+        "聚丙烯纤维(丙纶)",
+        "丙纶(聚丙烯纤维)",
+    ),
+    normalize_option("粘纤"): (
+        "粘胶纤维(粘纤)",
+        "粘纤(粘胶纤维)",
+    ),
+    normalize_option("莱赛尔"): (
+        "莱赛尔纤维(莱赛尔)",
+        "莱赛尔(莱赛尔纤维)",
+    ),
 }
+
+
+def is_material_field_label(label: object) -> bool:
+    """Return whether the field is in the shared fabric/material scope."""
+    normalized = normalize_label(label)
+    return bool(
+        normalized
+        and "含量" not in normalized
+        and ("材质" in normalized or "面料" in normalized)
+    )
+
+
+def material_value_candidates(value: object) -> Tuple[str, ...]:
+    """Expand one Excel material name into known platform spellings."""
+    text = str(value).strip()
+    if not text:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (text,)
+            + TAOBAO_MATERIAL_OPTION_ALIASES.get(normalize_option(text), ())
+        )
+    )
+
+
+def material_name_groups(value: object) -> Tuple[Tuple[str, ...], ...]:
+    """Parse material names: commas mean multiple values, slashes mean OR."""
+    groups: List[Tuple[str, ...]] = []
+    for raw_group in re.split(r"[,，、;；]", str(value or "")):
+        names: List[str] = []
+        normalized_names = set()
+        for raw_candidate in re.split(r"[/／]", raw_group):
+            candidate = raw_candidate.strip()
+            if not candidate or re.fullmatch(
+                r"\d+(?:\.\d+)?\s*[%％]", candidate
+            ):
+                continue
+            name = re.sub(
+                r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$",
+                "",
+                candidate,
+            ).strip()
+            normalized = normalize_option(name)
+            if name and normalized not in normalized_names:
+                normalized_names.add(normalized)
+                names.append(name)
+        if names:
+            groups.append(tuple(names))
+    return tuple(groups)
+
+
+def material_value_groups(
+    label: object, values: Sequence[object]
+) -> Tuple[Tuple[str, ...], ...]:
+    """Build one OR group per material while keeping multi-value semantics."""
+    if not is_material_field_label(label):
+        return tuple((str(value),) for value in values)
+    groups: List[Tuple[str, ...]] = []
+    for value in values:
+        for names in material_name_groups(value):
+            candidates: List[str] = []
+            for name in names:
+                for candidate in material_value_candidates(name):
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+            if candidates:
+                groups.append(tuple(candidates))
+    return tuple(groups)
 
 
 def parse_material_components(value: str) -> Tuple[Tuple[str, Optional[str]], ...]:
     """Parse ordered material rows shared by platform form adapters."""
     rows: List[Tuple[str, Optional[str]]] = []
-    for raw in re.split(r"[/／,，、;；]", str(value)):
-        raw = raw.strip()
-        if not raw:
+    for raw_group in re.split(r"[,，、;；]", str(value)):
+        parsed = material_name_groups(raw_group)
+        if not parsed:
             continue
-        match = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", raw)
-        name = re.sub(
-            r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$", "", raw
-        ).strip()
-        if name:
-            rows.append((name, match.group(1) if match else None))
+        names = parsed[0]
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", raw_group)
+        rows.append(("/".join(names), match.group(1) if match else None))
     return tuple(rows)
 
 
@@ -345,12 +447,16 @@ class TaobaoListing:
         logger: Any,
         *,
         attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
     ) -> None:
         # 子类改 attribute_platform_id 后，异常与日志文案随之切换平台名。
         self.page = page
         self.drawer = drawer
         self.logger = logger
         self.attribute_runtime = attribute_runtime
+        self.category_hints = tuple(
+            str(value).strip() for value in category_hints if str(value).strip()
+        )
         self.api_index: Any = TaobaoApiJsonIndex(page, logger)
         self.panel: Optional[Any] = None
         self.category_clicked = False
@@ -423,6 +529,265 @@ class TaobaoListing:
     @staticmethod
     def _normalize_category_path(value: object) -> str:
         return re.sub(r"[\s>]", "", str(value)).casefold()
+
+    @staticmethod
+    def _category_gender_roots(category_hints: Sequence[str]) -> Tuple[str, ...]:
+        text = " ".join(str(value) for value in category_hints)
+        if any(marker in text for marker in ("男士", "男装", "男性")):
+            return (normalize_label("男装"),)
+        if any(marker in text for marker in ("女士", "女装", "女性")):
+            return (normalize_label("女装"),)
+        return ()
+
+    @classmethod
+    def _choose_category_hint_text(
+        cls,
+        result_texts: Sequence[str],
+        category_hints: Sequence[str],
+    ) -> Tuple[str, str]:
+        """Choose one marketplace path from supplier category hints."""
+        chosen, strategy = choose_category_candidate(result_texts, category_hints)
+        if strategy.startswith("ambiguous"):
+            raise TaobaoListingError(
+                f"淘宝类目提示词匹配结果不唯一：{strategy}"
+            )
+        return chosen, strategy
+
+    async def _visible_category_result_nodes(self) -> Tuple[Tuple[str, Any], ...]:
+        """Read leaf rows from the page-level Element category result portal."""
+        nodes = self.page.locator(
+            ".el-autocomplete-suggestion:visible *:visible, "
+            ".el-popper:visible *:visible"
+        )
+        try:
+            snapshots = await nodes.evaluate_all(
+                """elements => elements.map((element, index) => {
+                  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                  const text = clean(element.innerText || element.textContent);
+                  const sameChild = text && Array.from(element.querySelectorAll('*'))
+                    .some(child => clean(child.innerText || child.textContent) === text);
+                  return {index, text, sameChild};
+                })"""
+            )
+        except Exception:
+            return ()
+        result: List[Tuple[str, Any]] = []
+        seen = set()
+        for snapshot in snapshots:
+            text = str(snapshot.get("text") or "")
+            normalized = self._normalize_category_path(text)
+            if not text or not normalized or snapshot.get("sameChild") or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((text, nodes.nth(int(snapshot["index"]))))
+        return tuple(result)
+
+    async def _prediction_candidates(self, panel: Optional[Any] = None) -> Tuple[Tuple[Any, str], ...]:
+        """Return every visible one-click category prediction in DOM order."""
+        scope = panel or self.panel
+        if scope is None:
+            return ()
+        buttons = scope.get_by_role("button", name="点击使用", exact=True)
+        predictions: List[Tuple[Any, str]] = []
+        for index in range(await buttons.count()):
+            button = buttons.nth(index)
+            if not await button.is_visible():
+                continue
+            row = button.locator("xpath=..")
+            if not await row.count() or not (await row.inner_text()).strip():
+                row = button.locator(
+                    "xpath=ancestor::*[contains(@class, 'prediction-item')][1]"
+                )
+            row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
+            expected = re.sub(r"^\s*推荐\s*", "", row_text)
+            expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
+            if expected:
+                predictions.append((button, expected))
+        return tuple(predictions)
+
+    async def _apply_category_prediction(
+        self, button: Any, expected: str, source: str
+    ) -> str:
+        await button.scroll_into_view_if_needed()
+        await button.click()
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        try:
+            await self.panel.locator(
+                ".conf .complex-wrap > .complex-item, "
+                ".conf .complex-wrap > .complex-item_multi"
+            ).first.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise TaobaoListingError("淘宝类目应用后，类目属性未渲染") from exc
+        actual = await self._category_text()
+        if self._normalize_category_path(actual) != self._normalize_category_path(expected):
+            raise TaobaoListingError(
+                f"淘宝类目应用后校验失败：期望 {expected!r}，页面为 {actual!r}"
+            )
+        if self.logger is not None:
+            self.logger.info("已应用淘宝%s类目：%s", source, actual)
+        return actual
+
+    async def apply_excel_category(self) -> str:
+        """Apply the Taobao category using the Excel 商品分类 hints."""
+        if self.panel is None:
+            raise TaobaoListingError("请先调用 open() 打开淘宝资料")
+        hints = tuple(self.category_hints)
+        if not hints:
+            return await self.apply_recommended_category()
+
+        current = ""
+        try:
+            current = await self._category_text()
+        except TaobaoListingError:
+            pass
+        if current and self._choose_category_hint_text((current,), hints)[0]:
+            if self.logger is not None:
+                self.logger.info("淘宝商品分类已匹配 Excel，跳过修改：%s", current)
+            return current
+
+        # The ERP can show several one-click predictions.  The first row may
+        # carry the red “推荐” badge while a later row is the Excel match.
+        # Inspect every visible prediction before opening the manual search.
+        buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
+        predictions: List[Tuple[Any, str]] = []
+        for index in range(await buttons.count()):
+            button = buttons.nth(index)
+            if not await button.is_visible():
+                continue
+            row = button.locator("xpath=..")
+            if not await row.count() or not (await row.inner_text()).strip():
+                row = button.locator(
+                    "xpath=ancestor::*[contains(@class, 'prediction-item')][1]"
+                )
+            row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
+            expected = re.sub(r"^\s*推荐\s*", "", row_text)
+            expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
+            if expected:
+                predictions.append((button, expected))
+        if predictions:
+            chosen, strategy = self._choose_category_hint_text(
+                tuple(expected for _button, expected in predictions), hints
+            )
+            if chosen:
+                matches = [
+                    (button, expected)
+                    for button, expected in predictions
+                    if self._normalize_category_path(expected)
+                    == self._normalize_category_path(chosen)
+                ]
+                if len(matches) != 1:
+                    raise TaobaoListingError(
+                        f"淘宝 Excel 类目推荐匹配结果不是唯一项：{len(matches)}"
+                    )
+                button, expected = matches[0]
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝推荐类目与 Excel 匹配，选择第 %s 个：%s（%s）",
+                        next(
+                            index + 1
+                            for index, item in enumerate(predictions)
+                            if item[0] == button
+                        ),
+                        expected,
+                        strategy,
+                    )
+                return await self._apply_category_prediction(button, expected, "Excel 推荐")
+
+        modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+        if await modify.count() != 1:
+            raise TaobaoListingError("淘宝页面找不到唯一的“修改类目”按钮")
+        await modify.click(timeout=30_000)
+        dialog = self.page.get_by_role("dialog", name="修改类目", exact=True)
+        try:
+            await dialog.wait_for(state="visible", timeout=10_000)
+        except Exception as exc:
+            raise TaobaoListingError("淘宝修改类目弹窗未出现") from exc
+        search = dialog.get_by_placeholder(
+            "请输入类目关键词，支持模糊查询", exact=True
+        )
+        if await search.count() != 1:
+            raise TaobaoListingError("淘宝修改类目弹窗缺少搜索框")
+
+        selected_text = ""
+        selected_node: Any = None
+        selected_hint = ""
+        for hint in category_search_terms(hints):
+            await search.fill(hint, timeout=10_000)
+            deadline = asyncio.get_running_loop().time() + 20
+            while asyncio.get_running_loop().time() < deadline:
+                rows = await self._visible_category_result_nodes()
+                chosen, strategy = self._choose_category_hint_text(
+                    tuple(text for text, _node in rows), hints
+                )
+                if chosen:
+                    matches = [
+                        (text, node)
+                        for text, node in rows
+                        if self._normalize_category_path(text)
+                        == self._normalize_category_path(chosen)
+                    ]
+                    if len(matches) == 1:
+                        selected_text, selected_node = matches[0]
+                        selected_hint = f"{hint} ({strategy})"
+                        break
+                    if len(matches) > 1:
+                        raise TaobaoListingError(
+                            f"淘宝类目搜索结果 DOM 不是唯一项：{len(matches)}"
+                        )
+                await asyncio.sleep(0.1)
+            if selected_node is not None:
+                break
+        if selected_node is None:
+            raise TaobaoListingError(
+                "淘宝类目搜索结果中没有 Excel 的唯一精确分类提示："
+                + "/".join(hints)
+            )
+
+        await selected_node.scroll_into_view_if_needed()
+        await selected_node.click(timeout=10_000)
+        if self.logger is not None:
+            self.logger.info(
+                "淘宝类目按 Excel 提示选中：%s；搜索词：%s",
+                selected_text,
+                selected_hint,
+            )
+        selected_path = ""
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            lines = [line.strip() for line in (await dialog.inner_text()).splitlines()]
+            selected_lines = [line for line in lines if line.startswith("已选")]
+            if selected_lines:
+                selected_path = selected_lines[-1].split("：", 1)[-1].strip()
+                if self._normalize_category_path(selected_path) == self._normalize_category_path(selected_text):
+                    break
+            await asyncio.sleep(0.05)
+        if self._normalize_category_path(selected_path) != self._normalize_category_path(selected_text):
+            raise TaobaoListingError(
+                f"淘宝类目确认前路径不一致：期望 {selected_text!r}，页面为 {selected_path!r}"
+            )
+        confirm = dialog.get_by_role("button", name=re.compile(r"确\s*定"))
+        if await confirm.count() != 1:
+            raise TaobaoListingError("淘宝修改类目弹窗找不到唯一“确定”按钮")
+        await confirm.click(timeout=10_000)
+        await dialog.wait_for(state="hidden", timeout=30_000)
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        try:
+            await self.panel.locator(
+                ".conf .complex-wrap > .complex-item, "
+                ".conf .complex-wrap > .complex-item_multi"
+            ).first.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise TaobaoListingError("淘宝 Excel 类目应用后，类目属性未渲染") from exc
+        actual = await self._category_text()
+        if self._normalize_category_path(actual) != self._normalize_category_path(selected_text):
+            raise TaobaoListingError(
+                f"淘宝类目应用后校验失败：期望 {selected_text!r}，页面为 {actual!r}"
+            )
+        if self.logger is not None:
+            self.logger.info("已应用淘宝 Excel 类目：%s", actual)
+        return actual
 
     async def apply_recommended_category(self) -> str:
         """点击当前页面唯一带“推荐”标记的类目，不依赖固定路径。"""
@@ -686,6 +1051,8 @@ class TaobaoListing:
         if mode == "casual-pants":
             return await self.apply_casual_pants_category()
         if mode == "recommended":
+            if self.category_hints:
+                return await self.apply_excel_category()
             return await self.apply_recommended_category()
         raise TaobaoListingError(f"不支持的淘宝类目模式：{mode!r}")
 
@@ -816,6 +1183,33 @@ class TaobaoListing:
             return local.first
         if await local.count() > 1:
             raise TaobaoListingError("当前淘宝属性内部出现多个可见下拉框")
+
+        # The production Element Select teleports its popper outside the field.
+        # Other fields can briefly leave a second visible popper behind, so a
+        # page-wide count cannot identify the dropdown that belongs to this
+        # select.  Element's Vue instance keeps the authoritative popper node.
+        marked = await select.evaluate(
+            """element => {
+              document.querySelectorAll('[data-kuaimai-active-select-popper]')
+                .forEach(node => node.removeAttribute('data-kuaimai-active-select-popper'));
+              const vm = element.__vue__;
+              const popper = vm && (vm.popperElm
+                || (vm.$refs && vm.$refs.popper && vm.$refs.popper.$el));
+              if (!popper || !popper.isConnected) return false;
+              popper.setAttribute('data-kuaimai-active-select-popper', 'true');
+              return true;
+            }"""
+        )
+        if marked:
+            owned = self.page.locator(
+                '[data-kuaimai-active-select-popper="true"]:visible'
+            )
+            owned_count = await owned.count()
+            if owned_count == 1:
+                return owned.first
+            if owned_count > 1:
+                raise TaobaoListingError("当前淘宝属性关联了多个可见下拉框")
+
         global_dropdowns = self.page.locator(".el-select-dropdown:visible")
         count = await global_dropdowns.count()
         if count == 0:
@@ -1154,6 +1548,7 @@ class TaobaoListing:
                 if str(option.get("name", "")).strip()
             )
         )
+        initial_options = tuple(options)
         custom_allowed = (
             (await select.get_attribute("caninputcustom") or "").casefold() == "true"
         )
@@ -1187,6 +1582,23 @@ class TaobaoListing:
                 chosen_text = candidate
                 break
             else:
+                if is_material_field_label(label):
+                    fuzzy_matches = match_option_candidates(
+                        (candidate,), initial_option_names
+                    )
+                    if len(fuzzy_matches) == 1:
+                        chosen = initial_options[fuzzy_matches[0]]
+                        platform_label = str(chosen.get("name", "")).strip()
+                        chosen_text = platform_label
+                        observed_matches[platform_label] = [chosen]
+                        if self.logger is not None:
+                            self.logger.info(
+                                "淘宝属性“%s”：材质/面料模糊匹配 Excel 值 %s 到平台候选 %s",
+                                label,
+                                candidate,
+                                chosen.get("name", ""),
+                            )
+                        break
                 if await self._search_select(select, candidate):
                     search_deadline = (
                         asyncio.get_running_loop().time() + REMOTE_OPTION_SEARCH_SECONDS
@@ -1244,6 +1656,42 @@ class TaobaoListing:
                         chosen_text = candidate
                 if chosen is not None:
                     break
+
+        # Material/fabric fields use a shared, conservative fuzzy tier after
+        # exact and registered alias matching.  A match is accepted only when
+        # one platform option remains; ambiguous values continue to the
+        # existing review/fallback path.
+        if chosen is None and is_material_field_label(label):
+            fuzzy_options: List[Mapping[str, Any]] = []
+            seen_option_keys = set()
+            for option in (*initial_options, *tuple(options)):
+                name = str(option.get("name", "")).strip()
+                key = (name, str(option.get("value", "")))
+                if not name or key in seen_option_keys:
+                    continue
+                if option.get("created") and not (
+                    custom_allowed or created_exact_click_allowed
+                ):
+                    continue
+                seen_option_keys.add(key)
+                fuzzy_options.append(option)
+            option_names = tuple(str(option.get("name", "")) for option in fuzzy_options)
+            for candidate in candidates:
+                matches = match_option_candidates((candidate,), option_names)
+                if len(matches) != 1:
+                    continue
+                chosen = fuzzy_options[matches[0]]
+                platform_label = str(chosen.get("name", "")).strip()
+                chosen_text = platform_label
+                observed_matches[platform_label] = [chosen]
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝属性“%s”：材质/面料模糊匹配 Excel 值 %s 到平台候选 %s",
+                        label,
+                        candidate,
+                        chosen.get("name", ""),
+                    )
+                break
 
         # Only when no OR alternative is unique do we retain the established
         # fallback of taking the first same-label platform entry.
@@ -1715,7 +2163,7 @@ class TaobaoListing:
             select = selects.first
             multi = await select.locator(".el-select__tags").count() > 0
             if exact_values is not None:
-                groups = tuple((str(value),) for value in exact_values)
+                groups = material_value_groups(page_label, exact_values)
             else:
                 groups = selection_value_groups_for_control(
                     page_label, expected, multi=multi
@@ -4257,38 +4705,9 @@ class TaobaoListing:
         )
 
     async def apply_payment_and_service(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
-        stock_match = _single_source(
-            fields, ("拍下减库存", "库存扣减方式"), "库存扣减方式"
-        )
-        if stock_match is None:
-            stock = await self._resolve_unprovided_radio("库存扣减方式")
-        else:
-            _stock_key, stock_source = stock_match
-            stock_options = []
-            for candidate in single_selection_candidates("库存扣减方式", stock_source):
-                normalized = normalize_option(candidate)
-                if normalized in {
-                    normalize_option(value) for value in ("否", "付款减库存", "0")
-                }:
-                    stock_options.append("付款减库存")
-                elif normalized in {
-                    normalize_option(value) for value in ("是", "拍下减库存", "1")
-                }:
-                    stock_options.append("拍下减库存")
-            stock_options = list(dict.fromkeys(stock_options))
-            if not stock_options:
-                raise TaobaoListingError(f"Excel 库存扣减方式无法识别：{stock_source!r}")
-            # 用户要求按页面顺序操作：库存扣减 -> 保修服务 -> 七天退货承诺。
-            stock = ""
-            last_error: Optional[Exception] = None
-            for stock_option in stock_options:
-                try:
-                    stock = await self._ensure_radio("库存扣减方式", stock_option)
-                    break
-                except TaobaoListingError as exc:
-                    last_error = exc
-            if not stock:
-                raise TaobaoListingError(str(last_error or "库存扣减方式无可用候选"))
+        # 淘宝库存扣减方式是运营固定配置，不读取 Excel，也不提交 AI
+        # 审核。页面没有默认值时直接勾选“付款减库存”。
+        stock = await self._ensure_radio("库存扣减方式", "付款减库存")
         warranty = await self._ensure_checkbox("售后服务", "保修服务")
         seven_day_return = await self._ensure_checkbox_contains(
             "售后服务", "七天退货"

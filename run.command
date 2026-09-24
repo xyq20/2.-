@@ -6,6 +6,36 @@ cd "$SCRIPT_DIR"
 
 typeset -a PYTHON_ARGS
 
+parse_platform_choices() {
+  local choice="$1" token="" platform_id="" platform_label=""
+  typeset -a platform_ids platform_labels numbers
+  choice="${choice//，/ }"
+  choice="${choice//、/ }"
+  choice="${choice//,/ }"
+  numbers=( ${=choice} )
+  for token in "${numbers[@]}"; do
+    case "$token" in
+      2) platform_id="douyin"; platform_label="抖音" ;;
+      3) platform_id="taobao"; platform_label="淘宝" ;;
+      4) platform_id="tmall"; platform_label="天猫" ;;
+      5) platform_id="pdd"; platform_label="拼多多" ;;
+      6) platform_id="wxsph"; platform_label="微信小店" ;;
+      7) platform_id="xhs"; platform_label="小红书" ;;
+      8) platform_id="youzan"; platform_label="有赞" ;;
+      9) platform_id="jd"; platform_label="京东" ;;
+      *) return 1 ;;
+    esac
+    if (( ${platform_ids[(Ie)$platform_id]} == 0 )); then
+      platform_ids+=("$platform_id")
+      platform_labels+=("$platform_label")
+    fi
+  done
+  (( ${#platform_ids[@]} > 0 )) || return 1
+  selected_platform="${(j:,:)platform_ids}"
+  print "本次运行顺序：${(j: → :)platform_labels}"
+  return 0
+}
+
 select_product_excel() {
   local products_root="${KUAIMAI_PRODUCTS_ROOT:-/Volumes/共享文件/谭/products}"
   local last_product_file="${KUAIMAI_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-product-path}"
@@ -85,8 +115,10 @@ if (( $# == 0 )); then
   print "  9) 京东（填写、保存、铺货）"
   print " 10) 一键新增链接（按视频固定填法，仅创建快麦商品）"
   print " 11) 全平台（有赞除外：基础资料 + 抖音 + 淘宝 + 天猫 + 拼多多 + 微信小店 + 小红书 + 京东）"
+  print "平台编号可多选：直接输入 2,9,7 或 2 9 7，依次运行抖音 → 京东 → 小红书。"
+  print "多选支持 2-9；0、1、10、11 请单独选择。"
   while true; do
-    read "platform_choice?平台编号 [0-11]: "
+    read "platform_choice?平台编号 [0-11，可多选]: " || exit 1
     case "$platform_choice" in
       0) selected_platform="all"; break ;;
       1) selected_platform="base"; break ;;
@@ -100,7 +132,10 @@ if (( $# == 0 )); then
       9) selected_platform="jd"; break ;;
       10) selected_platform="create"; break ;;
       11) selected_platform="all"; PYTHON_ARGS+=(--all-platform-skip youzan); break ;;
-      *) print "请输入 0-11 的编号。" ;;
+      *)
+        if parse_platform_choices "$platform_choice"; then break; fi
+        print "请输入 0-11 的编号；多选请输入 2-9 的平台编号，用逗号或空格分隔。"
+        ;;
     esac
   done
 
@@ -209,7 +244,7 @@ if (( $# == 0 )); then
     taobao:publish)
       PYTHON_ARGS+=(--platform taobao --save --allow-taobao-publish-once)
       ;;
-    all:preview|all:save_only|all:publish|base:preview|base:save_only|base:publish|douyin:preview|douyin:save_only|douyin:publish)
+    *)
       PYTHON_ARGS+=(--platform "$selected_platform")
       case "$selected_mode" in
         preview) PYTHON_ARGS+=(--no-save) ;;

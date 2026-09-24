@@ -31,6 +31,7 @@ from wxsph_listing import parse_wxsph_attribute_fields
 from taobao_listing import (
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     preferred_exact_candidate_label,
@@ -154,29 +155,13 @@ def _first_excel_value(
 
 
 def _material_name_candidates(value: str) -> Tuple[str, ...]:
-    """Normalize every material OR alternative without collapsing the group.
+    """Return one slash-joined OR group per comma-separated material.
 
     Excel uses ``/`` as ordered OR.  A composition suffix belongs to the
-    material alternative itself, while a percentage-only alternative is not a
-    material name.  Keeping the alternatives separate lets the live dropdown
-    choose ``棉`` from values such as ``棉100%/棉/棉布``.
+    material alternative itself; commas, enumeration commas and semicolons
+    introduce another material that a multi-select must choose as well.
     """
-
-    candidates: List[str] = []
-    # Excel 中多成分既可能用“/”也可能用逗号、顿号或分号分隔。
-    # 这些都表示独立材质，统一拆开后交给公共多值回退协议。
-    for raw in re.split(r"[/／,，、;；]", str(value)):
-        text = raw.strip()
-        if not text or re.fullmatch(r"\d+(?:\.\d+)?\s*[%％]", text):
-            continue
-        text = re.sub(
-            r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$",
-            "",
-            text,
-        ).strip()
-        if text and text not in candidates:
-            candidates.append(text)
-    return tuple(candidates)
+    return tuple("/".join(group) for group in material_name_groups(value))
 
 
 def _material_name(value: str) -> str:

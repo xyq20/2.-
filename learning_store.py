@@ -439,15 +439,17 @@ class LearningStore:
         excel_value: str,
         control_type: str,
         canonical_field: Optional[str] = None,
+        product_version: Optional[str] = None,
     ) -> Optional[str]:
-        """Reuse a confirmed choice for the same platform/field input.
+        """Reuse the latest confirmed choice for the same platform field.
 
         A vendor category ID is not part of the learning key.  The same
         logical field can be exposed by different category endpoints with
         different option IDs (and schema versions), so reuse is matched by
         platform, canonical/logical field, live candidate *names*, control
-        type and the exact Excel OR input.  Candidate IDs are remapped by the
-        caller.
+        type. Candidate IDs are remapped by the caller. ``product_version``
+        restricts reuse to the same product when its review must take priority
+        over a later spreadsheet value.
 
         If older products contain different confirmed values for the same
         otherwise-identical input, the most recently confirmed value wins.
@@ -456,10 +458,11 @@ class LearningStore:
         """
         excel = tuple(v.strip() for v in re.split(r"[/／]", excel_value) if v.strip())
         labels = [v.label for v in snapshot.values]
-        if not excel or len(labels) != len(set(labels)):
+        if len(labels) != len(set(labels)):
             return None
         rows = self.connection.execute(
-            "SELECT r.final_value_id,r.updated_at,s.payload_json,e.payload_json AS review_json "
+            "SELECT r.product_version,r.final_value_id,r.updated_at,s.payload_json,"
+            "e.payload_json AS review_json "
             "FROM review_resolutions r JOIN candidate_snapshots s "
             "ON r.snapshot_version=s.snapshot_version "
             "LEFT JOIN sync_outbox e ON e.event_type='review.created' "
@@ -470,6 +473,8 @@ class LearningStore:
         ).fetchall()
         choices: list[tuple[str, str]] = []
         for row in rows:
+            if product_version is not None and row['product_version'] != product_version:
+                continue
             old = json.loads(row['payload_json'])
             review = json.loads(row['review_json']) if row['review_json'] else {}
             old_canonical = str(review.get('canonical_field') or '').strip()
@@ -496,16 +501,30 @@ class LearningStore:
                 continue
             evidence = review.get('evidence_json', {})
             context = evidence.get('reuse_context')
+            final_parts = tuple(
+                part.strip()
+                for part in re.split(
+                    r"[,，、;；]", str(row['final_value_id'] or '')
+                )
+                if part.strip()
+            )
+            if not final_parts:
+                continue
             if context is not None:
-                context_candidates = tuple(
-                    str(value).strip()
-                    for value in context.get('excel_candidates', ())
-                    if str(value).strip()
-                ) if isinstance(context, Mapping) else ()
+                old_control_type = context.get('control_type') if isinstance(
+                    context, Mapping
+                ) else None
+                legacy_multi_select = (
+                    old_control_type == 'select'
+                    and control_type == 'multi_select'
+                    and len(final_parts) > 1
+                )
                 if (
                     not isinstance(context, Mapping)
-                    or context.get('control_type') != control_type
-                    or set(context_candidates) != set(excel)
+                    or (
+                        old_control_type != control_type
+                        and not legacy_multi_select
+                    )
                 ):
                     continue
             else:
@@ -525,26 +544,41 @@ class LearningStore:
                         or not evidence.get('text') or set(old_labels) != set(excel)
                         or old['schema_version'] != legacy_schema):
                     continue
-            if evidence.get('force_review') or evidence.get('selection_only'):
-                continue
-            matches = [v['label'] for v in values
-                       if row['final_value_id'] in (v['value_id'], v['label'])]
-            if len(matches) != 1:
+            # Review confirmation supports multi-select values encoded as a
+            # comma separated list of value IDs or labels.  Resolve every
+            # part against the old snapshot first, then remap by label to the
+            # current live dictionary.  Treating the whole string as one ID
+            # made a confirmed pair such as ``青年,中年`` impossible to reuse.
+            matched_labels = []
+            valid = True
+            for part in final_parts:
+                old_matches = [
+                    value['label']
+                    for value in values
+                    if part in (value['value_id'], value['label'])
+                ]
+                if len(old_matches) != 1 or old_matches[0] in matched_labels:
+                    valid = False
+                    break
+                matched_labels.append(old_matches[0])
+            if not valid:
                 continue
             # A category may add/remove unrelated candidates.  The learned
-            # choice is reusable as long as its name is still a unique live
-            # candidate; IDs and the complete option-list shape are irrelevant.
-            if sum(1 for value in snapshot.values if value.label == matches[0]) != 1:
+            # choice is reusable as long as every learned label is still a
+            # unique live candidate; IDs and the complete option-list shape
+            # are irrelevant.
+            if any(
+                sum(1 for value in snapshot.values if value.label == label) != 1
+                for label in matched_labels
+            ):
                 continue
-            choices.append((str(row['updated_at'] or ''), matches[0]))
+            choices.append((str(row['updated_at'] or ''), ",".join(matched_labels)))
         if not choices:
             return None
         # The rows are already newest-first.  A later correction is the
         # operator's current rule when old category-specific approvals differ.
         chosen = choices[0][1]
-        # An explicit new Excel value always wins over a cross-product rule.
-        exact = [v.label for v in snapshot.values if excel_value.strip() in (v.label, v.value_id)]
-        return chosen if not exact or chosen in exact else None
+        return chosen
 
     def enqueue(
         self,

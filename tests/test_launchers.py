@@ -9,6 +9,63 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherArgumentTests(unittest.TestCase):
+    def test_all_except_youzan_menu_is_preserved(self):
+        arguments, _ = self._run_launcher(input_text="11\n2\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--all-platform-skip", "youzan",
+            "--platform", "all", "--save-only",
+        ))
+
+    def test_platform_menu_accepts_multiple_platforms_directly(self):
+        arguments, output = self._run_launcher(input_text="2,9,7\n2\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "douyin,jd,xhs", "--save-only",
+        ))
+        self.assertIn("平台编号可多选", output)
+        self.assertNotIn("12)", output)
+        self.assertNotIn("自定义多平台", output)
+        self.assertIn("抖音 → 京东 → 小红书", output)
+
+    def test_platform_menu_accepts_separators_and_removes_duplicates(self):
+        arguments, _ = self._run_launcher(input_text="9，2、9 7\n1\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "jd,douyin,xhs", "--no-save",
+        ))
+
+    def test_platform_menu_retries_invalid_or_empty_selection(self):
+        arguments, output = self._run_launcher(input_text="12\n\n2,0\n2,1\n2,10\n2,11\n9,12\n2,xhs\n2,7\n1\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "douyin,xhs", "--no-save",
+        ))
+        self.assertIn("请输入 2-9 的平台编号", output)
+
+    def test_multiple_platform_publish_keeps_confirmation(self):
+        arguments, _ = self._run_launcher(input_text="2,3,9\n3\nPUBLISH\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "douyin,taobao,jd", "--save",
+        ))
+        arguments, _ = self._run_launcher(input_text="2,3,9\n3\nno\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "douyin,taobao,jd", "--no-save",
+        ))
+
+    def test_repeated_taobao_selection_keeps_save_authorization(self):
+        arguments, _ = self._run_launcher(input_text="3,3\n2\n")
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "taobao", "--save-only",
+            "--allow-taobao-save-once",
+        ))
+
+    def test_multiple_platforms_work_with_review_launcher_environment(self):
+        arguments, _ = self._run_launcher(
+            input_text="2,9,7\n1\n",
+            extra_env={"KUAIMAI_LEARNING_AUTO_ENABLE": "1"},
+        )
+        self.assertEqual(arguments, (
+            "kuaimai_erp.py", "--platform", "douyin,jd,xhs", "--no-save",
+            "--learning-enabled",
+        ))
+
     def test_new_product_menu_saves_without_publishing(self):
         arguments, _ = self._run_launcher(input_text="10\n2\n")
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "base", "--create-product", "--save-only"))
@@ -60,6 +117,7 @@ class LauncherArgumentTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=10,
                 env={**__import__("os").environ,
                      "KUAIMAI_SKIP_PRODUCT_SELECTION": "1", **(extra_env or {})},
             )

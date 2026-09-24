@@ -24,6 +24,7 @@ from platform_schema import (
     field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -709,7 +710,7 @@ class PddListing:
         )
         observations = [prediction_observation]
         issues = []
-        hints = _hint_leaves(context)
+        category_hints = context.category_hints
         first_viable = False
         if candidates:
             first_viable = await self._probe_candidate(
@@ -720,15 +721,13 @@ class PddListing:
             )
             if not first_viable:
                 issues.append("candidate_unavailable:{0}".format(candidates[0].leaf_id))
-            if not hints or normalize_label(candidates[0].path[-1]) not in hints:
-                issues.append("candidate_hint_mismatch:{0}".format(candidates[0].leaf_id))
-
-        exact = tuple(
-            item
-            for item in candidates
-            if hints and normalize_label(item.path[-1]) in hints
+        recommended, recommendation_strategy = choose_category_object(
+            candidates, category_hints
         )
-        if len(exact) > 1:
+        if recommended is None and not category_hints and candidates:
+            recommended = candidates[0]
+            recommendation_strategy = "default_recommendation"
+        if recommendation_strategy.startswith("ambiguous"):
             self._resolution_fragment = SchemaFragment(
                 endpoints=tuple(observations),
                 issues=tuple(issues),
@@ -736,14 +735,14 @@ class PddListing:
             return CategoryResolution(
                 status="review_required",
                 source="recommendation",
-                candidates=exact,
+                candidates=candidates,
                 reason="ambiguous_exact_leaf",
             )
 
         tree_candidates = ()
         selected_source = "recommendation"
-        if len(exact) == 1:
-            selected = exact[0]
+        if recommended is not None:
+            selected = recommended
         else:
             tree = await _panel_call(self._panel(panel), "list_category_tree")
             tree_candidates = tuple(
@@ -757,12 +756,10 @@ class PddListing:
                 )
                 if item is not None
             )
-            tree_exact = tuple(
-                item
-                for item in tree_candidates
-                if hints and normalize_label(item.path[-1]) in hints
+            selected, tree_strategy = choose_category_object(
+                tree_candidates, category_hints
             )
-            if len(tree_exact) != 1:
+            if selected is None:
                 self._resolution_fragment = SchemaFragment(
                     endpoints=tuple(observations),
                     issues=tuple(issues),
@@ -770,14 +767,9 @@ class PddListing:
                 return CategoryResolution(
                     status="review_required",
                     source="tree" if tree_candidates else "recommendation",
-                    candidates=tree_exact or tree_candidates or candidates,
-                    reason=(
-                        "ambiguous_exact_leaf"
-                        if len(tree_exact) > 1
-                        else "no_exact_leaf"
-                    ),
+                    candidates=tree_candidates or candidates,
+                    reason="ambiguous_exact_leaf" if tree_strategy.startswith("ambiguous") else "no_excel_match",
                 )
-            selected = tree_exact[0]
             selected_source = "tree"
 
         if candidates and selected.leaf_id == candidates[0].leaf_id:
@@ -806,22 +798,23 @@ class PddListing:
                     )
                     if item is not None
                 )
-                alternate_exact = tuple(
-                    item
-                    for item in tree_candidates
-                    if hints
-                    and normalize_label(item.path[-1]) in hints
-                    and item.leaf_id != selected.leaf_id
+                alternate, _alternate_strategy = choose_category_object(
+                    tuple(
+                        item
+                        for item in tree_candidates
+                        if item.leaf_id != selected.leaf_id
+                    ),
+                    category_hints,
                 )
-                if len(alternate_exact) == 1:
+                if alternate is not None:
                     alternate_viable = await self._probe_candidate(
                         api,
                         panel,
-                        alternate_exact[0],
+                        alternate,
                         observations,
                     )
                     if alternate_viable:
-                        selected = alternate_exact[0]
+                        selected = alternate
                         selected_source = "tree"
                         selected_viable = True
             if selected_viable:

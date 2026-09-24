@@ -267,6 +267,27 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             await select.locator(".el-select-dropdown").is_visible()
         )
 
+    async def test_material_uses_unique_platform_synonym(self):
+        listing = await self._listing()
+        await self.page.locator(".complex-wrap").evaluate(
+            """root => root.insertAdjacentHTML('beforeend', `
+              <div class="complex-item"><div class="el-form-item">
+                <label class="el-form-item__label">材质</label>
+                <div class="el-form-item__content"><div class="el-select">
+                  <input class="el-input__inner" readonly onclick="openSelect(this)">
+                  <div class="el-select-dropdown" style="display:none"><ul>
+                    <li class="el-select-dropdown__item" onclick="choose(this)">涤纶（聚酯纤维）</li>
+                  </ul></div>
+                </div></div>
+              </div></div>`);"""
+        )
+
+        actual = await listing.fill_attribute(
+            "材质", "涤纶/涤纶100%", exact_values=("涤纶",)
+        )
+
+        self.assertEqual(actual, ("涤纶（聚酯纤维）",))
+
     async def test_fills_excel_attributes_skips_only_crotch_and_applies_batch_presale(self):
         listing = await self._listing()
 

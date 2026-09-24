@@ -22,6 +22,7 @@ from platform_schema import (
     field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -629,30 +630,27 @@ class WxsphListing:
             )
             if candidate is not None
         )
-        hints = _hint_leaves(context)
-        recommendation_exact = tuple(
-            candidate
-            for candidate in prediction_candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+        chosen, strategy = choose_category_object(
+            prediction_candidates, context.category_hints
         )
-        if len(recommendation_exact) == 1:
+        if chosen is not None:
             self._resolution_fragment = SchemaFragment(
                 endpoints=(prediction_observation,),
             )
             return CategoryResolution(
                 status="resolved",
                 source="recommendation",
-                selected=recommendation_exact[0],
+                selected=chosen,
                 candidates=prediction_candidates,
             )
-        if len(recommendation_exact) > 1:
+        if strategy.startswith("ambiguous"):
             self._resolution_fragment = SchemaFragment(
                 endpoints=(prediction_observation,),
             )
             return CategoryResolution(
                 status="review_required",
                 source="recommendation",
-                candidates=recommendation_exact,
+                candidates=prediction_candidates,
                 reason="ambiguous_exact_leaf",
             )
 
@@ -670,27 +668,25 @@ class WxsphListing:
             observations,
             state,
         )
-        exact = tuple(
-            candidate
-            for candidate in candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+        chosen_tree, tree_strategy = choose_category_object(
+            candidates, context.category_hints
         )
         self._resolution_fragment = SchemaFragment(
             endpoints=tuple(observations),
             issues=tuple(state["issues"]),
         )
-        if len(exact) == 1 and not state["issues"]:
+        if chosen_tree is not None and not state["issues"]:
             return CategoryResolution(
                 status="resolved",
                 source="tree",
-                selected=exact[0],
+                selected=chosen_tree,
                 candidates=candidates,
             )
         return CategoryResolution(
             status="review_required",
             source="tree",
-            candidates=exact or candidates or prediction_candidates,
-            reason="ambiguous_exact_leaf" if len(exact) > 1 else "no_exact_leaf",
+            candidates=candidates or prediction_candidates,
+            reason="ambiguous_exact_leaf" if tree_strategy.startswith("ambiguous") else "no_excel_match",
         )
 
     async def activate_category(

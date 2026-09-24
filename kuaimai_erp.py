@@ -58,7 +58,7 @@ from platform_registry import (
     PlatformSpec,
     expand_platform_selection,
     get_platform_spec,
-    platform_cli_choices,
+    normalize_platform_selection,
 )
 from size_image_recognition import (
     ClothingSkuRecommendation,
@@ -4698,6 +4698,7 @@ async def run_browser_automation(
                     logger,
                     artifact_dir,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await douyin.open()
                 # 抖音只有在先应用商品类目后才会渲染水洗标上传组件。
@@ -4872,6 +4873,7 @@ async def run_browser_automation(
                     logger,
                     artifact_dir,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await douyin.open()
                 title_prediction = await douyin.prepare_product_title_and_predictions(
@@ -4952,6 +4954,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await taobao.open()
                 if args.taobao_test_scope == "category-size":
@@ -5057,6 +5060,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await pdd.open()
                 try:
@@ -5147,6 +5151,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await xhs.open()
                 try:
@@ -5181,6 +5186,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await youzan.open()
                 try:
@@ -5246,6 +5252,7 @@ async def run_browser_automation(
                     logger,
                     api_index=tmall_api_index,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 tmall_report: Dict[str, Any] = {
                     "status": "in_progress",
@@ -5965,12 +5972,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--create-product", action="store_true", help="手工新增商品链接；与 --platform base 搭配，仅创建快麦商品，不铺货")
     parser.add_argument(
         "--platform",
-        choices=platform_cli_choices(),
+        type=normalize_platform_selection,
+        metavar="PLATFORM[,PLATFORM...]",
         default="all",
         help=(
             "运行范围：all=全部已实现平台，base=仅基础资料，"
             "douyin=抖音，taobao=淘宝，tmall=天猫，"
-            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞，jd=京东"
+            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞，jd=京东；"
+            "可用逗号指定多个平台，按输入顺序执行，例如 douyin,jd,xhs"
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="只读取并校验 Excel/图片，不打开浏览器")
@@ -6157,6 +6166,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...]:
+    try:
+        args.platform = normalize_platform_selection(args.platform)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if getattr(args, "wash_label_upload_test", False) and (
         args.platform != "douyin"
         or args.save
@@ -6172,6 +6185,8 @@ def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...
         if args.platform != "base" or args.inspect_only:
             raise SystemExit("--create-product 只允许 --platform base，不能与字段发现或平台铺货组合")
     selected = expand_platform_selection(args.platform)
+    if len(selected) > 1 and not args.save and any(spec.cli_name == "base" for spec in selected):
+        raise SystemExit("多平台仅填写模式不能包含基础资料；请只选择所需平台，或使用 --save-only")
     scaffold = tuple(spec for spec in selected if spec.lifecycle == "scaffold")
     save_forbidden = tuple(
         spec for spec in selected if spec.save_policy == "forbidden"
@@ -6629,6 +6644,36 @@ async def run_single_platform_with_learning(
     await drain_learning_events(learning_context)
 
 
+def platform_execution_stages(
+    args: argparse.Namespace, product: ProductData,
+) -> Tuple[str, ...]:
+    """Custom selections are exact; only all mode adds a base-save stage."""
+    selected = expand_platform_selection(args.platform)
+    if args.platform != "all":
+        return tuple(spec.cli_name for spec in selected)
+    commerce_stages = (
+        tuple(spec.cli_name for spec in selected
+              if spec.cli_name != "douyin" or product.douyin_fields is not None)
+    )
+    start_at = getattr(args, "all_platform_start_at", None)
+    if start_at is not None:
+        if start_at not in commerce_stages:
+            raise AutomationError(f"全平台恢复起点不可用：{start_at}")
+        commerce_stages = commerce_stages[commerce_stages.index(start_at) :]
+    skipped_platforms = set(getattr(args, "all_platform_skip", ()) or ())
+    if skipped_platforms:
+        commerce_stages = tuple(name for name in commerce_stages if name not in skipped_platforms)
+    if not commerce_stages:
+        raise AutomationError("本次全平台流程没有可运行的平台")
+    # 预览模式承诺不保存，因此不运行会强制保存的基础资料阶段。
+    # 只有全平台的两种保存模式会把它作为第一阶段。
+    return (
+        (("base",) + commerce_stages)
+        if args.save and start_at is None
+        else commerce_stages
+    )
+
+
 async def run_all_implemented_platforms(
     args: argparse.Namespace,
     product: ProductData,
@@ -6636,34 +6681,9 @@ async def run_all_implemented_platforms(
     logger: logging.Logger,
     learning_context: Optional[LearningRunContext] = None,
 ) -> None:
-    """同一编辑页内依次保存基础资料和各平台资料。"""
-    commerce_stages = (
-        ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
-        if product.douyin_fields is not None
-        else ("taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
-    )
-    start_at = getattr(args, "all_platform_start_at", None)
-    if start_at is not None:
-        if start_at not in commerce_stages:
-            raise AutomationError(f"全平台恢复起点不可用：{start_at}")
-        commerce_stages = commerce_stages[commerce_stages.index(start_at) :]
-        logger.info(
-            "全平台恢复模式：从 %s 开始，不重跑之前已完成平台",
-            start_at,
-        )
-    skipped_platforms = set(getattr(args, "all_platform_skip", ()) or ())
-    if skipped_platforms:
-        logger.info("本次全平台流程跳过：%s", "、".join(sorted(skipped_platforms)))
-        commerce_stages = tuple(name for name in commerce_stages if name not in skipped_platforms)
-    if not commerce_stages:
-        raise AutomationError("本次全平台流程没有可运行的平台")
-    # 预览模式承诺不保存，因此不运行会强制保存的基础资料阶段。
-    # 只有全平台的两种保存模式会把它作为第一阶段。
-    stages = (
-        (("base",) + commerce_stages)
-        if args.save and start_at is None
-        else commerce_stages
-    )
+    """在同一编辑页内依次运行全平台或用户指定的平台组合。"""
+    stages = platform_execution_stages(args, product)
+    logger.info("本次平台执行顺序：%s", " → ".join(stages))
     stage_results: List[Dict[str, Any]] = []
     shared_session: Dict[str, Any] = {}
 
@@ -6706,7 +6726,7 @@ async def run_all_implemented_platforms(
                 )
             )
             logger.info(
-                "全平台流程开始：%s（%s）",
+                "多平台流程开始：%s（%s）",
                 platform_name,
                 stage_mode,
             )
@@ -6805,7 +6825,7 @@ async def run_all_implemented_platforms(
                 )
                 await drain_learning_events(learning_context)
             logger.info(
-                "全平台流程完成：%s；下一平台将复用当前编辑页，"
+                "多平台流程完成：%s；下一平台将复用当前编辑页，"
                 "如抽屉已关闭则自动重开",
                 platform_name,
             )
@@ -6816,7 +6836,7 @@ async def run_all_implemented_platforms(
 
 def main() -> int:
     args = build_parser().parse_args()
-    validate_execution_mode(args)
+    selected_platforms = validate_execution_mode(args)
     if args.publish_shop is None:
         args.publish_shop = list(DEFAULT_DOUYIN_PUBLISH_SHOPS)
     if args.all_platform_one_shop_test:
@@ -6841,7 +6861,9 @@ def main() -> int:
         else:
             product = read_product_data(
                 resolve_excel_path(args.excel_url),
-                include_douyin=args.platform in {"all", "douyin", "taobao"},
+                include_douyin=any(
+                    spec.cli_name in {"douyin", "taobao"} for spec in selected_platforms
+                ),
             )
         learning_context = create_learning_context(args, product)
         if redactor is not None:
@@ -6876,7 +6898,7 @@ def main() -> int:
             logger.info("dry-run 完成，未打开浏览器")
             return 0
         if redactor is None:
-            if args.platform == "all":
+            if args.platform == "all" or len(selected_platforms) > 1:
                 asyncio.run(
                     run_all_implemented_platforms(
                         args,

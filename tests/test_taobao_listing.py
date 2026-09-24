@@ -9,6 +9,7 @@ from taobao_data import parse_taobao_fields
 from taobao_listing import (
     TaobaoListing,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     parse_taobao_fabrics,
     parse_taobao_materials,
@@ -454,6 +455,25 @@ class TaobaoPureFunctionTests(unittest.TestCase):
             ("无弹", "无弹力", "无弹性"),
         )
 
+    def test_material_candidates_include_platform_synonyms(self):
+        polyester = value_candidates("材质", "涤纶")
+        spandex = value_candidates("面料俗称", "氨纶")
+
+        self.assertEqual(polyester[0], "涤纶")
+        self.assertIn("涤纶（聚酯纤维）", polyester)
+        self.assertEqual(spandex[0], "氨纶")
+        self.assertIn("氨纶(聚氨酯弹性纤维)", spandex)
+
+    def test_material_names_use_slash_as_or_and_commas_as_multiple(self):
+        self.assertEqual(
+            material_name_groups("涤纶/涤纶100%"),
+            (("涤纶",),),
+        )
+        self.assertEqual(
+            material_name_groups("棉100%/棉布，氨纶6%/聚氨酯弹性纤维"),
+            (("棉", "棉布"), ("氨纶", "聚氨酯弹性纤维")),
+        )
+
     def test_fabric_and_material_composition_use_separate_excel_fields(self):
         fields = {
             "面料材质/面料": "亚麻（100%）",
@@ -523,6 +543,26 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fabric_fallback_accepts_other_spelling(self):
+        calls = []
+
+        async def writer(value, values):
+            calls.append((value, tuple(values)))
+            if tuple(values) == ("其它",):
+                return ("其它",)
+            raise RuntimeError("candidate unavailable")
+
+        actual = await self.listing._fill_fabric_attribute(
+            "面料",
+            ("棉", "氨纶"),
+            item=self.page.locator("body"),
+            writer=writer,
+            raw_value="棉，氨纶",
+        )
+
+        self.assertEqual(actual, ("其它",))
+        self.assertEqual(calls[-2:], [("其他", ("其他",)), ("其它", ("其它",))])
+
     async def test_hidden_loaded_dropdown_reopens_before_selecting(self):
         await self.page.set_content('''
           <div class="el-select"><input class="el-input__inner" readonly></div>
@@ -961,6 +1001,34 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.fill_attribute("风格", "休闲/工装")
 
         self.assertEqual(actual, ("休闲",))
+
+    async def test_active_dropdown_uses_current_select_popper_when_two_are_visible(self):
+        await self.listing.apply_recommended_category()
+        style = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('风格')) .el-select"
+        )
+        waterproof = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('防水等级')) .el-select"
+        )
+        await self.page.evaluate(
+            """([first, second]) => {
+              for (const select of [first, second]) {
+                const popper = select.querySelector('.el-select-dropdown');
+                document.body.appendChild(popper);
+                popper.style.display = 'block';
+                select.__vue__.popperElm = popper;
+              }
+            }""",
+            [await style.element_handle(), await waterproof.element_handle()],
+        )
+
+        dropdown = await self.listing._active_select_dropdown(waterproof)
+
+        self.assertIsNotNone(dropdown)
+        self.assertEqual(
+            await dropdown.locator(".el-select-dropdown__item").all_inner_texts(),
+            ["1级", "2级"],
+        )
 
     async def test_or_value_removes_extra_existing_multi_select_values(self):
         await self.listing.apply_recommended_category()
@@ -1472,7 +1540,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["values"]["是否加绒"], "否")
         self.assertNotEqual(actual["values"]["是否加绒"], "不加绒")
 
-    async def test_missing_stock_mode_is_deferred_without_skipping_service_fields(self):
+    async def test_missing_stock_mode_uses_fixed_payment_deduction_without_review(self):
         class Runtime:
             def __init__(self):
                 self.requests = []
@@ -1488,20 +1556,13 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         actual = await self.listing.apply_payment_and_service({})
 
-        self.assertIsNone(actual["库存扣减方式"])
+        self.assertEqual(actual["库存扣减方式"], "付款减库存")
         self.assertTrue(actual["保修服务"])
         self.assertTrue(actual["七天退货承诺"])
-        self.assertEqual(
-            tuple(request.field_label for request in runtime.requests),
-            ("库存扣减方式",),
-        )
-        self.assertEqual(
-            tuple(candidate.label for candidate in runtime.requests[0].candidates),
-            ("拍下减库存", "付款减库存"),
-        )
+        self.assertEqual(runtime.requests, [])
         self.assertEqual(
             await self.page.evaluate("window.actionLog"),
-            ["warranty", "seven-day-return"],
+            ["stock", "warranty", "seven-day-return"],
         )
 
     async def test_unmatched_freight_is_deferred_instead_of_stopping_platform(self):

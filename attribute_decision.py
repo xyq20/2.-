@@ -196,6 +196,18 @@ def validate_decision(
             return _review("rule_not_allowed", snapshot_version)
         if decision.mature_rule is not True:
             return _review("rule_not_mature", snapshot_version)
+        support_is_valid = (
+            type(decision.support_count) is int and decision.support_count >= 3
+        )
+        rate = decision.calibrated_acceptance_rate
+        rate_is_valid = (
+            type(rate) in (int, float)
+            and not isinstance(rate, bool)
+            and math.isfinite(rate)
+            and 0.95 <= rate <= 1.0
+        )
+        if not support_is_valid or not rate_is_valid:
+            return _review("confidence_gate_not_met", snapshot_version)
     elif source == "constrained_model":
         support_is_valid = (
             type(decision.support_count) is int and decision.support_count >= 3
